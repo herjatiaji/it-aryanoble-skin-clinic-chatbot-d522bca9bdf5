@@ -1,0 +1,32 @@
+# --- Core Backend Dependencies ---
+fastapi                     # High-performance web framework for API endpoints
+uvicorn[standard]           # Asynchronous ASGI web server for running FastAPI
+python-multipart            # Form data and file upload parser for FastAPI
+sqlalchemy[asyncio]         # Async ORM and SQL toolkit for database interaction
+asyncpg                     # High-performance async PostgreSQL driver
+pgvector                    # PostgreSQL extension adapter for vector embeddings
+alembic                     # Database migration tool for SQLAlchemy schema changes
+pydantic                    # Data validation and model serialization using type hints
+pydantic-settings           # Environment variable settings management for Pydantic
+email-validator             # Email format validation for Pydantic EmailStr fields
+python-dotenv               # Environment variable loader from .env files
+passlib[bcrypt]             # Secure password hashing library
+bcrypt==3.2.2               # Low-level bcrypt engine (pinned for passlib compatibility)
+python-jose[cryptography]   # JWT token generation and decoding for user authentication
+apscheduler                 # Background task and cron job scheduler
+httpx                       # Asynchronous HTTP client for external web requests
+loguru                      # Enhanced structured logging framework
+
+# --- RAG / AI Dependencies ---
+langchain>=0.1.0            # Core RAG orchestration framework and chain components
+langchain-openai            # LangChain integrations for OpenAI-compatible LLMs & embeddings
+langchain-community         # Community tool integrations, retrievers, and adapters
+langchain-huggingface       # LangChain wrappers for HuggingFace embedding models
+langchain-experimental      # Advanced experimental RAG splitters and agents
+docling                     # Deep document parsing engine for complex PDFs & tables
+sentence-transformers       # Local vector embedding generation (e.g., BAAI/bge-m3)
+unstructured                # Unstructured document parsing fallback
+langdetect                  # Natural language detection for document content
+rank-bm25                   # In-memory BM25 sparse keyword index engine
+psycopg[binary]             # Synchronous PostgreSQL driver for PGVector adapter
+

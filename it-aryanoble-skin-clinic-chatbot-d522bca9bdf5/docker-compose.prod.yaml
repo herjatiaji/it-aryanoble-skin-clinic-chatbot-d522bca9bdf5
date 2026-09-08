@@ -1,0 +1,18 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      target: production
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+      target: production
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000/api
+    depends_on:
+      - backend
+    restart: always

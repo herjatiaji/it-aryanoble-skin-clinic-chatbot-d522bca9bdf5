@@ -1,0 +1,8 @@
+{
+    "conventionalCommits.scopes": [
+        "agents",
+        "ui",
+        "frontend",
+        "backend"
+    ]
+}

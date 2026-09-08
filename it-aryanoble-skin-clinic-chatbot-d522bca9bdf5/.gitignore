@@ -1,0 +1,18 @@
+/.hf_cache
+/.agents
+.venv
+.env
+.env.*
+!.env.example
+/docs
+/backend/docs
+/demo-chatbot
+
+# Temporary RAG data
+backend/data/temp/*
+backend/data/pending/*
+backend/data/output/*
+backend/data/bm25_index.pkl
+!backend/data/temp/.gitkeep
+!backend/data/pending/.gitkeep
+!backend/data/output/.gitkeep

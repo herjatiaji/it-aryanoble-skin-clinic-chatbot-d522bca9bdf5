@@ -1,0 +1,380 @@
+@Library('shared-lib') _
+def detectChanges() {
+    def files = []
+
+    if (env.CHANGE_TARGET) {
+        sh "git fetch origin ${env.CHANGE_TARGET}"
+
+        files = sh(
+            script: "git diff --name-only origin/${env.CHANGE_TARGET}...HEAD",
+            returnStdout: true
+        ).trim().split("\n")
+    } else {
+        def hasPrevCommit = sh(
+            script: "git rev-parse --verify HEAD~1 >/dev/null 2>&1",
+            returnStatus: true
+        ) == 0
+
+        if (hasPrevCommit) {
+            files = sh(
+                script: "git diff --name-only HEAD~1 HEAD",
+                returnStdout: true
+            ).trim().split("\n")
+        } else {
+            echo "⚠️ No previous commit available (shallow clone or first commit) — treating all paths as changed"
+            files = ["backend/", "frontend/"]
+        }
+    }
+
+    return [
+        backend : files.any { it.startsWith("backend/") },
+        frontend: files.any { it.startsWith("frontend/") }
+    ]
+}
+def POD_LABEL = "jenkins-${UUID.randomUUID()}"
+withFolderProperties {
+    def branch = env.BRANCH_NAME
+    def repoName = env.REPO_NAME
+    def isPR = env.CHANGE_ID != null
+    def repoSlugName = env.ECRNAME
+    echo "Branch: ${branch}"
+    if (branch in ['dev', 'staging', 'master']) {
+        properties([
+            disableConcurrentBuilds(abortPrevious: true)
+        ])
+    }
+
+    /*
+    =========================
+    PULL REQUEST
+    =========================
+    */
+    if (isPR) {
+
+        podTemplate(label: POD_LABEL, inheritFrom: 'noncis-be-pr') {
+
+            node(POD_LABEL) {
+
+                stage('Checkout SCM') {
+                    container('agent-noncis-be-pr') {
+                        checkout scm
+                    }
+                }
+
+                stage('Validation PR') {
+
+                    container('agent-noncis-be-pr') {
+
+                        validatePr(
+                            projectName: repoName
+                        )
+
+                    }
+
+                }
+
+                stage('Sonar Scan') {
+
+                    container('agent-noncis-be-pr') {
+
+                        sonarScan(
+                            projectKey: repoSlugName,
+                            projectName: repoSlugName
+                        )
+
+                    }
+
+                }
+
+                stage('Quality Gate') {
+
+                    container('agent-noncis-be-pr') {
+
+                        sonarGate(
+                            projectKey: repoSlugName
+                        )
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    /*
+    =========================
+    DEVELOP
+    =========================
+    */
+    if (branch == 'develop') {
+
+        podTemplate(label: POD_LABEL, inheritFrom: 'noncis-be-dev') {
+
+            node(POD_LABEL) {
+
+                stage('Checkout SCM') {
+                    container('agent-noncis-be-dev') {
+                        checkout scm
+                    }
+                }
+
+                def changes
+                stage('Detect Changes') {
+                    container('agent-noncis-be-dev') {
+                        changes = detectChanges()
+                    }
+                }
+
+                echo "Backend changed : ${changes.backend}"
+                echo "Frontend changed: ${changes.frontend}"
+
+                def runBackend = changes.backend
+                def runFrontend = changes.frontend
+
+                stage("Build & Deploy") {
+                    parallel(
+                        backend: {
+                            if (!runBackend) {
+                                echo "Skipping Backend"
+                                return
+                            }
+                            stage('Build and Push Docker Image') {
+                                container('agent-noncis-be-dev') {
+                                    dir("backend") {
+                                        buildPushImage.otherwithtarget(
+                                            repoName: repoName,
+                                            registry: env.REGISTRY,
+                                            project: env.PROJECT,
+                                            ecrRepo: env.ECRNAME  + '-be',
+                                            branch: env.BRANCH_NAME
+                                        )
+                                        
+                                    }
+                                }
+                            }
+                            stage('Argocd Sync Develop') {
+                                container('agent-noncis-be-dev') {
+                                    argocdSync.sync(
+                                        appName: 'connect-' + repoName + '-be-dev'
+                                    )
+                                }
+                            }
+                        },
+                        frontend: {
+                            if (!runFrontend) {
+                                echo "Skipping Frontend"
+                                return
+                            }
+                            stage('Build and Push Docker Image') {
+                                container('agent-noncis-be-dev') {
+                                    dir("frontend") {
+                                        buildPushImage.otherwithtarget(
+                                            repoName: repoName,
+                                            registry: env.REGISTRY,
+                                            project: env.PROJECT,
+                                            ecrRepo: env.ECRNAME + '-fe',
+                                            branch: env.BRANCH_NAME
+                                        )
+                                    }
+                                }
+                            }
+                            stage('Argocd Sync Develop') {
+                                container('agent-noncis-be-dev') {
+                                    argocdSync.sync(
+                                        appName: 'connect-' + repoName + '-fe-dev'
+                                    )
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    /*
+    =========================
+    STAGING
+    =========================
+    */
+    if (branch == 'staging') {
+
+        podTemplate(label: POD_LABEL, inheritFrom: 'noncis-be-dev') {
+
+            node(POD_LABEL) {
+
+                stage('Checkout SCM') {
+                    container('agent-noncis-be-dev') {
+                        checkout scm
+                    }
+                }
+
+                def changes
+                stage('Detect Changes') {
+                    container('agent-noncis-be-dev') {
+                        changes = detectChanges()
+                    }
+                }
+
+                echo "Backend changed : ${changes.backend}"
+                echo "Frontend changed: ${changes.frontend}"
+
+                def runBackend = changes.backend
+                def runFrontend = changes.frontend
+
+                stage("Build & Deploy") {
+                    parallel(
+                        backend: {
+                            if (!runBackend) {
+                                echo "Skipping Backend"
+                                return
+                            }
+                            stage('Build and Push Docker Image') {
+                                container('agent-noncis-be-dev') {
+                                    dir("backend") {
+                                        buildPushImage.otherwithtarget(
+                                            repoName: repoName,
+                                            registry: env.REGISTRY,
+                                            project: env.PROJECT,
+                                            ecrRepo: env.ECRNAME + '-be',
+                                            branch: env.BRANCH_NAME
+                                        )
+                                    }
+                                }
+                            }
+                            stage('Argocd Sync Staging') {
+                                container('agent-noncis-be-dev') {
+                                    argocdSync.sync(
+                                        appName: 'connect-' + repoName + '-be-staging'
+                                    )
+                                }
+                            }
+                        },
+                        frontend: {
+                            if (!runFrontend) {
+                                echo "Skipping Frontend"
+                                return
+                            }
+                            stage('Build and Push Docker Image') {
+                                container('agent-noncis-be-dev') {
+                                    dir("frontend") {
+                                        buildPushImage.otherwithtarget(
+                                            repoName: repoName,
+                                            registry: env.REGISTRY,
+                                            project: env.PROJECT,
+                                            ecrRepo: env.ECRNAME + '-fe',
+                                            branch: env.BRANCH_NAME
+                                        )
+                                    }
+                                }
+                            }
+                            stage('Argocd Sync Staging') {
+                                container('agent-noncis-be-dev') {
+                                    argocdSync.sync(
+                                        appName: 'connect-' + repoName + '-fe-staging'
+                                    )
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    /*
+    =========================
+    PRODUCTION
+    =========================
+    */
+    if (branch == 'master') {
+
+        podTemplate(label: POD_LABEL, inheritFrom: 'noncis-be-prod') {
+
+            node(POD_LABEL) {
+
+                stage('Checkout SCM') {
+                    container('agent-noncis-be-prod') {
+                        checkout scm
+                    }
+                }
+
+                def changes
+                stage('Detect Changes') {
+                    container('agent-noncis-be-prod') {
+                        changes = detectChanges()
+                    }
+                }
+
+                echo "Backend changed : ${changes.backend}"
+                echo "Frontend changed: ${changes.frontend}"
+
+                def runBackend = changes.backend
+                def runFrontend = changes.frontend
+
+                stage("Build") {
+                    parallel(
+                        backend: {
+                            if (!runBackend) {
+                                echo "Skipping Backend"
+                                return
+                            }
+                            stage('Build and Push Docker Image') {
+                                container('agent-noncis-be-prod') {
+                                    dir("backend") {
+                                        buildPushImage.otherwithtarget(
+                                            repoName: repoName,
+                                            registry: env.REGISTRY,
+                                            project: env.PROJECT,
+                                            ecrRepo: env.ECRNAME  + '-be',
+                                            branch: env.BRANCH_NAME
+                                        )
+                                    }
+                                }
+                            }
+                            stage('Schedule Deployment BE') {
+                                container('agent-noncis-be-prod') {
+
+                                withEnv(['REPO_NAME=skin-clinic-chatbot-be']) {
+                                            scheduleDeploy()
+                                        }
+                                }
+                            }
+                        },
+                        frontend: {
+                            if (!runFrontend) {
+                                echo "Skipping Frontend"
+                                return
+                            }
+                            stage('Build and Push Docker Image') {
+                                container('agent-noncis-be-prod') {
+                                    dir("frontend") {
+                                        buildPushImage.otherwithtarget(
+                                            repoName: repoName,
+                                            registry: env.REGISTRY,
+                                            project: env.PROJECT,
+                                            ecrRepo: env.ECRNAME + '-fe',
+                                            branch: env.BRANCH_NAME
+                                        )
+                                    }
+                                }
+                            }
+                            stage('Schedule Deployment FE') {
+                                container('agent-noncis-be-prod') {
+
+                                withEnv(['REPO_NAME=skin-clinic-chatbot-fe']) {
+                                            scheduleDeploy()
+                                        }
+                                }
+                            }
+                        }
+                    )
+                }
+
+            }
+        }
+    }
+}
