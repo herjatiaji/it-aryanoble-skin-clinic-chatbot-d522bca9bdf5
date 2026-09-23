@@ -42,4 +42,11 @@ backend/test_dummy_parse.py
 *DUMMY*
 *dummy*
 DUMMY_TEST_*
+*PENGUJIAN*
+*pengujian*
+*DOKUMENTASI_PENGUJIAN*
+DOKUMENTASI_PENGUJIAN_DAN_OPTIMASI.md
+backend/backend_ai_notes.md
+backend/test_all_bugfixes.py
+backend/tests/
 

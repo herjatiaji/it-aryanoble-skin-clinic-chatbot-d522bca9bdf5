@@ -1,0 +1,37 @@
+# Ignore all Office & PDF documents (dummy, testing, catalog files)
+*.xlsx
+*.xls
+*.pdf
+*.docx
+*.doc
+*.pptx
+*.ppt
+*.csv
+
+# Ignore test datasets and test documents
+TEST SET*
+*TEST*
+*test*
+*DUMMY*
+*dummy*
+
+# Ignore testing reports & notes
+*DOKUMENTASI_PENGUJIAN*
+*PENGUJIAN*
+*pengujian*
+backend_ai_notes.md
+test_all_bugfixes.py
+
+# Python & Environment
+.env
+.env.*
+!.env.example
+.venv
+__pycache__/
+*.pyc
+
+# Node / pnpm
+node_modules/
+.pnpm-store
+.next/
+out/
