@@ -58,9 +58,9 @@ class TestKnowledgeSafeUnit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload2.ai_summary, "Updated AI Summary")
         self.assertIsNone(payload2.title)
 
-        # 3. Update type & metadata
-        payload3 = KnowledgeUpdate(type=KnowledgeType.TREATMENT, metadata_={"category": "Facial"})
-        self.assertEqual(payload3.type, KnowledgeType.TREATMENT)
+        # 3. Update content & metadata
+        payload3 = KnowledgeUpdate(content="Updated content text", metadata_={"category": "Facial"})
+        self.assertEqual(payload3.content, "Updated content text")
         self.assertEqual(payload3.metadata_, {"category": "Facial"})
 
     def test_router_routes_registered(self):
@@ -123,9 +123,11 @@ class TestKnowledgeSafeUnit(unittest.IsolatedAsyncioTestCase):
         mock_result.scalar_one_or_none.return_value = self.mock_doc
         mock_db.execute.return_value = mock_result
 
+        mock_request = MagicMock()
         with patch("os.path.exists", return_value=False):
             res = await delete_knowledge(
                 knowledge_id=self.dummy_doc_id,
+                request=mock_request,
                 db=mock_db,
                 current_admin=self.dummy_user
             )

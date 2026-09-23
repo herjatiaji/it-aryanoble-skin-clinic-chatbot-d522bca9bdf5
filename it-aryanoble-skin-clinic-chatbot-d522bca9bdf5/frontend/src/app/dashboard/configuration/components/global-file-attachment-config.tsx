@@ -1,52 +1,25 @@
 "use client";
 
+import { ConfirmationModal } from "@/components/shared/confirmation-modal";
 import { Switch } from "@/components/ui/switch";
-import * as React from "react";
-import { toast } from "sonner";
-import { useConfigs, useUpdateConfig } from "../hooks/use-config";
 import { RiLoader4Line } from "@remixicon/react";
+import { useFileAttachmentState } from "../hooks/use-file-attachment-state";
+import { ConfigCardSkeleton } from "./skeletons/config-card-skeleton";
 
 export function GlobalFileAttachmentConfig() {
-	const { data: configs, isLoading } = useConfigs();
-	const updateConfig = useUpdateConfig();
-
-	// Find config, default to "false" if not found
-	const fileAttachmentConfig = configs?.find((c) => c.key === "AI_PROMPT_FILE_ATTACHMENTS")?.value || "false";
-	const isChecked = fileAttachmentConfig === "true";
-
-	const [isUpdating, setIsUpdating] = React.useState(false);
-	const [localChecked, setLocalChecked] = React.useState(false);
-
-	React.useEffect(() => {
-		if (configs) {
-			setTimeout(() => {
-				setLocalChecked(isChecked);
-			}, 0);
-		}
-	}, [configs, isChecked]);
-
-	const handleToggle = (checked: boolean) => {
-		setLocalChecked(checked);
-		setIsUpdating(true);
-		
-		updateConfig.mutate(
-			{ key: "AI_PROMPT_FILE_ATTACHMENTS", data: { value: checked.toString() } },
-			{
-				onSuccess: () => {
-					setIsUpdating(false);
-					toast.success("AI Prompt File Attachments setting updated successfully!");
-				},
-				onError: () => {
-					// Revert on error
-					setLocalChecked(!checked);
-					setIsUpdating(false);
-				}
-			}
-		);
-	};
+	const {
+		isLoading,
+		isUpdating,
+		localChecked,
+		confirmModalOpen,
+		handleOpenChange,
+		pendingChecked,
+		handleInitiateToggle,
+		handleConfirmToggle,
+	} = useFileAttachmentState();
 
 	if (isLoading) {
-		return <div className="p-4 text-center text-sm text-gray-500">Loading configuration...</div>;
+		return <ConfigCardSkeleton lines={1} />;
 	}
 
 	return (
@@ -65,16 +38,36 @@ export function GlobalFileAttachmentConfig() {
 
 					<div className="flex items-center gap-3">
 						<Switch
+							id="global-file-attachment-switch"
 							checked={localChecked}
-							onCheckedChange={handleToggle}
-							disabled={updateConfig.isPending || isUpdating}
+							onCheckedChange={handleInitiateToggle}
+							disabled={isUpdating}
+							className="cursor-pointer"
 						/>
-						<span className="text-sm text-black-400">
-							{localChecked ? "Don't allow file attachment" : "Allow file attachment"}
-						</span>
+						<label
+							htmlFor="global-file-attachment-switch"
+							className="text-sm text-black-400 cursor-pointer select-none"
+						>
+							{localChecked ? "Allow file attachment" : "Don't allow file attachment"}
+						</label>
 					</div>
 				</div>
 			</div>
+
+			<ConfirmationModal
+				isOpen={confirmModalOpen}
+				onOpenChange={handleOpenChange}
+				title={pendingChecked ? "Allow File Attachments" : "Disallow File Attachments"}
+				description={
+					pendingChecked
+						? "Are you sure you want to allow doctors to attach files when asking questions to the AI assistant?"
+						: "Are you sure you want to disallow doctors from attaching files when asking questions to the AI assistant?"
+				}
+				confirmText={pendingChecked ? "Allow" : "Disallow"}
+				variant={pendingChecked ? "primary" : "destructive"}
+				isLoading={isUpdating}
+				onConfirm={handleConfirmToggle}
+			/>
 		</div>
 	);
 }

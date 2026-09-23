@@ -4,17 +4,21 @@ import FloatingChatbot from '../components/FloatingChatbot'
 
 export default function Dashboard() {
   const navigate = useNavigate()
-  const [doctor, setDoctor] = useState(null)
+  const [doctor] = useState(() => {
+    try {
+      const docData = localStorage.getItem('cis_doctor')
+      return docData ? JSON.parse(docData) : null
+    } catch {
+      return null
+    }
+  })
 
   useEffect(() => {
     const token = localStorage.getItem('cis_token')
-    const docData = localStorage.getItem('cis_doctor')
-    if (!token || !docData) {
+    if (!token || !doctor) {
       navigate('/')
-    } else {
-      setDoctor(JSON.parse(docData))
     }
-  }, [navigate])
+  }, [doctor, navigate])
 
   const handleLogout = () => {
     localStorage.removeItem('cis_token')
@@ -23,6 +27,10 @@ export default function Dashboard() {
   }
 
   if (!doctor) return null
+
+  const activeBranch = doctor.user_branchs?.find((b) => b.status === "1" || b.status === 1) || doctor.user_branchs?.[0]
+  const branchCode = activeBranch?.branch_code || (doctor.ecosystem?.toLowerCase() === 'dermies' ? '034' : '011')
+  const branchId = activeBranch?.branch_id ? String(activeBranch.branch_id) : (doctor.ecosystem?.toLowerCase() === 'dermies' ? '847' : '838')
 
   return (
     <div style={{ 
@@ -40,7 +48,7 @@ export default function Dashboard() {
           External CIS Dashboard (Mock)
         </h1>
         <p style={{ color: '#52525b', fontSize: '0.875rem', marginBottom: '1rem' }}>
-          Logged in as: {doctor.name}
+          Logged in as: {doctor.name} ({doctor.ecosystem || 'Default'} - Branch {branchCode})
         </p>
         <button 
           onClick={handleLogout}
@@ -53,8 +61,9 @@ export default function Dashboard() {
       <FloatingChatbot 
         token={localStorage.getItem('cis_token')}
         doctorName={doctor ? doctor.name : 'Unknown'}
-        branchId="11111111-1111-1111-1111-111111111111" // In a real app, this would be fetched from context or state
-        apiBaseUrl="http://localhost:8000"
+        branchCode={branchCode}
+        branchId={branchId}
+        apiBaseUrl={typeof window !== 'undefined' ? window.location.origin : ''}
       />
     </div>
   )

@@ -1,7 +1,7 @@
 # Stage 1: Base image with Corepack enabled for PNPM support
 FROM node:22-alpine AS base
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@11.9.0  --activate 
+RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
 
 # Stage 2: Dependencies layer
 FROM base AS deps
@@ -19,6 +19,8 @@ CMD ["pnpm", "dev"]
 
 # Stage 4: Production builder
 FROM base AS builder
+ARG NEXT_PUBLIC_API_URL=https://dokterpedia-api-dev.aryanoble.web.id/api
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .

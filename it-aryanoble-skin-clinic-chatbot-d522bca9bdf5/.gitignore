@@ -16,3 +16,30 @@ backend/data/bm25_index.pkl
 !backend/data/temp/.gitkeep
 !backend/data/pending/.gitkeep
 !backend/data/output/.gitkeep
+backend/tests/
+backend/scripts/
+scripts/
+data/
+
+# pnpm store and cache
+.pnpm-store
+**/.pnpm-store/
+
+scratch/
+
+# Test & dummy documents and scripts
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+backend/*.pdf
+backend/*.docx
+backend/*.xlsx
+backend/*.pptx
+backend/generate_dummy_docs.py
+backend/ingest_dummy_to_db.py
+backend/test_dummy_parse.py
+*DUMMY*
+*dummy*
+DUMMY_TEST_*
+

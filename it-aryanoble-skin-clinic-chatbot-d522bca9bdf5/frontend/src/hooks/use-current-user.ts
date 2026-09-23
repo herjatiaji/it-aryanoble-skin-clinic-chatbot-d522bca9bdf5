@@ -3,6 +3,7 @@ import { api } from "@/lib/axios";
 import type { UserResponse } from "@/lib/types";
 
 import { authKeys } from "@/app/login/api/keys";
+import { AxiosError } from "axios";
 
 export const useCurrentUser = () => {
   return useQuery({
@@ -11,7 +12,15 @@ export const useCurrentUser = () => {
       const response = await api.get("/users/me");
       return response.data;
     },
-    retry: 0, // Don't retry if it fails (e.g., 401 Unauthorized)
+    retry: (failureCount, error) => {
+      if (error instanceof AxiosError && error.response) {
+        if (error.response.status === 401 || error.response.status === 403) {
+          return false;
+        }
+      }
+      return failureCount < 2;
+    },
+    retryDelay: 1000,
     staleTime: 5 * 60 * 1000, // Cache for 5 minutes
   });
 };

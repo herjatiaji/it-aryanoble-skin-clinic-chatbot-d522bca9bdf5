@@ -6,6 +6,7 @@ from loguru import logger
 
 from sqlalchemy import create_engine, Column, String, Text, Integer, JSON, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+# pyrefly: ignore [missing-import]
 from pgvector.sqlalchemy import Vector
 
 from app.rag.services.interfaces import BaseVectorStoreAdapter
@@ -26,7 +27,12 @@ class DocumentChunk(Base):
 
 class PGVectorAdapter(BaseVectorStoreAdapter):
     def __init__(self):
-        self.conn_str = settings.pg_conn_str
+        conn_str = settings.pg_conn_str
+        try:
+            import psycopg
+        except ImportError:
+            conn_str = conn_str.replace("postgresql+psycopg://", "postgresql+psycopg2://")
+        self.conn_str = conn_str
         self.collection_name = settings.pg_collection_name
         
         # Instantiate embedding adapter first to get dimension
@@ -35,7 +41,7 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
         
         logger.info(f"Initializing PGVector client (Dimension: {dim})...")
         try:
-            self.engine = create_engine(self.conn_str)
+            self.engine = create_engine(self.conn_str, pool_pre_ping=True, pool_recycle=300)
             with self.engine.connect() as conn:
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
                 conn.commit()
@@ -44,7 +50,7 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
                 check_table_sql = text("""
                     SELECT atttypmod 
                     FROM pg_attribute 
-                    WHERE attrelid = :tablename::regclass AND attname = 'embedding';
+                    WHERE attrelid = to_regclass(:tablename) AND attname = 'embedding';
                 """)
                 try:
                     result = conn.execute(check_table_sql, {"tablename": self.collection_name}).fetchone()
@@ -75,6 +81,20 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
                     ON {self.collection_name} USING hnsw (embedding vector_cosine_ops)
                     WITH (m = 16, ef_construction = 100);
                 """))
+
+                # Create GIN index on metadata JSONB if not exists
+                gin_index_name = f"idx_{self.collection_name}_metadata_gin"
+                conn.execute(text(f"""
+                    CREATE INDEX IF NOT EXISTS {gin_index_name} 
+                    ON {self.collection_name} USING gin (metadata);
+                """))
+
+                # Create B-Tree index on source_file if not exists
+                source_index_name = f"idx_{self.collection_name}_source_file"
+                conn.execute(text(f"""
+                    CREATE INDEX IF NOT EXISTS {source_index_name} 
+                    ON {self.collection_name} (source_file);
+                """))
                 conn.commit()
                 
             self.Session = sessionmaker(bind=self.engine)
@@ -97,15 +117,20 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
             metadata = chunk.get("metadata", {})
             source_file = metadata.get("source_file", "unknown")
             
-            product_name = source_file
-            for ext in [".pdf", ".docx", ".txt", "_parsed.json"]:
+            product_name = metadata.get("product_name") or metadata.get("title") or source_file
+            for ext in [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".csv", ".jpg", ".jpeg", ".png", ".webp", "_parsed.json"]:
                 product_name = product_name.replace(ext, "")
             product_name = product_name.replace("dumy-", "").replace("dummy-", "").replace("Dummy_", "").replace("dummy_", "")
             product_name = product_name.replace("-", " ").replace("_", " ")
             product_name = product_name.strip()
             
             section = metadata.get("section", "General")
-            enriched_text = f"Product: {product_name} | Section: {section} | Content: {chunk['text']}"
+            sku = metadata.get("sku") or metadata.get("product_id") or metadata.get("item_code")
+            if not sku and isinstance(metadata.get("extracted_information"), dict):
+                ext_info = metadata["extracted_information"]
+                sku = ext_info.get("sku") or ext_info.get("product_id") or ext_info.get("item_code")
+            sku_header = f" | SKU: {sku}" if sku else ""
+            enriched_text = f"Product: {product_name}{sku_header} | Section: {section} | Content: {chunk['text']}"
             texts_to_embed.append(enriched_text)
             
         embeddings = self.embeddings.embed_documents(texts_to_embed)
@@ -148,14 +173,21 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
                 q = session.query(DocumentChunk, dist_col)
                 
                 if filter_metadata:
+                    from sqlalchemy import cast, String, not_, or_
                     for k, v in filter_metadata.items():
-                        if isinstance(v, list):
-                            from sqlalchemy import or_
-                            or_clauses = [DocumentChunk.metadata_[k].astext.ilike(f"%{item}%") for item in v if item]
+                        if k == "excluded_categories" and isinstance(v, list):
+                            for item in v:
+                                if item:
+                                    q = q.filter(not_(cast(DocumentChunk.metadata_["categories"], String).ilike(f"%{item}%")))
+                        elif isinstance(v, list):
+                            or_clauses = [cast(DocumentChunk.metadata_[k], String).ilike(f"%{item}%") for item in v if item]
+                            if "all" in v:
+                                or_clauses.append(cast(DocumentChunk.metadata_[k], String).ilike("%all%"))
+                                or_clauses.append(DocumentChunk.metadata_[k].is_(None))
                             if or_clauses:
                                 q = q.filter(or_(*or_clauses))
                         elif v:
-                            q = q.filter(DocumentChunk.metadata_[k].astext.ilike(f"%{v}%"))
+                            q = q.filter(cast(DocumentChunk.metadata_[k], String).ilike(f"%{v}%"))
                         
                 results = q.order_by(dist_col).limit(top_k).all()
                 
@@ -173,15 +205,36 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
             logger.error(f"Search failed in PGVector store: {e}")
             return []
 
-    def delete_document(self, source_file: str):
+    def delete_document(self, identifier: str):
         try:
-            logger.info(f"Deleting chunks for source_file: {source_file}")
+            logger.info(f"Deleting chunks for identifier: {identifier}")
+            from sqlalchemy import text
+            src_str = str(identifier).strip()
+            clean_id = src_str.replace("_parsed.json", "").replace(".json", "").replace(".pdf", "").strip()
+            
             with self.Session() as session:
-                session.query(DocumentChunk).filter_by(source_file=source_file).delete()
+                result = session.execute(text(f"""
+                    DELETE FROM {self.collection_name}
+                    WHERE source_file = :src
+                       OR source_file ILIKE :src_like
+                       OR source_file ILIKE :clean_like
+                       OR metadata ->> 'knowledge_id' = :src
+                       OR metadata ->> 'knowledge_id' = :clean_id
+                       OR metadata ->> 'file_name' = :src
+                       OR metadata ->> 'file_name' ILIKE :clean_like
+                       OR metadata ->> 'title' = :src
+                       OR metadata ->> 'title' ILIKE :clean_like
+                """), {
+                    "src": src_str,
+                    "src_like": f"%{src_str}%",
+                    "clean_id": clean_id,
+                    "clean_like": f"%{clean_id}%"
+                })
                 session.commit()
-            logger.info(f"Successfully deleted chunks for {source_file} from PGVector.")
+                deleted_rows = result.rowcount
+            logger.info(f"Successfully deleted {deleted_rows} chunks for '{identifier}' from PGVector.")
         except Exception as e:
-            logger.error(f"Failed to delete chunks for {source_file}: {e}")
+            logger.error(f"Failed to delete chunks for {identifier}: {e}")
             raise
 
     def clear_all(self):

@@ -29,8 +29,13 @@ async def get_generation_pipeline(request: Request, db: AsyncSession = Depends(g
     hybrid_retriever = request.app.state.hybrid_retriever
     try:
         llm_adapter = await AdapterFactory.get_dynamic_llm(db)
+        medical_agent = await get_medical_agent(request, db)
         if hybrid_retriever and llm_adapter:
-            return GenerationPipeline(retriever=hybrid_retriever, llm_adapter=llm_adapter)
+            return GenerationPipeline(
+                retriever=hybrid_retriever, 
+                llm_adapter=llm_adapter,
+                medical_agent=medical_agent
+            )
     except Exception as e:
         logger.error(f"Failed to create dynamic generation pipeline: {e}")
     return request.app.state.generation_pipeline

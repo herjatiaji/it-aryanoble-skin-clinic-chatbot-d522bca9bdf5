@@ -28,7 +28,7 @@ FROM runtime-base AS development
 COPY . .
 
 RUN chmod +x /app/start.sh
-RUN mkdir -p data/temp logs
+RUN mkdir -p data/temp data/pending data/output logs
 
 EXPOSE 8000
 
@@ -40,7 +40,7 @@ FROM runtime-base AS production
 COPY . .
 
 RUN chmod +x /app/start.sh
-RUN mkdir -p data/temp logs
+RUN mkdir -p data/temp data/pending data/output logs
 
 EXPOSE 8000
 

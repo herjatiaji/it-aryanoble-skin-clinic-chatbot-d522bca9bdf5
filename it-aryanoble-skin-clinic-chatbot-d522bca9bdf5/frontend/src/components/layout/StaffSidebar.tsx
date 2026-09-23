@@ -12,58 +12,63 @@ import {
 	SidebarRail,
 } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
-import {
-	RiDatabase2Line,
-	RiHistoryLine,
-	RiUser3Line,
-	RiSettings4Line,
-	RiRobot2Line,
-	RiFileAddLine,
-	RiFunctionLine,
-	RiBuilding4Line,
-} from "@remixicon/react";
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { SidebarProfileMenu } from "@/components/shared/SidebarProfileMenu";
+import { RiRobot2Line, RiFileAddLine } from "@remixicon/react";
+import { SidebarProfileMenu } from "./sidebar-profile-menu";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 
-const staffNav = [
+interface NavItem {
+	title: string;
+	url: string;
+	iconSrc: string;
+	requiredAccess: string | string[];
+}
+
+const staffNav: NavItem[] = [
 	{
 		title: "Knowledge Base",
 		url: "/dashboard/knowledge",
-		icon: RiDatabase2Line,
+		iconSrc: "/icons/database.png",
 		requiredAccess: "knowledge:read",
 	},
 	{
 		title: "Chat History",
 		url: "/dashboard/chat-history",
-		icon: RiHistoryLine,
+		iconSrc: "/icons/history.png",
 		requiredAccess: "chats:read",
-	},
-	{
-		title: "User",
-		url: "/dashboard/users",
-		icon: RiUser3Line,
-		requiredAccess: "users:read",
 	},
 	{
 		title: "Category",
 		url: "/dashboard/category",
-		icon: RiFunctionLine,
+		iconSrc: "/icons/boxes.png",
 		requiredAccess: "categories:read",
 	},
 	{
 		title: "Branch",
 		url: "/dashboard/branches",
-		icon: RiBuilding4Line,
+		iconSrc: "/icons/store.png",
 		requiredAccess: "branches:read",
+	},
+	{
+		title: "User",
+		url: "/dashboard/users",
+		iconSrc: "/icons/user.png",
+		requiredAccess: "users:read",
+	},
+	{
+		title: "Roles",
+		url: "/dashboard/roles",
+		iconSrc: "/icons/user-cog.png",
+		requiredAccess: ["roles:read", "users:read"],
 	},
 	{
 		title: "Configuration",
 		url: "/dashboard/configuration",
-		icon: RiSettings4Line,
-		requiredAccess: "branches:read",
+		iconSrc: "/icons/wrench.png",
+		requiredAccess: ["configuration:read", "branches:read"],
 	},
 ];
 
@@ -73,7 +78,12 @@ export function StaffSidebar({ ...props }: React.ComponentProps<typeof Sidebar>)
 
 	const userAccesses = user?.accesses || [];
 
-	const visibleNav = staffNav.filter((item) => userAccesses.includes(item.requiredAccess));
+	const visibleNav = staffNav.filter((item) => {
+		if (Array.isArray(item.requiredAccess)) {
+			return item.requiredAccess.some((acc) => userAccesses.includes(acc));
+		}
+		return userAccesses.includes(item.requiredAccess);
+	});
 
 	return (
 		<Sidebar collapsible="icon" {...props} className="border-r border-border">
@@ -84,13 +94,15 @@ export function StaffSidebar({ ...props }: React.ComponentProps<typeof Sidebar>)
 							size="lg"
 							render={<Link href="/dashboard/knowledge" />}
 							className="hover:bg-transparent hover:text-inherit active:bg-transparent cursor-default p-0 group-data-[collapsible=icon]:justify-center"
+							tooltip="ERHA Medical Assistant"
 						>
-							<div className="flex aspect-square size-10 group-data-[collapsible=icon]:size-8 shrink-0 items-center justify-center rounded-md bg-blue-50 text-blue-500">
-								<RiRobot2Line className="size-5 group-data-[collapsible=icon]:size-4" />
+							<div className="flex aspect-square size-10 group-data-[collapsible=icon]:size-8 shrink-0 items-center justify-center rounded-md bg-blue-50 text-blue-700">
+								<RiRobot2Line className="size-6 group-data-[collapsible=icon]:size-5 text-blue-700" />
 							</div>
-							<div className="flex flex-col gap-1 leading-none ml-2 group-data-[collapsible=icon]:hidden">
-								<span className="font-semibold text-blue-500 text-sm">ERHA</span>
-								<span className="font-semibold text-blue-500 text-sm">Medical Assistant</span>
+							<div className="flex flex-col gap-0.5 leading-none group-data-[collapsible=icon]:hidden overflow-hidden">
+								<span className="font-semibold text-blue-700 text-sm whitespace-nowrap">
+									ERHA Medical Assistant
+								</span>
 							</div>
 						</SidebarMenuButton>
 					</SidebarMenuItem>
@@ -103,7 +115,7 @@ export function StaffSidebar({ ...props }: React.ComponentProps<typeof Sidebar>)
 						<Button
 							render={<Link href="/dashboard/ingest" />}
 							nativeButton={false}
-							className="w-full justify-center bg-blue-500 hover:bg-blue-600 text-white shadow-none h-10 px-3 rounded-md group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:p-0 shrink-0"
+							className="w-full justify-center bg-blue-600 hover:bg-blue-700 text-white shadow-none h-10 px-3 rounded-lg group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:p-0 shrink-0 cursor-pointer"
 						>
 							<RiFileAddLine className="mr-2 size-5 group-data-[collapsible=icon]:mr-0 group-data-[collapsible=icon]:size-4 shrink-0" />
 							<span className="font-medium text-sm group-data-[collapsible=icon]:hidden">
@@ -125,7 +137,15 @@ export function StaffSidebar({ ...props }: React.ComponentProps<typeof Sidebar>)
 									}
 									tooltip={item.title}
 								>
-									<item.icon className="size-4" />
+									<Image
+										src={item.iconSrc}
+										alt={item.title}
+										width={16}
+										height={16}
+										className={`size-4 shrink-0 object-contain ${
+											isActive ? "opacity-100" : "opacity-75"
+										}`}
+									/>
 									<span className="font-medium">{item.title}</span>
 								</SidebarMenuButton>
 							</SidebarMenuItem>

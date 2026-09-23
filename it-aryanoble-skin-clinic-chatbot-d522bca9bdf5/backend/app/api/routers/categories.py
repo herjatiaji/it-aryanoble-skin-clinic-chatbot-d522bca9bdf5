@@ -13,12 +13,45 @@ from datetime import datetime, timezone
 
 router = APIRouter(tags=["Categories"])
 
-@router.get("/", response_model=List[CategoryResponse])
+from app.schemas.pagination import PaginatedResponse
+from typing import List, Optional, Union
+from fastapi import Query
+from sqlalchemy import func
+import math
+
+@router.get("/", response_model=Union[PaginatedResponse[CategoryResponse], List[CategoryResponse]])
 async def list_categories(
+    search: Optional[str] = None,
+    page: Optional[int] = Query(None, ge=1, description="Page number"),
+    page_size: Optional[int] = Query(None, ge=1, le=100, description="Items per page"),
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(RequireAccess("categories:read"))
 ):
     stmt = select(Category).where(Category.deleted_at.is_(None))
+    if search:
+        s_clean = f"%{search.strip()}%"
+        stmt = stmt.where(Category.name.ilike(s_clean))
+    stmt = stmt.order_by(Category.name.asc())
+
+    if page is not None:
+        p_size = page_size or 10
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        count_res = await db.execute(count_stmt)
+        total = count_res.scalar() or 0
+        total_pages = max(1, math.ceil(total / p_size))
+
+        paginated_stmt = stmt.offset((page - 1) * p_size).limit(p_size)
+        result = await db.execute(paginated_stmt)
+        items = result.scalars().all()
+
+        return PaginatedResponse[CategoryResponse](
+            items=items,
+            total=total,
+            page=page,
+            page_size=p_size,
+            total_pages=total_pages
+        )
+
     result = await db.execute(stmt)
     return result.scalars().all()
 

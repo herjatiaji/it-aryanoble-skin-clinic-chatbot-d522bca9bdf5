@@ -37,3 +37,10 @@ class BaseLLMAdapter(ABC):
     @abstractmethod
     def generate(self, prompt: str) -> str:
         pass
+
+    @abstractmethod
+    async def generate_stream(self, prompt: str):
+        """
+        Yields tokens asynchronously from the LLM.
+        """
+        pass

@@ -5,10 +5,10 @@ export const editTokenSchema = z.object({
 		z.number().min(0),
 		z
 			.string()
-			.refine((val) => val === "" || !isNaN(parseInt(val, 10)), {
+			.refine((val) => val === "" || !isNaN(parseInt(val.replace(/[^0-9]/g, ""), 10)), {
 				message: "Token limit must be a valid number",
 			})
-			.transform((val) => (val === "" ? 0 : parseInt(val, 10))),
+			.transform((val) => (val === "" ? 0 : parseInt(val.replace(/[^0-9]/g, ""), 10))),
 	]),
 });
 

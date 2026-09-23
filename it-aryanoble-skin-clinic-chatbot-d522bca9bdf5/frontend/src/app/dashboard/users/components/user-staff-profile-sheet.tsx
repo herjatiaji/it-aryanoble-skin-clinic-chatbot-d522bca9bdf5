@@ -1,12 +1,15 @@
 import { Button } from "@/components/ui/button";
 import { Field, FieldContent, FieldLabel, FieldTitle } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { RiDeleteBinLine, RiEyeLine, RiEyeOffLine, RiLoader4Line, RiEdit2Line, RiCheckLine, RiCloseLine } from "@remixicon/react";
-import Image from "next/image";
+import { Badge } from "@/components/ui/badge";
+import { ConfirmationModal } from "@/components/shared/confirmation-modal";
+import { RiDeleteBinLine, RiEyeLine, RiEyeOffLine, RiLoader4Line, RiEdit2Line, RiCheckLine } from "@remixicon/react";
 import { useEffect, useState } from "react";
 import { UserResponse } from "../api/types";
-import { useDeleteUser, useUpdateStaffDetails } from "../hooks/use-users";
+import { useDeleteUser, useUpdateStaffDetails, useUpdateUserRoles } from "../hooks/use-users";
+import { useRoles } from "../hooks/use-roles";
 
 export function UserStaffProfileSheet({
 	isOpen,
@@ -18,13 +21,17 @@ export function UserStaffProfileSheet({
 	staff: UserResponse | null;
 }) {
 	const [isEditing, setIsEditing] = useState(false);
+	const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
 	const [name, setName] = useState("");
 	const [email, setEmail] = useState("");
 	const [password, setPassword] = useState("");
+	const [role, setRole] = useState("");
 	const [showPassword, setShowPassword] = useState(false);
 
 	const deleteUser = useDeleteUser();
 	const updateStaff = useUpdateStaffDetails();
+	const updateRoles = useUpdateUserRoles();
+	const { data: rolesList = [] } = useRoles();
 
 	useEffect(() => {
 		if (staff && isOpen) {
@@ -32,23 +39,38 @@ export function UserStaffProfileSheet({
 				setName(staff.name || "");
 				setEmail(staff.email || "");
 				setPassword("");
+				setRole(staff.roles && staff.roles.length > 0 ? staff.roles[0].name : "Staff");
 				setIsEditing(false);
 				setShowPassword(false);
+				setIsDeleteModalOpen(false);
 			}, 0);
 		}
 	}, [staff, isOpen]);
 
-	const handleDelete = () => {
+	const handleDeleteClick = () => {
 		if (!staff) return;
-		if (confirm(`Are you sure you want to delete ${staff.name}?`)) {
-			deleteUser.mutate(staff.id, {
-				onSuccess: () => onOpenChange(false),
-			});
-		}
+		setIsDeleteModalOpen(true);
+	};
+
+	const handleConfirmDelete = () => {
+		if (!staff) return;
+		deleteUser.mutate(staff.id, {
+			onSuccess: () => {
+				setIsDeleteModalOpen(false);
+				onOpenChange(false);
+			},
+		});
 	};
 
 	const handleSave = () => {
 		if (!staff) return;
+
+		// If role changed, update role
+		const currentRole = staff.roles && staff.roles.length > 0 ? staff.roles[0].name : "Staff";
+		if (role && role !== currentRole) {
+			updateRoles.mutate({ userId: staff.id, roles: [role] });
+		}
+
 		updateStaff.mutate(
 			{
 				userId: staff.id,
@@ -77,13 +99,8 @@ export function UserStaffProfileSheet({
 					<>
 						<div className="flex-1 overflow-y-auto pb-6">
 							<div className="flex flex-col pb-4">
-								{/* Profile Cover Image */}
-								<div className="relative h-65 w-full bg-gray-100 overflow-hidden shrink-0">
-									<Image src="/placeholder.svg" alt={staff.name} fill className="object-cover" />
-								</div>
-
 								{/* Details Section */}
-								<div className="flex flex-col gap-6 px-6 py-4">
+								<div className="p-6 m-0 flex flex-col gap-6">
 									<Field>
 										<FieldLabel>
 											<FieldTitle>Name</FieldTitle>
@@ -108,9 +125,31 @@ export function UserStaffProfileSheet({
 											<FieldTitle>Role</FieldTitle>
 										</FieldLabel>
 										<FieldContent>
-											<span className="text-sm text-gray-900">
-												{staff.roles && staff.roles.length > 0 ? staff.roles[0].name : "Staff"}
-											</span>
+											{isEditing ? (
+												<Select value={role} onValueChange={(val) => setRole(val ?? "")}>
+													<SelectTrigger className="w-full border-gray-200 bg-white text-gray-700">
+														<SelectValue placeholder="Select one role" />
+													</SelectTrigger>
+													<SelectContent alignItemWithTrigger={false} sideOffset={4}>
+														{rolesList.length === 0 ? (
+															<SelectItem value="Staff">Staff</SelectItem>
+														) : (
+															rolesList.map((r) => (
+																<SelectItem key={r.id} value={r.name}>
+																	{r.name}
+																</SelectItem>
+															))
+														)}
+													</SelectContent>
+												</Select>
+											) : (
+												<Badge
+													variant="secondary"
+													className="bg-blue-50 text-blue-700 border-blue-200 font-medium text-xs uppercase"
+												>
+													{staff.roles && staff.roles.length > 0 ? staff.roles[0].name : "Staff"}
+												</Badge>
+											)}
 										</FieldContent>
 									</Field>
 
@@ -153,7 +192,7 @@ export function UserStaffProfileSheet({
 													<Button
 														variant="ghost"
 														size="icon"
-														className="absolute right-0 top-0 text-gray-500 hover:text-gray-700"
+														className="absolute right-0 top-0 text-zinc-600 hover:text-zinc-900"
 														onClick={() => setShowPassword(!showPassword)}
 														type="button"
 													>
@@ -171,23 +210,36 @@ export function UserStaffProfileSheet({
 									</Field>
 
 									{!isEditing && (
-										<Field>
-											<FieldLabel>
-												<FieldTitle>Date & Time Created</FieldTitle>
-											</FieldLabel>
-											<FieldContent>
-												<span className="text-sm text-gray-900">
-													{new Date(staff.created_at).toLocaleString("en-US", {
-														year: "numeric",
-														month: "numeric",
-														day: "numeric",
-														hour: "numeric",
-														minute: "numeric",
-														hour12: true,
-													})}
-												</span>
-											</FieldContent>
-										</Field>
+										<>
+											<Field>
+												<FieldLabel>
+													<FieldTitle>Tokens Used This Month</FieldTitle>
+												</FieldLabel>
+												<FieldContent>
+													<span className="text-sm text-gray-900 font-medium">
+														{(staff.tokens_used ?? 0).toLocaleString()} tokens
+													</span>
+												</FieldContent>
+											</Field>
+
+											<Field>
+												<FieldLabel>
+													<FieldTitle>Date & Time Created</FieldTitle>
+												</FieldLabel>
+												<FieldContent>
+													<span className="text-sm text-gray-900">
+														{new Date(staff.created_at).toLocaleString("en-US", {
+															year: "numeric",
+															month: "numeric",
+															day: "numeric",
+															hour: "numeric",
+															minute: "numeric",
+															hour12: true,
+														})}
+													</span>
+												</FieldContent>
+											</Field>
+										</>
 									)}
 								</div>
 							</div>
@@ -196,8 +248,9 @@ export function UserStaffProfileSheet({
 						{isEditing ? (
 							<div className="p-4 border-t border-gray-200 bg-white flex justify-end gap-3">
 								<Button
+									type="button"
 									variant="outline"
-									className="bg-white border-gray-200 text-gray-700 hover:bg-gray-50 hover:text-gray-900"
+									className="border-gray-200 bg-white text-zinc-700 hover:bg-zinc-50 rounded-lg px-4 h-10 font-medium text-sm transition-colors cursor-pointer shadow-none"
 									onClick={() => {
 										setIsEditing(false);
 										if (staff) {
@@ -207,18 +260,18 @@ export function UserStaffProfileSheet({
 										}
 									}}
 								>
-									<RiCloseLine className="mr-2 h-4 w-4 shrink-0" />
 									Cancel
 								</Button>
 								<Button
-									className="bg-blue-600 hover:bg-blue-700 text-white"
+									type="button"
+									className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-4 h-10 font-medium text-sm transition-colors cursor-pointer shadow-none disabled:opacity-50"
 									onClick={handleSave}
 									disabled={updateStaff.isPending}
 								>
 									{updateStaff.isPending ? (
-										<RiLoader4Line className="mr-2 h-4 w-4 animate-spin shrink-0" />
+										<RiLoader4Line className="mr-1.5 h-4 w-4 animate-spin shrink-0" />
 									) : (
-										<RiCheckLine className="mr-2 h-4 w-4 shrink-0" />
+										<RiCheckLine className="mr-1.5 h-4 w-4 shrink-0" />
 									)}
 									{updateStaff.isPending ? "Saving..." : "Save Changes"}
 								</Button>
@@ -226,23 +279,21 @@ export function UserStaffProfileSheet({
 						) : (
 							<div className="p-4 border-t border-gray-200 bg-white flex justify-end gap-3">
 								<Button
+									type="button"
 									variant="outline"
-									className="border-red-500 text-red-600 hover:bg-red-50 hover:text-red-700 disabled:opacity-50"
-									onClick={handleDelete}
+									className="border-red-200 text-red-600 hover:bg-red-50 hover:border-red-300 rounded-lg px-4 h-10 font-medium text-sm transition-colors cursor-pointer shadow-none disabled:opacity-50"
+									onClick={handleDeleteClick}
 									disabled={deleteUser.isPending}
 								>
-									{deleteUser.isPending ? (
-										<RiLoader4Line className="mr-2 h-4 w-4 animate-spin shrink-0" />
-									) : (
-										<RiDeleteBinLine className="mr-2 h-4 w-4 shrink-0" />
-									)}
-									{deleteUser.isPending ? "Deleting..." : "Delete User"}
+									<RiDeleteBinLine className="mr-1.5 h-4 w-4 shrink-0" />
+									Delete User
 								</Button>
 								<Button
-									className="bg-blue-600 text-white hover:bg-blue-700"
+									type="button"
+									className="bg-blue-600 text-white hover:bg-blue-700 rounded-lg px-4 h-10 font-medium text-sm transition-colors cursor-pointer shadow-none"
 									onClick={() => setIsEditing(true)}
 								>
-									<RiEdit2Line className="mr-2 h-4 w-4 shrink-0" />
+									<RiEdit2Line className="mr-1.5 h-4 w-4 shrink-0" />
 									Edit Profile
 								</Button>
 							</div>
@@ -250,6 +301,18 @@ export function UserStaffProfileSheet({
 					</>
 				)}
 			</SheetContent>
+
+			{/* Delete User Confirmation Modal */}
+			<ConfirmationModal
+				isOpen={isDeleteModalOpen}
+				onOpenChange={setIsDeleteModalOpen}
+				title="Delete User"
+				description={`Are you sure you want to delete ${staff?.name || "this user"}? This action cannot be undone.`}
+				confirmText="Delete User"
+				variant="destructive"
+				isLoading={deleteUser.isPending}
+				onConfirm={handleConfirmDelete}
+			/>
 		</Sheet>
 	);
 }

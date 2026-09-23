@@ -7,6 +7,9 @@ env/
 venv/
 .env
 .venv/
-.pytest_cache/
-.coverage
-htmlcov/
+.git/
+data/
+data/temp/
+data/pending/
+data/output/
+data/uploads/

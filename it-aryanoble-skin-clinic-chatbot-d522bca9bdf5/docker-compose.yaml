@@ -1,6 +1,8 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    container_name: skin_clinic_db
+    restart: always
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -10,7 +12,26 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres -d arya_noble" ]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d arya_noble"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: skin_clinic_minio
+    restart: always
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -19,17 +40,31 @@ services:
     build:
       context: ./backend
       target: development
+    container_name: skin_clinic_backend
+    restart: always
+    cpus: 1.5
+    mem_limit: 3000m
     ports:
       - "8000:8000"
     env_file:
       - ./backend/.env
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/arya_noble
+      - PG_HOST=db
+      - PG_PORT=5432
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
     depends_on:
       db:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", 'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/health'')"' ]
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/health'')"',
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -42,10 +77,17 @@ services:
     build:
       context: ./frontend
       target: development
+    container_name: skin_clinic_frontend
+    restart: always
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000/api
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000/api}
+      - CI=true
+      - NODE_OPTIONS=--max-old-space-size=1024
+      - WATCHPACK_POLLING=true
+    cpus: 2
+    mem_limit: 1536m
     depends_on:
       backend:
         condition: service_healthy
@@ -57,16 +99,17 @@ services:
   mock-cis:
     build:
       context: ./mock-cis
+    container_name: skin_clinic_mock_cis
+    restart: always
     ports:
       - "8001:8001"
     environment:
+      - BACKEND_URL=http://backend:8000
       - BACKEND_WEBHOOK_URL=http://backend:8000/api/webhooks/cis
-    command: [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--reload-dir", "/app" ]
-    volumes:
-      - ./mock-cis/main.py:/app/main.py
     depends_on:
       backend:
         condition: service_healthy
 
 volumes:
   pgdata:
+  minio_data:

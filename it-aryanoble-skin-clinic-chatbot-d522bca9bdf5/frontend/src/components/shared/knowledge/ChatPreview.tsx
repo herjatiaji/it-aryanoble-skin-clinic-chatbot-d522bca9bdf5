@@ -123,9 +123,11 @@ export function ChatPreview({
 				const response = await api.post(endpoint, {
 					prompt: userMsg.content,
 				});
-				const chatResponse = response.data.summary
-					? `Here is the updated summary:\n\n${response.data.summary}`
-					: "I've updated the document summary based on your instructions.";
+				const chatResponse = response.data.reply
+					|| response.data.answer
+					|| (response.data.summary
+						? `Here is the updated summary:\n\n${response.data.summary}`
+						: "I've updated the document summary based on your instructions.");
 				setUserChatMessages((prev) => [...prev, { role: "assistant", content: chatResponse }]);
 
 				if (knowledgeId) {

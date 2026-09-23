@@ -1,103 +1,166 @@
 # Mock CIS (Clinic Information System) Service
 
-This module simulates the external **Clinic Information System (CIS)** environment. It serves as both a testing ground and a **reference implementation** for the external CIS development team to integrate with the Arya Noble AI Chatbot ecosystem.
+This module simulates the external **Clinic Information System (CIS)** environment. It serves as both an automated integration testbed and a **reference implementation** for external CIS development teams integrating with the Arya Noble AI Chatbot ecosystem.
 
 ---
 
-## Integration Overview
+## Table of Contents
 
-The integration between the CIS and the Arya Noble AI Chatbot consists of three main pillars:
-
-1. **Master Data Synchronization**: Background webhooks to keep clinics and doctors in sync.
-2. **Seamless SSO (Single Sign-On)**: Secure token generation so doctors don't need to log in twice.
-3. **Chatbot UI Integration**: Embedding the AI assistant widget directly into the CIS dashboard.
+1. [Integration Architecture](#integration-architecture)
+2. [Master Data Synchronization (Push-Only)](#1-master-data-synchronization-push-only)
+3. [Seamless Doctor SSO Authentication](#2-seamless-doctor-sso-authentication)
+4. [Floating Chatbot Widget Integration](#3-floating-chatbot-widget-integration)
+5. [API Endpoints Reference](#api-endpoints-reference)
+6. [Local Setup & Execution](#local-setup--execution)
 
 ---
 
-## 1. Master Data Synchronization (Backend-to-Backend)
+## Integration Architecture
 
-The CIS must push real-time master data (Branches and Doctors) to the AI Chatbot Backend via **RSA-signed webhooks**.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Doctor as Clinic Doctor
+    participant CIS_UI as CIS Dashboard (Frontend)
+    participant CIS_BE as CIS Backend
+    participant Chatbot_BE as Arya Noble Chatbot Backend
 
-### How it works:
+    Note over CIS_BE,Chatbot_BE: Phase 1: Background Master Data Push
+    CIS_BE->>CIS_BE: Generate RSA-SHA256 Payload Signature
+    CIS_BE->>Chatbot_BE: POST /api/webhooks/cis (Header: X-Signature)
+    Chatbot_BE-->>CIS_BE: 200 OK (Sync Acknowledged)
 
-- **Push-Only Architecture**: The CIS pushes data to `POST /api/webhooks/cis`.
-- **Security**: Payloads must be signed using an RSA Private Key (`RS256`). The signature is sent in the `X-Signature` HTTP header.
-- **Auto-Sync**: In this mock service, data is pushed automatically every hour.
+    Note over Doctor,Chatbot_BE: Phase 2: Doctor SSO & Chatbot Initialization
+    Doctor->>CIS_UI: Log into CIS Dashboard
+    CIS_UI->>CIS_BE: Authenticate Doctor
+    CIS_BE-->>CIS_UI: Issue Doctor SSO Token (Signed via CIS RS256 Private Key)
+    CIS_UI->>Chatbot_BE: POST /api/chats/ (Authorization: Bearer <SSO_TOKEN>)
+    Chatbot_BE-->>CIS_UI: Return Chat Session ID & Settings
+
+    Note over Doctor,Chatbot_BE: Phase 3: Real-Time Consultation Chat
+    Doctor->>CIS_UI: Ask Clinical / Treatment Question
+    CIS_UI->>Chatbot_BE: POST /api/chats/{session_id}/messages/stream
+    Chatbot_BE-->>CIS_UI: SSE Token Stream (Real-Time AI Response & Citations)
+```
+
+---
+
+## 1. Master Data Synchronization (Push-Only)
+
+The CIS pushes real-time master data (Branches and Doctors) to the AI Chatbot Backend via **RSA-signed webhooks**.
+
+### Key Rules:
+- **Push-Only Architecture**: The Chatbot Backend never polls the CIS. The CIS pushes updates to `POST /api/webhooks/cis`.
+- **Security & Payload Signing**: Payloads are signed using the **CIS RSA Private Key** (`RS256`). The base64-encoded signature is transmitted in the `X-Signature` HTTP header.
+- **Automated Sync Worker**: On startup, `mock-cis` automatically pushes initial seed data (`bulk.sync`) and triggers an automated background push every **1 hour**.
 
 ### Webhook Event Types:
 
-- `branch.upsert`: Insert or update clinic branches.
-- `doctor.upsert`: Insert or update doctors.
-- `bulk.sync`: Sync all data at once.
+| Event Type | Description | Sample Payload Scope |
+| :--- | :--- | :--- |
+| `branch.upsert` | Insert or update clinic branch locations. | `branch_code`, `name`, `address`, `city`, `phone`, `status` |
+| `doctor.upsert` | Insert or update doctor credentials. | `doctor_id`, `name`, `specialization`, `branch_code`, `email` |
+| `bulk.sync` | Full master data synchronization. | List of all active branches and registered doctors |
 
 ---
 
-## 2. Seamless SSO Authentication
+## 2. Seamless Doctor SSO Authentication
 
-To provide a seamless experience, doctors logged into the CIS should automatically be authenticated when interacting with the Chatbot widget.
+To provide a seamless experience, doctors logged into the CIS are automatically authenticated when interacting with the Chatbot widget without a second login prompt.
 
-### How it works:
+```mermaid
+flowchart TD
+    DoctorLogin["Doctor logs into CIS"] --> CISAuth["CIS Backend verifies doctor"]
+    CISAuth --> GenJWT["Generate JWT signed with CIS RSA Private Key (RS256)<br/><code>sub: DR-12345, branch_code: 011</code>"]
+    GenJWT --> InjectUI["Store token in CIS Frontend localStorage"]
+    InjectUI --> WidgetPass["Pass token to &lt;FloatingChatbot token={...} /&gt;"]
+    WidgetPass --> ChatbotAuth["Chatbot Backend validates token using CIS Public Key"]
+```
 
-1. When a doctor logs into the CIS, the CIS Backend generates a **JWT (JSON Web Token)**.
-2. The token must be signed using the **CIS RSA Private Key** (`RS256` algorithm).
-3. The payload must contain the doctor's unique ID in the `sub` claim (e.g., `DR-12345`).
-4. This token is passed to the CIS Frontend (Dashboard) and stored (e.g., in `localStorage`).
-5. The Chatbot UI uses this token in the `Authorization: Bearer <TOKEN>` header for all chat interactions.
+### Token Specifications:
+- **Algorithm**: `RS256`
+- **Signing Key**: CIS RSA Private Key (`keys/cis_private_key.pem`)
+- **Required Claims**:
+  - `sub`: Unique Doctor ID (e.g. `"DR-12345"`)
+  - `name`: Doctor Full Name (e.g. `"Dr. Jane Doe, Sp.D.V.E."`)
+  - `branch_code`: Current Active Branch Code (e.g. `"011"`)
+  - `exp`: Token Expiration Timestamp
 
 ---
 
-## 3. Chatbot UI Integration (Frontend)
+## 3. Floating Chatbot Widget Integration
 
-The mock service includes a reference React implementation (`frontend/src/components/FloatingChatbot.jsx`) demonstrating how to embed the Chatbot widget.
+The mock service provides a reference implementation (`frontend/src/components/FloatingChatbot.jsx`) demonstrating how to embed the Chatbot widget inside third-party React applications.
 
-### Integration Steps for the CIS Frontend Team:
+### Integration Steps:
 
-1. **Copy the Component**: The `FloatingChatbot.jsx` and `FloatingChatbot.css` are built as pure, reusable React components.
-2. **Pass the Props**: Inject the required contextual data into the component:
+1. **Import the Component**: Copy `FloatingChatbot.jsx` and `FloatingChatbot.css` into your application.
+2. **Inject Props**:
    ```jsx
-   <FloatingChatbot
-   	token="eyJhbGciOiJSUzI1Ni... (SSO Token)"
-   	doctorName="Dr. Jane Doe, Sp.D.V.E."
-   	branchId="11111111-1111-1111-1111-111111111111"
-   	apiBaseUrl="https://api.chatbot.aryanoble.com"
-   />
+   import FloatingChatbot from "@/components/FloatingChatbot";
+
+   export default function DoctorDashboard() {
+     return (
+       <div className="cis-layout">
+         {/* CIS Dashboard Content */}
+         <FloatingChatbot
+           token="eyJhbGciOiJSUzI1Ni..."
+           doctorName="Dr. Jane Doe, Sp.D.V.E."
+           branchCode="011"
+           apiBaseUrl="http://localhost:8000"
+         />
+       </div>
+     );
+   }
    ```
-3. **API Flow inside the Component**:
-   - **Start Session**: Calls `POST /api/chats/` with the `branch_id`.
-   - **Send Message**: Calls `POST /api/chats/{session_id}/messages` using `FormData` (supports text and file attachments).
-   - **Receive Message**: Polls `GET /api/chats/{session_id}/messages` to get the AI's response (or uses WebSockets/SSE in production).
+3. **Internal Component Flow**:
+   - **Session Creation**: Calls `POST /api/chats/` with `{ branch_code: "011" }`.
+   - **SSE Streaming**: Calls `POST /api/chats/{session_id}/messages/stream` to receive real-time streaming answer tokens.
+   - **Attachments**: Supports multipart file uploads to `POST /api/chats/{session_id}/messages`.
 
 ---
 
 ## API Endpoints Reference
 
-### Chatbot Backend APIs (Target for CIS)
+### Chatbot Backend APIs (Target for CIS Integration)
 
-| Method | Endpoint                   | Description                   | Auth Required        |
-| :----- | :------------------------- | :---------------------------- | :------------------- |
-| `POST` | `/api/webhooks/cis`        | Receive Master Data sync      | `X-Signature` Header |
-| `POST` | `/api/chats/`              | Create a new chat session     | Bearer Token (RS256) |
-| `POST` | `/api/chats/{id}/messages` | Send message to AI            | Bearer Token (RS256) |
-| `GET`  | `/api/chats/{id}/messages` | Get chat history & AI replies | Bearer Token (RS256) |
+| Method | Endpoint | Description | Auth Header |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/webhooks/cis` | Receive Master Data sync payload | `X-Signature: <RSA_SHA256_BASE64>` |
+| `POST` | `/api/chats/` | Create a new doctor chat session | `Authorization: Bearer <SSO_TOKEN>` |
+| `POST` | `/api/chats/{id}/messages/stream` | Stream real-time AI response (SSE) | `Authorization: Bearer <SSO_TOKEN>` |
+| `POST` | `/api/chats/{id}/messages` | Send message with file attachments | `Authorization: Bearer <SSO_TOKEN>` |
+| `GET` | `/api/chats/{id}/messages` | Retrieve session message history | `Authorization: Bearer <SSO_TOKEN>` |
 
-### Mock CIS Endpoints (For Testing & Simulation)
+### Mock CIS Endpoints (Simulation & Testing)
 
-| Method | Endpoint               | Description                                 |
-| :----- | :--------------------- | :------------------------------------------ |
-| `POST` | `/auth/login`          | Simulates doctor login, returns RS256 token |
-| `POST` | `/trigger/push-doctor` | Manually sync a doctor to the AI backend    |
-| `POST` | `/trigger/push-all`    | Manually sync all data to the AI backend    |
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/auth/login` | Simulates doctor login and returns RS256 SSO token |
+| `POST` | `/trigger/push-doctor` | Manually sync a single doctor record to the AI backend |
+| `POST` | `/trigger/push-all` | Manually trigger a full bulk master data sync (`bulk.sync`) |
 
 ---
 
 ## Local Setup & Execution
 
-### Running the complete Mock CIS (Backend + Frontend)
+### 1. Running via Docker Compose
 
 ```bash
-# Starts the FastAPI webhook service and the Vite React Frontend
+# Run standalone Mock CIS (Backend + UI):
+docker compose -f mock-cis/docker-compose.yaml up --build
+
+# Or run within root monorepo stack:
 docker compose up --build mock-cis
 ```
 
 - **Mock CIS Dashboard (UI)**: `http://localhost:8001/dashboard`
-- **Mock CIS API (Swagger)**: `http://localhost:8001/docs`
+- **Mock CIS Swagger Docs**: `http://localhost:8001/docs`
+
+### 2. Standalone Python Run
+
+```bash
+cd mock-cis
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8001
+```

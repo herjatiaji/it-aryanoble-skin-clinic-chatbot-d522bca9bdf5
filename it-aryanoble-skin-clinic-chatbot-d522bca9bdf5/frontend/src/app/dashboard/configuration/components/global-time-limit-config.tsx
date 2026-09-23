@@ -1,45 +1,28 @@
 "use client";
 
+import { ConfirmationModal } from "@/components/shared/confirmation-modal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { RiCheckLine, RiEdit2Line, RiLoader4Line, RiInformationFill } from "@remixicon/react";
-import * as React from "react";
-import { toast } from "sonner";
-import { useConfigs, useUpdateConfig } from "../hooks/use-config";
+import { RiCheckLine, RiEdit2Line, RiInformationFill, RiLoader4Line } from "@remixicon/react";
+import { useTimeLimitState } from "../hooks/use-time-limit-state";
+import { ConfigCardSkeleton } from "./skeletons/config-card-skeleton";
 
 export function GlobalTimeLimitConfig() {
-	const { data: configs, isLoading } = useConfigs();
-	const updateConfig = useUpdateConfig();
-
-	const timeLimit = configs?.find((c) => c.key === "TIME_LIMIT_PER_SESSION")?.value || "5";
-
-	const [isEditing, setIsEditing] = React.useState(false);
-	const [timeAmount, setTimeAmount] = React.useState("5");
-
-	// Sync state when configs load, keeping it simple
-	React.useEffect(() => {
-		if (configs) {
-			// Use setTimeout to avoid synchronous setState during render phase warning in React 19 / strict mode
-			setTimeout(() => {
-				setTimeAmount(timeLimit);
-			}, 0);
-		}
-	}, [configs, timeLimit]);
-
-	const handleSave = () => {
-		updateConfig.mutate(
-			{ key: "TIME_LIMIT_PER_SESSION", data: { value: timeAmount } },
-			{
-				onSuccess: () => {
-					setIsEditing(false);
-					toast.success("Time limit per session updated successfully!");
-				},
-			},
-		);
-	};
+	const {
+		isLoading,
+		isPending,
+		isEditing,
+		setIsEditing,
+		timeAmount,
+		setTimeAmount,
+		isConfirmOpen,
+		setIsConfirmOpen,
+		handleCancel,
+		handleConfirmSave,
+	} = useTimeLimitState();
 
 	if (isLoading) {
-		return <div className="p-4 text-center text-sm text-gray-500">Loading configuration...</div>;
+		return <ConfigCardSkeleton lines={1} />;
 	}
 
 	return (
@@ -59,9 +42,11 @@ export function GlobalTimeLimitConfig() {
 							<div className="relative">
 								<Input
 									type="number"
+									min={1}
 									disabled={!isEditing}
 									value={timeAmount}
 									onChange={(e) => setTimeAmount(e.target.value)}
+									onWheel={(e) => (e.target as HTMLInputElement).blur()}
 									className="w-60 bg-black-50 border-black-50 text-black-500 h-10 rounded-lg [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none disabled:opacity-75"
 								/>
 								<span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-black-200 pointer-events-none">
@@ -73,36 +58,36 @@ export function GlobalTimeLimitConfig() {
 							{isEditing ? (
 								<div className="flex items-center gap-2">
 									<Button
-										variant="ghost"
-										className="text-black-500 hover:text-black-600 hover:bg-zinc-100 px-5 rounded-lg font-medium"
-										onClick={() => {
-											setIsEditing(false);
-											setTimeAmount(timeLimit);
-										}}
-										disabled={updateConfig.isPending}
+										type="button"
+										variant="outline"
+										className="border-gray-200 bg-white text-zinc-700 hover:bg-zinc-50 rounded-lg px-4 font-medium h-10 text-sm transition-colors cursor-pointer shadow-none"
+										onClick={handleCancel}
+										disabled={isPending}
 									>
 										Cancel
 									</Button>
 									<Button
-										className="bg-blue-600 hover:bg-blue-700 text-white shadow-none px-5 rounded-lg font-medium"
-										onClick={handleSave}
-										disabled={updateConfig.isPending}
+										type="button"
+										className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-4 font-medium h-10 text-sm transition-colors cursor-pointer shadow-none gap-1.5 disabled:opacity-50"
+										onClick={() => setIsConfirmOpen(true)}
+										disabled={isPending || !timeAmount}
 									>
-										{updateConfig.isPending ? (
-											<RiLoader4Line className="size-4.5 mr-2 animate-spin" />
+										{isPending ? (
+											<RiLoader4Line className="size-4 animate-spin mr-1" />
 										) : (
-											<RiCheckLine className="size-4.5 mr-2" />
+											<RiCheckLine className="size-4 mr-1" />
 										)}
-										Save and Apply
+										Save
 									</Button>
 								</div>
 							) : (
 								<Button
+									type="button"
 									variant="outline"
-									className="border-blue-500 text-blue-500 hover:text-blue-600 hover:bg-blue-50 bg-transparent shadow-none px-5 rounded-lg"
+									className="border-gray-200 bg-white text-zinc-700 hover:bg-zinc-50 rounded-lg px-4 h-10 text-sm font-medium transition-colors cursor-pointer shadow-none gap-1.5"
 									onClick={() => setIsEditing(true)}
 								>
-									<RiEdit2Line className="size-4.5 mr-2" />
+									<RiEdit2Line className="size-4 text-zinc-500" />
 									Edit
 								</Button>
 							)}
@@ -119,10 +104,22 @@ export function GlobalTimeLimitConfig() {
 				<div className="flex items-start gap-3 p-4 rounded-xl bg-amber-50 border border-amber-200">
 					<RiInformationFill className="size-5 text-amber-500 mt-0.5 shrink-0" />
 					<p className="text-sm text-amber-700 mt-0.5">
-						<strong className="font-semibold text-amber-900">Note: </strong> Changes apply instantly to <strong className="font-semibold text-amber-900">new sessions</strong>. Any existing, active sessions will retain their original settings until they expire or are closed.
+						<strong className="font-semibold text-amber-900">Note: </strong> Changes apply instantly
+						to <strong className="font-semibold text-amber-900">new sessions</strong>. Any existing,
+						active sessions will retain their original settings until they expire or are closed.
 					</p>
 				</div>
 			</div>
+
+			<ConfirmationModal
+				isOpen={isConfirmOpen}
+				onOpenChange={setIsConfirmOpen}
+				title="Save Time Limit Per Session"
+				description={`Are you sure you want to update the session time limit to ${timeAmount} minutes per session?`}
+				confirmText="Save and Apply"
+				isLoading={isPending}
+				onConfirm={handleConfirmSave}
+			/>
 		</div>
 	);
 }

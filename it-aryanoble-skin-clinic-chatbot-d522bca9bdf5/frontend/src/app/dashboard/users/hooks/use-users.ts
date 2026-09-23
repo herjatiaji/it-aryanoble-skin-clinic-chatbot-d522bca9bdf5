@@ -2,6 +2,7 @@ import { api } from "@/lib/axios";
 import { getErrorMessage } from "@/lib/utils";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { branchKeys } from "../../configuration/api/keys";
 import { userKeys } from "../api/keys";
 import type {
 	DoctorUpdate,
@@ -31,7 +32,7 @@ export const useCreateStaff = () => {
 		},
 		onSuccess: () => {
 			toast.success("Staff user created successfully!");
-			queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: userKeys.all, refetchType: "all" });
 		},
 		onError: (error: unknown) => {
 			toast.error(getErrorMessage(error, "Failed to create staff user."));
@@ -49,7 +50,7 @@ export const useCreateDoctor = () => {
 		},
 		onSuccess: () => {
 			toast.success("Doctor user created successfully!");
-			queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: userKeys.all, refetchType: "all" });
 		},
 		onError: (error: unknown) => {
 			toast.error(getErrorMessage(error, "Failed to create doctor user."));
@@ -67,7 +68,8 @@ export const useUpdateDoctorAccess = () => {
 		},
 		onSuccess: () => {
 			toast.success("Doctor access updated successfully!");
-			queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: userKeys.all, refetchType: "all" });
+			queryClient.invalidateQueries({ queryKey: branchKeys.all, refetchType: "all" });
 		},
 		onError: (error: unknown) => {
 			toast.error(getErrorMessage(error, "Failed to update doctor access."));
@@ -85,10 +87,28 @@ export const useUpdateStaffDetails = () => {
 		},
 		onSuccess: () => {
 			toast.success("Staff details updated successfully!");
-			queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: userKeys.all, refetchType: "all" });
 		},
 		onError: (error: unknown) => {
 			toast.error(getErrorMessage(error, "Failed to update staff details."));
+		},
+	});
+};
+
+export const useUpdateUserRoles = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: async ({ userId, roles }: { userId: string; roles: string[] }) => {
+			const response = await api.put(`/users/${userId}/roles`, { roles });
+			return response.data;
+		},
+		onSuccess: () => {
+			toast.success("User role updated successfully!");
+			queryClient.invalidateQueries({ queryKey: userKeys.all, refetchType: "all" });
+		},
+		onError: (error: unknown) => {
+			toast.error(getErrorMessage(error, "Failed to update user role."));
 		},
 	});
 };
@@ -103,7 +123,7 @@ export const useUpdateDoctorCategories = () => {
 		},
 		onSuccess: () => {
 			toast.success("Doctor knowledge base updated successfully!");
-			queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: userKeys.all, refetchType: "all" });
 		},
 		onError: (error: unknown) => {
 			toast.error(getErrorMessage(error, "Failed to update doctor knowledge base."));
@@ -121,7 +141,7 @@ export const useDeleteUser = () => {
 		},
 		onSuccess: () => {
 			toast.success("User deleted successfully!");
-			queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: userKeys.all, refetchType: "all" });
 		},
 		onError: (error: unknown) => {
 			toast.error(getErrorMessage(error, "Failed to delete user."));

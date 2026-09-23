@@ -19,16 +19,12 @@ export function RouteGuard({ children, allowedTypes, requiredAccess }: RouteGuar
 		if (isLoading) return;
 
 		if (isError || !user) {
-			router.replace(`/login?from=${encodeURIComponent(pathname)}`);
+			router.replace(`/login?reason=session_expired&from=${encodeURIComponent(pathname)}`);
 			return;
 		}
 
 		if (allowedTypes && !(allowedTypes as string[]).includes(user.type)) {
-			if (user.type === "DOCTOR") {
-				router.replace("/doctor");
-			} else {
-				router.replace("/dashboard/knowledge");
-			}
+			router.replace("/dashboard/knowledge");
 			return;
 		}
 

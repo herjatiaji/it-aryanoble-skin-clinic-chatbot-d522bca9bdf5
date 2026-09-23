@@ -335,14 +335,6 @@ withFolderProperties {
                                     }
                                 }
                             }
-                            stage('Schedule Deployment BE') {
-                                container('agent-noncis-be-prod') {
-
-                                withEnv(['REPO_NAME=skin-clinic-chatbot-be']) {
-                                            scheduleDeploy()
-                                        }
-                                }
-                            }
                         },
                         frontend: {
                             if (!runFrontend) {
@@ -362,18 +354,15 @@ withFolderProperties {
                                     }
                                 }
                             }
-                            stage('Schedule Deployment FE') {
-                                container('agent-noncis-be-prod') {
-
-                                withEnv(['REPO_NAME=skin-clinic-chatbot-fe']) {
-                                            scheduleDeploy()
-                                        }
-                                }
-                            }
                         }
                     )
                 }
 
+                stage('Schedule Deployment to Prod') {
+                    container('agent-noncis-be-prod') {
+                        scheduleDeploy()
+                    }
+                }
             }
         }
     }

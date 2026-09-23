@@ -36,6 +36,7 @@ class Knowledge(Base, TimestampMixin, SoftDeleteMixin):
     
     uploaded_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     approved_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    project_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
     metadata_: Mapped[Optional[dict]] = mapped_column("metadata", JSONB, default=dict)
     
     # Note: searchable_content on Knowledge is GENERATED ALWAYS in postgres if needed, but for chunks we define it below.

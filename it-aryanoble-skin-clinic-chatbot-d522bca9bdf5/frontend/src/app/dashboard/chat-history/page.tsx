@@ -1,70 +1,67 @@
 "use client";
-import { useState } from "react";
+
 import { SearchBar } from "@/components/shared/search-bar";
-import { RiLoader4Line } from "@remixicon/react";
 import { ChatFilter } from "./components/chat-filter";
-import { ChatHistoryCard } from "./components/chat-history-card";
-import { useChatHistories } from "./hooks/use-chat-history";
-import { useUsers } from "@/app/dashboard/users/hooks/use-users";
+import { ChatHistoryList } from "./components/chat-history-list";
+import { ChatHistorySummary } from "./components/chat-history-summary";
+import { useChatHistoryState } from "./hooks/use-chat-history-state";
 
 export default function ChatHistoryPage() {
-	const { data: chatHistories, isLoading, isError } = useChatHistories();
-	const { data: allDoctors } = useUsers("DOCTOR");
-	const [doctorFilter, setDoctorFilter] = useState("ALL");
-
-	// Get names of all registered doctors
-	const doctors = allDoctors?.map((user) => user.name) || [];
-
-	const filteredData = chatHistories?.filter((item) => {
-		if (doctorFilter !== "ALL" && item.doctor !== doctorFilter) return false;
-		return true;
-	});
+	const {
+		isLoading,
+		isError,
+		filteredData,
+		users,
+		chatTypes,
+		hasActiveFilters,
+		userFilter,
+		setUserFilter,
+		chatTypeFilter,
+		setChatTypeFilter,
+		dateRange,
+		setDateRange,
+		searchQuery,
+		setSearchQuery,
+		handleResetFilters,
+		pagination,
+	} = useChatHistoryState();
 
 	return (
-		<div className="flex flex-col h-full gap-6 p-6">
-			{/* Header */}
-			<div className="flex flex-col gap-1">
-				<h1 className="text-xl font-semibold text-foreground">Chat History</h1>
-				<p className="text-sm text-muted-foreground">View past chats with the AI chatbot easily.</p>
-			</div>
+		<div className="flex flex-col min-h-full gap-6 p-6 pb-12">
+			{/* Overview Summary Cards */}
+			<ChatHistorySummary items={filteredData} />
 
 			<div className="flex flex-col gap-4">
 				{/* Toolbar */}
-				<div className="flex items-center justify-between">
+				<div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
 					<SearchBar
-						containerClassName="max-w-md"
+						containerClassName="max-w-md w-full"
 						placeholder="Search for chat sessions..."
+						value={searchQuery}
+						onChange={(e) => setSearchQuery(e.target.value)}
 					/>
-					<ChatFilter 
-						doctors={doctors} 
-						value={doctorFilter} 
-						onChange={setDoctorFilter} 
+					<ChatFilter
+						users={users}
+						userFilter={userFilter}
+						onUserChange={setUserFilter}
+						chatTypes={chatTypes}
+						chatTypeFilter={chatTypeFilter}
+						onChatTypeChange={setChatTypeFilter}
+						dateRange={dateRange}
+						onDateRangeChange={setDateRange}
 					/>
 				</div>
 
-			{/* List */}
-			<div className="flex flex-col gap-4">
-				{isLoading && (
-					<div className="flex items-center justify-center p-8 text-muted-foreground">
-						<RiLoader4Line className="w-6 h-6 animate-spin" />
-						<span className="ml-2">Loading chat histories...</span>
-					</div>
-				)}
-
-				{isError && (
-					<div className="p-4 text-sm text-red-500 bg-red-50 rounded-md">
-						Failed to load chat history.
-					</div>
-				)}
-
-				{!isLoading && !isError && filteredData?.length === 0 && (
-					<div className="p-8 text-center text-muted-foreground">No chat history found.</div>
-				)}
-
-				{!isLoading &&
-					!isError &&
-					filteredData?.map((item) => <ChatHistoryCard key={item.id} item={item} />)}
-			</div>
+				{/* List */}
+				<ChatHistoryList
+					isLoading={isLoading}
+					isError={isError}
+					filteredData={filteredData}
+					paginatedItems={pagination.paginatedItems}
+					hasActiveFilters={hasActiveFilters}
+					onResetFilters={handleResetFilters}
+					pagination={pagination}
+				/>
 			</div>
 		</div>
 	);

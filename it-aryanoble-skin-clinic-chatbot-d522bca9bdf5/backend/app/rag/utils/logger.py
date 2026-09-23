@@ -11,13 +11,24 @@ os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 from loguru import logger
 
 
+def _can_write_and_rotate_log(log_dir: str = "logs") -> bool:
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        test_path = os.path.join(log_dir, ".perm_test.tmp")
+        renamed_path = os.path.join(log_dir, ".perm_test_renamed.tmp")
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write("test")
+        os.rename(test_path, renamed_path)
+        os.remove(renamed_path)
+        return True
+    except Exception:
+        return False
+
 def setup_logging(log_level: str = "INFO"):
     """
     Configures application-wide logging using Loguru.
     - Terminal (stdout): Clean output, only app-level logs at INFO+
-    - File (logs/rag_system.log): Full DEBUG logs including all libraries
-
-    Also suppresses noisy third-party libraries from polluting the terminal.
+    - File (logs/rag_system.log): Full DEBUG logs including all libraries (if permissions allow)
     """
     # --- Silence noisy third-party libraries in terminal ---
     _SILENT_LIBS = [
@@ -46,9 +57,6 @@ def setup_logging(log_level: str = "INFO"):
     # --- Remove default Loguru handler ---
     logger.remove()
 
-    # --- Ensure logs directory exists ---
-    os.makedirs("logs", exist_ok=True)
-
     # --- Terminal handler: clean, INFO+ only, app logs only ---
     logger.add(
         sys.stdout,
@@ -65,13 +73,19 @@ def setup_logging(log_level: str = "INFO"):
     )
 
     # --- File handler: full DEBUG, all logs including libraries ---
-    logger.add(
-        "logs/rag_system.log",
-        level="DEBUG",
-        rotation="10 MB",
-        retention="10 days",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        encoding="utf-8",
-    )
+    if _can_write_and_rotate_log("logs"):
+        try:
+            logger.add(
+                "logs/rag_system.log",
+                level="DEBUG",
+                rotation="10 MB",
+                retention="10 days",
+                enqueue=True,
+                catch=True,
+                format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+                encoding="utf-8",
+            )
+        except Exception as err:
+            sys.stderr.write(f"Warning: Could not initialize file logger 'logs/rag_system.log': {err}\n")
 
     logger.info("Logging configured. Terminal: app logs only | File: full debug.")

@@ -93,7 +93,7 @@ class MetadataEnricher:
         elif "treatment" in file_path.lower():
             return "treatment"
 
-        return "product"
+        return "general"
 
     def enrich_chunks(self, chunks: List[Dict], file_path: str, language: str = "en") -> List[Dict]:
         """
@@ -150,6 +150,11 @@ class MetadataEnricher:
                 "token_count": token_count,
                 "processed_at": processed_at
             }
+            # Preserve pre-existing chunk metadata keys while strictly filtering out redundant keys
+            redundant_keys = {"entity", "storage_key", "image_reference"}
+            for k, v in chunk_meta.items():
+                if k not in enriched_meta and k not in redundant_keys and v is not None:
+                    enriched_meta[k] = v
 
             enriched_data.append({
                 "text": text,

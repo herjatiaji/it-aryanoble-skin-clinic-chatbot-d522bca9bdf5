@@ -1,0 +1,18 @@
+services:
+  mock-cis:
+    build:
+      context: .
+    container_name: skin_clinic_mock_cis
+    restart: always
+    ports:
+      - "8001:8001"
+    environment:
+      - BACKEND_URL=http://host.docker.internal:8000
+      - BACKEND_WEBHOOK_URL=http://host.docker.internal:8000/api/webhooks/cis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--reload-dir", "/app" ]
+    volumes:
+      - ./main.py:/app/main.py
+      - ./keys:/app/keys
+      - ./frontend/dist:/app/frontend/dist

@@ -74,3 +74,38 @@ class IngestionPipeline:
             for file in files:
                 file_path = os.path.join(root, file)
                 self.ingest_file(file_path)
+
+    async def ingest_files_parallel(
+        self, 
+        file_paths: list[str], 
+        max_concurrency: int = 3, 
+        batch_id: Optional[str] = None
+    ) -> list[dict]:
+        """
+        Ingests multiple files in parallel with safe bounded concurrency.
+        Fault-tolerant: failures in one file do not abort other files.
+        Logs every action with batch_id and file context.
+        """
+        import asyncio
+        semaphore = asyncio.Semaphore(max_concurrency)
+        b_id = batch_id or "BATCH-PARALLEL"
+
+        async def _worker(fp: str, idx: int) -> dict:
+            fname = os.path.basename(fp)
+            async with semaphore:
+                logger.info(f"⚡ [BATCH: {b_id}] [FILE {idx+1}/{len(file_paths)}: {fname}] Starting parallel ingestion...")
+                try:
+                    out = await asyncio.to_thread(self.ingest_file, fp)
+                    if out:
+                        logger.info(f"✅ [BATCH: {b_id}] [FILE: {fname}] Successfully ingested -> {out}")
+                        return {"file_name": fname, "file_path": fp, "status": "SUCCESS", "output_file": out}
+                    else:
+                        logger.warning(f"⚠️ [BATCH: {b_id}] [FILE: {fname}] Ingestion yielded empty output.")
+                        return {"file_name": fname, "file_path": fp, "status": "FAILED", "error": "Empty parse output"}
+                except Exception as e:
+                    logger.error(f"❌ [BATCH: {b_id}] [FILE: {fname}] Ingestion exception: {e}")
+                    return {"file_name": fname, "file_path": fp, "status": "FAILED", "error": str(e)}
+
+        tasks = [_worker(fp, i) for i, fp in enumerate(file_paths)]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return list(results)

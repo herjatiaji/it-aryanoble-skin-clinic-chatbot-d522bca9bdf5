@@ -2,6 +2,7 @@ import { api } from "@/lib/axios";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { categoryKeys } from "../api/keys";
+import { knowledgeKeys } from "../../knowledge/api/keys";
 import { CategoryCreate, CategoryResponse, CategoryUpdate } from "../api/types";
 
 export function useCategories() {
@@ -34,7 +35,8 @@ export function useCreateCategory() {
 			return response.data;
 		},
 		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: categoryKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: categoryKeys.all, refetchType: "all" });
+			queryClient.invalidateQueries({ queryKey: knowledgeKeys.all, refetchType: "all" });
 			toast.success("Category created successfully");
 		},
 		onError: (error) => {
@@ -53,8 +55,11 @@ export function useUpdateCategory() {
 			return response.data;
 		},
 		onSuccess: (_, variables) => {
-			queryClient.invalidateQueries({ queryKey: categoryKeys.lists() });
-			queryClient.invalidateQueries({ queryKey: categoryKeys.detail(variables.id) });
+			queryClient.invalidateQueries({ queryKey: categoryKeys.all, refetchType: "all" });
+			queryClient.invalidateQueries({ queryKey: knowledgeKeys.all, refetchType: "all" });
+			if (variables?.id) {
+				queryClient.invalidateQueries({ queryKey: categoryKeys.detail(variables.id), refetchType: "all" });
+			}
 			toast.success("Category updated successfully");
 		},
 		onError: (error) => {
@@ -73,7 +78,8 @@ export function useDeleteCategory() {
 			return response.data;
 		},
 		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: categoryKeys.lists() });
+			queryClient.invalidateQueries({ queryKey: categoryKeys.all, refetchType: "all" });
+			queryClient.invalidateQueries({ queryKey: knowledgeKeys.all, refetchType: "all" });
 			toast.success("Category deleted successfully");
 		},
 		onError: (error) => {

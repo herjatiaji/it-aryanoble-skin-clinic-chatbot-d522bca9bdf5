@@ -16,6 +16,7 @@ python-jose[cryptography]   # JWT token generation and decoding for user authent
 apscheduler                 # Background task and cron job scheduler
 httpx                       # Asynchronous HTTP client for external web requests
 loguru                      # Enhanced structured logging framework
+speedtest-cli               # Command-line / programmatic bandwidth speed testing
 
 # --- RAG / AI Dependencies ---
 langchain>=0.1.0            # Core RAG orchestration framework and chain components
@@ -29,4 +30,6 @@ unstructured                # Unstructured document parsing fallback
 langdetect                  # Natural language detection for document content
 rank-bm25                   # In-memory BM25 sparse keyword index engine
 psycopg[binary]             # Synchronous PostgreSQL driver for PGVector adapter
+boto3                       # AWS S3 / MinIO Object Storage SDK
+PyMuPDF                     # Fast PDF text and embedded image extraction
 

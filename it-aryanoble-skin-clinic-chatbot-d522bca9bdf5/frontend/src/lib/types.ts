@@ -5,9 +5,9 @@ export interface ApiError {
 export interface UserResponse {
   id: string;
   type: "STAFF" | "DOCTOR" | "ADMIN";
-  email: string;
+  email: string | null;
   name: string;
-  cis_id: string | null;
+  cis_id: number | null;
   token_limit: number | null;
   created_at: string;
   status: "Active" | "Inactive" | "Warning";

@@ -11,7 +11,8 @@ export default function Login() {
       .then(res => res.json())
       .then(data => {
         setDoctors(data)
-        if (data.length > 0) setSelectedDoctor(data[0].cis_id)
+        // MOCK_DOCTORS from backend has 'id', not 'cis_id'
+        if (data.length > 0) setSelectedDoctor(data[0].id)
       })
       .catch(err => console.error('Failed to fetch doctors', err))
   }, [])
@@ -44,7 +45,7 @@ export default function Login() {
         <label>Select Mock Doctor:</label>
         <select value={selectedDoctor} onChange={e => setSelectedDoctor(e.target.value)} style={{ padding: '8px', fontSize: '16px' }}>
           {doctors.map(doc => (
-            <option key={doc.cis_id} value={doc.cis_id}>
+            <option key={doc.id} value={doc.id}>
               {doc.name}
             </option>
           ))}

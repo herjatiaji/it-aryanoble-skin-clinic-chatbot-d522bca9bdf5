@@ -29,6 +29,7 @@ async def _hydrate_user(user: User, db: AsyncSession) -> dict:
         "token_limit": user.token_limit,
         "employee_id": user.employee_id,
         "dr_type": user.dr_type,
+        "user_type_code": user.user_type_code,
         "ecosystem": user.ecosystem,
         "created_at": user.created_at,
         "status": "Inactive" if user.deleted_at else "Active",
@@ -55,11 +56,49 @@ async def _hydrate_user(user: User, db: AsyncSession) -> dict:
         result_acc = await db.execute(stmt_acc)
         user_dict["accesses"] = list(result_acc.scalars().all())
         
+        # Calculate staff tokens used (current month)
+        current_ym = datetime.now(timezone.utc).strftime("%Y-%m")
+        stmt_token = select(func.sum(UserTokenUsage.tokens_used)).where(
+            UserTokenUsage.user_id == user.id,
+            UserTokenUsage.year_month == current_ym
+        )
+        result_token = await db.execute(stmt_token)
+        user_dict["tokens_used"] = result_token.scalar() or 0
+        
     elif user.type == UserType.DOCTOR:
-        stmt_branch = select(Branch).join(UserBranch, UserBranch.branch_id == Branch.id).where(UserBranch.user_id == user.id)
+        stmt_branch = (
+            select(Branch)
+            .join(UserBranch, UserBranch.branch_id == Branch.id)
+            .where(
+                UserBranch.user_id == user.id,
+                UserBranch.status == 1,
+                UserBranch.deleted_at.is_(None),
+                Branch.deleted_at.is_(None)
+            )
+        )
         result_branch = await db.execute(stmt_branch)
         branches = result_branch.scalars().all()
-        user_dict["branches"] = [{"id": b.id, "name": b.name, "address": b.address, "latitude": b.latitude, "longitude": b.longitude, "image_url": b.image_url, "token_limit": b.token_limit, "created_at": b.created_at, "updated_at": b.updated_at} for b in branches]
+        current_ym = datetime.now(timezone.utc).strftime("%Y-%m")
+        user_dict["branches"] = []
+        for b in branches:
+            b_usage_stmt = select(func.sum(UserTokenUsage.tokens_used)).where(
+                UserTokenUsage.user_id == user.id,
+                UserTokenUsage.branch_id == b.id,
+                UserTokenUsage.year_month == current_ym
+            )
+            b_used_res = await db.execute(b_usage_stmt)
+            doc_branch_used = b_used_res.scalar() or 0
+            user_dict["branches"].append({
+                "id": b.id,
+                "external_id": b.external_id,
+                "name": b.name,
+                "code": b.code,
+                "ecosystem": b.ecosystem,
+                "token_limit": b.token_limit,
+                "tokens_used": doc_branch_used,
+                "created_at": b.created_at,
+                "updated_at": b.updated_at
+            })
         
         stmt_cat = select(Category).where(
             Category.deleted_at.is_(None),
@@ -78,8 +117,36 @@ async def _hydrate_user(user: User, db: AsyncSession) -> dict:
         tokens_used = result_token.scalar() or 0
         user_dict["tokens_used"] = tokens_used
         
-        # Override status for doctors if tokens are low
-        if user_dict["status"] == "Active" and user.token_limit and user.token_limit > 0:
+        # Check global token mode for status
+        from app.models.config import AppConfig
+        cfg_stmt = select(AppConfig.value).where(AppConfig.key == "GLOBAL_TOKEN_LIMIT_ACTIVE")
+        cfg_res = await db.execute(cfg_stmt)
+        cfg_val = cfg_res.scalar_one_or_none()
+        is_global_mode = (cfg_val or "false").lower() == "true"
+
+        if is_global_mode:
+            # Check Doctor Type limits (SpDVE vs GP Plus) only if sub-flag is active
+            dr_type_clean = (user.dr_type or "").upper()
+            is_spkk = any(k in dr_type_clean for k in ["SPDVE", "SP.DVE", "SPKK", "SP.KK", "SPDV"])
+            is_gp = any(k in dr_type_clean for k in ["GP", "GP PLUS", "UMUM"])
+            
+            global_doc_limit = 0
+            if is_spkk:
+                spkk_act = (await db.execute(select(AppConfig.value).where(AppConfig.key == "GLOBAL_SPKK_LIMIT_ACTIVE"))).scalar_one_or_none()
+                if (spkk_act or "false").lower() == "true":
+                    t_val = (await db.execute(select(AppConfig.value).where(AppConfig.key == "TOKEN_LIMIT_SPKK"))).scalar_one_or_none()
+                    global_doc_limit = int(t_val) if (t_val and t_val.isdigit() and int(t_val) > 0) else 0
+            elif is_gp:
+                gp_act = (await db.execute(select(AppConfig.value).where(AppConfig.key == "GLOBAL_GP_LIMIT_ACTIVE"))).scalar_one_or_none()
+                if (gp_act or "false").lower() == "true":
+                    t_val = (await db.execute(select(AppConfig.value).where(AppConfig.key == "TOKEN_LIMIT_GP"))).scalar_one_or_none()
+                    global_doc_limit = int(t_val) if (t_val and t_val.isdigit() and int(t_val) > 0) else 0
+
+            # If user has custom override (user.token_limit > 0), prioritize it; otherwise use global limit if active
+            effective_limit = user.token_limit if (user.token_limit is not None and user.token_limit > 0) else global_doc_limit
+            if user_dict["status"] == "Active" and effective_limit > 0 and tokens_used >= effective_limit * 0.9:
+                user_dict["status"] = "Warning"
+        elif user_dict["status"] == "Active" and user.token_limit and user.token_limit > 0:
             if tokens_used >= user.token_limit * 0.9:
                 user_dict["status"] = "Warning"
                 
@@ -92,19 +159,56 @@ async def read_users_me(
 ):
     return await _hydrate_user(current_user, db)
 
-@router.get("/", response_model=List[UserResponse])
+from app.schemas.pagination import PaginatedResponse
+from typing import List, Optional, Union
+from fastapi import Query
+import math
+
+@router.get("/", response_model=Union[PaginatedResponse[UserResponse], List[UserResponse]])
 async def list_users(
     type: Optional[UserType] = None,
+    search: Optional[str] = None,
+    page: Optional[int] = Query(None, ge=1, description="Page number"),
+    page_size: Optional[int] = Query(None, ge=1, le=100, description="Items per page"),
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(RequireAccess("users:read"))
 ):
     stmt = select(User).where(User.deleted_at.is_(None))
     if type:
         stmt = stmt.where(User.type == type)
+    if search:
+        s_clean = f"%{search.strip()}%"
+        stmt = stmt.where(
+            (User.name.ilike(s_clean)) |
+            (User.email.ilike(s_clean)) |
+            (User.employee_id.ilike(s_clean))
+        )
+    stmt = stmt.order_by(User.created_at.desc())
+
+    if page is not None:
+        p_size = page_size or 10
+        # Calculate total
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        count_res = await db.execute(count_stmt)
+        total = count_res.scalar() or 0
+        total_pages = max(1, math.ceil(total / p_size))
+
+        paginated_stmt = stmt.offset((page - 1) * p_size).limit(p_size)
+        result = await db.execute(paginated_stmt)
+        users = result.scalars().all()
+        hydrated_items = [await _hydrate_user(u, db) for u in users]
+
+        return PaginatedResponse[UserResponse](
+            items=hydrated_items,
+            total=total,
+            page=page,
+            page_size=p_size,
+            total_pages=total_pages
+        )
+
     result = await db.execute(stmt)
     users = result.scalars().all()
-    
-    return [await _hydrate_user(user, db) for user in users]
+    return [await _hydrate_user(u, db) for u in users]
 
 @router.post("/staff", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_staff(
@@ -147,7 +251,7 @@ async def get_user(
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(RequireAccess("users:read"))
 ):
-    stmt = select(User).where(User.id == user_id)
+    stmt = select(User).where(User.id == user_id, User.deleted_at.is_(None))
     user = (await db.execute(stmt)).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -167,6 +271,56 @@ async def update_user(
         
     if user.type == UserType.DOCTOR:
         update_data = DoctorUpdate(**user_in).model_dump(exclude_unset=True)
+        if "token_limit" in update_data and update_data["token_limit"] is not None:
+            stmt_branch = (
+                select(Branch)
+                .join(UserBranch, UserBranch.branch_id == Branch.id)
+                .where(
+                    UserBranch.user_id == user.id,
+                    UserBranch.status == 1,
+                    UserBranch.deleted_at.is_(None),
+                    Branch.deleted_at.is_(None)
+                )
+            )
+            result_branch = await db.execute(stmt_branch)
+            user_branches = result_branch.scalars().all()
+            
+            if not user_branches:
+                raise HTTPException(status_code=400, detail="Doctor is not assigned to any branch yet.")
+
+            # Check if global branch pool is active to determine max branch limit
+            from app.models.config import AppConfig
+            cfg_stmt = select(AppConfig.value).where(AppConfig.key == "GLOBAL_TOKEN_LIMIT_ACTIVE")
+            cfg_res = await db.execute(cfg_stmt)
+            is_global_mode = (cfg_res.scalar_one_or_none() or "false").lower() == "true"
+
+            b_act_stmt = select(AppConfig.value).where(AppConfig.key == "GLOBAL_BRANCH_LIMIT_ACTIVE")
+            b_act_res = await db.execute(b_act_stmt)
+            is_branch_global_active = is_global_mode and ((b_act_res.scalar_one_or_none() or "false").lower() == "true")
+
+            global_branch_limit = 0
+            if is_branch_global_active:
+                gl_stmt = select(AppConfig.value).where(AppConfig.key == "GLOBAL_TOKEN_LIMIT")
+                gl_res = await db.execute(gl_stmt)
+                gl_val = gl_res.scalar_one_or_none()
+                global_branch_limit = int(gl_val) if (gl_val and gl_val.isdigit() and int(gl_val) > 0) else 3000000
+
+            branch_limits = []
+            for b in user_branches:
+                if b.token_limit is not None and b.token_limit > 0:
+                    branch_limits.append(b.token_limit)
+                elif is_branch_global_active:
+                    branch_limits.append(global_branch_limit)
+                else:
+                    branch_limits.append(b.token_limit or 0)
+
+            max_branch_limit = max(branch_limits) if branch_limits else 0
+
+            if max_branch_limit == 0:
+                raise HTTPException(status_code=400, detail="Branch token limit must be set before setting doctor token limit.")
+                
+            if update_data["token_limit"] > max_branch_limit:
+                raise HTTPException(status_code=400, detail=f"Doctor token limit ({update_data['token_limit']:,}) cannot exceed branch token limit ({max_branch_limit:,}).")
     else:
         update_data = StaffUpdate(**user_in).model_dump(exclude_unset=True)
 

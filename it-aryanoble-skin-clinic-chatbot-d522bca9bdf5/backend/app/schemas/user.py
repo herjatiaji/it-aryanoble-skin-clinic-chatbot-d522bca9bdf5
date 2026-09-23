@@ -12,10 +12,11 @@ class RoleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 class UserBase(BaseModel):
-    email: EmailStr
     name: str
+    email: Optional[EmailStr] = None
 
 class UserCreateStaff(UserBase):
+    email: EmailStr
     password: str
     employee_id: Optional[str] = None
     roles: Optional[List[str]] = ["Staff"]
@@ -31,6 +32,7 @@ class DoctorUpdate(BaseModel):
     status: Optional[str] = None
     employee_id: Optional[str] = None
     dr_type: Optional[str] = None
+    user_type_code: Optional[str] = None
     ecosystem: Optional[str] = None
 
 class UserUpdateRoles(BaseModel):
@@ -48,10 +50,11 @@ class UserUpdateAccesses(BaseModel):
 class UserResponse(UserBase):
     id: UUID
     type: UserType
-    cis_id: Optional[str] = None
+    cis_id: Optional[int] = None
     token_limit: Optional[int] = None
     employee_id: Optional[str] = None
     dr_type: Optional[str] = None
+    user_type_code: Optional[str] = None
     ecosystem: str
     created_at: datetime
     

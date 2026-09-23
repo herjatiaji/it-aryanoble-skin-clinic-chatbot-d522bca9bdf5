@@ -1,5 +1,8 @@
 import { KnowledgeResponse } from "@/app/dashboard/knowledge/api/types";
-import { useUpdateKnowledgeStatus, useApproveKnowledge } from "@/app/dashboard/knowledge/hooks/use-knowledge";
+import {
+	useUpdateKnowledgeStatus,
+	useApproveKnowledge,
+} from "@/app/dashboard/knowledge/hooks/use-knowledge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -30,7 +33,7 @@ export function ClassificationSidebar({ knowledge }: ClassificationSidebarProps)
 	};
 
 	return (
-		<div className="w-70 lg:w-[320px] shrink-0 p-4 bg-zinc-50/50 border-l border-black/5 flex flex-col overflow-y-auto gap-4">
+		<div className="w-sidebar-width lg:w-[320px] shrink-0 p-4 bg-zinc-50/50 border-l border-black/5 flex flex-col overflow-y-auto gap-4">
 			<div className="bg-white rounded-md border border-black/10 shadow-sm flex flex-col overflow-hidden shrink-0">
 				<div className="p-3 border-b border-black/5">
 					<h2 className="text-sm font-medium text-zinc-950">Knowledge Classification</h2>
@@ -109,7 +112,7 @@ export function ClassificationSidebar({ knowledge }: ClassificationSidebarProps)
 								<span className="text-xs text-zinc-950">Text Accuracy</span>
 								<span className="text-xs font-medium text-blue-600">
 									{knowledge.ai_confidence !== null && knowledge.ai_confidence !== undefined
-										? `${Number(knowledge.ai_confidence)}%`
+										? `${Number(knowledge.ai_confidence) > 0 && Number(knowledge.ai_confidence) <= 1 ? Math.round(Number(knowledge.ai_confidence) * 100) : Math.round(Number(knowledge.ai_confidence))}%`
 										: knowledge.status === "PROCESSING"
 											? "Calculating..."
 											: "—"}
@@ -118,7 +121,9 @@ export function ClassificationSidebar({ knowledge }: ClassificationSidebarProps)
 							<Progress
 								value={
 									knowledge.ai_confidence !== null && knowledge.ai_confidence !== undefined
-										? Number(knowledge.ai_confidence)
+										? Number(knowledge.ai_confidence) > 0 && Number(knowledge.ai_confidence) <= 1
+											? Math.round(Number(knowledge.ai_confidence) * 100)
+											: Number(knowledge.ai_confidence)
 										: 0
 								}
 								className="h-2 bg-blue-100"

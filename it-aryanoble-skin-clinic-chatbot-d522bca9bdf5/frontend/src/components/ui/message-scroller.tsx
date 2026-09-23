@@ -34,15 +34,24 @@ function MessageScroller({
   )
 }
 
+interface MessageScrollerViewportProps
+  extends React.ComponentProps<typeof MessageScrollerPrimitive.Viewport> {
+  hideScrollbar?: boolean;
+}
+
 function MessageScrollerViewport({
   className,
+  hideScrollbar = false,
   ...props
-}: React.ComponentProps<typeof MessageScrollerPrimitive.Viewport>) {
+}: MessageScrollerViewportProps) {
   return (
     <MessageScrollerPrimitive.Viewport
       data-slot="message-scroller-viewport"
       className={cn(
-        "size-full min-h-0 min-w-0 scroll-fade-b overflow-y-auto overscroll-contain contain-content scrollbar-none [&::-webkit-scrollbar]:hidden",
+        "size-full min-h-0 min-w-0 scroll-fade-b overflow-y-auto overflow-x-hidden overscroll-contain",
+        hideScrollbar
+          ? "scrollbar-none [&::-webkit-scrollbar]:hidden"
+          : "custom-scrollbar",
         className
       )}
       {...props}
@@ -57,7 +66,7 @@ function MessageScrollerContent({
   return (
     <MessageScrollerPrimitive.Content
       data-slot="message-scroller-content"
-      className={cn("flex h-max min-h-full flex-col gap-6", className)}
+      className={cn("flex h-max min-h-full flex-col gap-6 min-w-0 max-w-full", className)}
       {...props}
     />
   )
@@ -72,10 +81,7 @@ function MessageScrollerItem({
     <MessageScrollerPrimitive.Item
       data-slot="message-scroller-item"
       scrollAnchor={scrollAnchor}
-      className={cn(
-        "min-w-0 shrink-0 [contain-intrinsic-size:auto_10rem] [content-visibility:auto]",
-        className
-      )}
+      className={cn("min-w-0 shrink-0", className)}
       {...props}
     />
   )
@@ -107,8 +113,7 @@ function MessageScrollerButton({
     >
       {children ?? (
         <>
-          <RiArrowDownLine
-          />
+          <RiArrowDownLine />
           <span className="sr-only">
             {direction === "end" ? "Scroll to end" : "Scroll to start"}
           </span>
@@ -118,6 +123,48 @@ function MessageScrollerButton({
   )
 }
 
+function MessageScrollerSmartButton({
+  className,
+  size = "icon-sm",
+}: { className?: string; size?: React.ComponentProps<typeof Button>["size"] }) {
+  const { scrollToStart, scrollToEnd } = useMessageScroller();
+  const scrollable = useMessageScrollerScrollable();
+
+  // If content cannot be scrolled at all, hide button
+  if (!scrollable.start && !scrollable.end) return null;
+
+  // When user is at the bottom (scrollable.end === false, scrollable.start === true), show Arrow Up
+  // When user is scrolled up (scrollable.end === true), show Arrow Down
+  const isAtBottom = !scrollable.end && scrollable.start;
+
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size={size}
+      onClick={() => {
+        if (isAtBottom) {
+          scrollToStart({ behavior: "smooth" });
+        } else {
+          scrollToEnd({ behavior: "smooth" });
+        }
+      }}
+      className={cn(
+        "absolute inset-s-1/2 -translate-x-1/2 bottom-3 z-20 size-7.5 rounded-md border border-zinc-200/70 bg-white/80 backdrop-blur-xs text-zinc-500 shadow-xs hover:border-zinc-300 hover:bg-white hover:text-zinc-900 hover:shadow-sm opacity-70 hover:opacity-100 transition-all duration-200 rtl:translate-x-1/2",
+        className
+      )}
+      title={isAtBottom ? "Scroll to top" : "Scroll to bottom"}
+    >
+      <RiArrowDownLine
+        className={cn("size-3.5 transition-transform duration-200", isAtBottom && "rotate-180")}
+      />
+      <span className="sr-only">
+        {isAtBottom ? "Scroll to top" : "Scroll to bottom"}
+      </span>
+    </Button>
+  );
+}
+
 export {
   MessageScrollerProvider,
   MessageScroller,
@@ -125,6 +172,7 @@ export {
   MessageScrollerContent,
   MessageScrollerItem,
   MessageScrollerButton,
+  MessageScrollerSmartButton,
   useMessageScroller,
   useMessageScrollerScrollable,
   useMessageScrollerVisibility,
