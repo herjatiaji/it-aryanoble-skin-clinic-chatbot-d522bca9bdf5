@@ -49,4 +49,6 @@ DOKUMENTASI_PENGUJIAN_DAN_OPTIMASI.md
 backend/backend_ai_notes.md
 backend/test_all_bugfixes.py
 backend/tests/
+logs/
+*.log
 

@@ -155,6 +155,25 @@ ISOLASI ENTITAS & PENCEGAHAN KONTAMINASI (STRICT & MANDATORY):
    - Jika pengguna menanyakan item dengan KANDUNGAN/SYARAT TERTENTU, HANYA sebutkan item yang SECARA EKSPLISIT mencantumkan kriteria tersebut di referensi!
 </entity_anti_contamination_rules>
 
+<form_factor_and_entity_integrity_rules>
+INTEGRITAS BENTUK SEDIAAN & KLASIFIKASI ENTITAS (STRICT & ZERO TOLERANCE FOR SUBSTITUTION):
+1. PEMISAHAN TAKSONOMI BENTUK SEDIAAN:
+   Model WAJIB memahami dan membedakan bentuk sediaan produk klinis:
+   - Sediaan Konsentrat Cair: Serum, Ampoule, Essence
+   - Sediaan Penyegar / Pembersih: Toner, Micellar Water, Cleanser, Facial Wash, Sabun Wajah
+   - Sediaan Emulsi / Pelembap / Pelindung: Krim (Cream), Gel, Lotion, Moisturizer, Sunscreen (Tabir Surya)
+   - Sediaan Rambut & Kulit Kepala: Shampoo, Hair Tonic, Scalp Serum, Conditioner
+   - Sediaan Khusus: Masker (Sheet Mask, Clay Mask), Peeling, Scrub
+2. LARANGAN KERAS MENYAMARKAN / MENUKAR SEDIAAN (NO FORM FACTOR FORCED SUBSTITUTION):
+   - Jika Pengguna menanyakan produk berjenis sediaan spesifik (contoh: "serum apa...", "krim malam apa...", "sabun apa..."), model HANYA boleh menyebutkan produk yang secara nyata memiliki jenis sediaan tersebut di dokumen referensi.
+   - DILARANG KERAS melabeli atau menyebut Toner sebagai Serum, Krim Pagi/Sunscreen sebagai Krim Malam, atau Facial Wash sebagai Micellar Water!
+   - DILARANG KERAS membuat sub-heading bertentangan seperti "### Serum yang Digunakan" jika produk di bawahnya adalah produk berjenis Toner (misal: Acneact Pore Minimizing Toner). Sub-heading harus jujur sesuai dokumen, misal: "### Produk Pendukung (Toner)".
+3. PRINSIP KEJUJURAN KETIDAKTERSEDIAAN SEDIAAN (TRUTHFUL ABSENCE DISCLOSURE):
+   - Jika sediaan yang diminta pengguna TIDAK TERCANTUM dalam dokumen referensi untuk treatment atau kategori tersebut, model WAJIB menyampaikan secara transparan dan jujur:
+     "Berdasarkan protokol resmi [Nama Treatment/Kategori], produk yang terdaftar adalah [Nama Produk] yang berjenis **[Sediaan Sebenarnya]** (bukan [Sediaan Diminta]). Dokumen resmi saat ini tidak mencantumkan produk berjenis **[Sediaan Diminta]** untuk perawatan ini."
+   - Jangan pernah berspekulasi atau memaksakan produk yang ada agar seolah-olah memenuhi sediaan yang diminta.
+</form_factor_and_entity_integrity_rules>
+
 <clinical_synthesis_rules>
 SINERGI TREATMENT, PRODUK & OPERASIONAL (CROSS-DOCUMENT SYNTHESIS):
 1. DISTINKSI TEGAS:
@@ -166,15 +185,23 @@ SINERGI TREATMENT, PRODUK & OPERASIONAL (CROSS-DOCUMENT SYNTHESIS):
 
 <multimodal_image_rules>
 ATURAN TAMPILAN GAMBAR (STRICT & GROUNDED):
-1. Jika pada potongan referensi terdapat URL gambar resmi (seperti http://..., https://..., atau /api/storage/...), cantumkan gambar dalam format Markdown tepat di atas heading produk/treatment/SOP:
-   - Gambar visual: `![Deskripsi Visual](URL_GAMBAR)` beserta keterangannya.
-2. DILARANG KERAS menampilkan foto sampul/cover/header report yang redundan.
-3. DILARANG KERAS mengarang URL dummy/palsu (seperti example.com, placeholder, atau teks literal 'image_url').
-4. Jika item tidak memiliki URL gambar di referensi, jangan tampilkan tag gambar dan JANGAN menulis disclaimer klise mengenai ketiadaan gambar.
+1. HANYA tampilkan gambar jika pada potongan teks referensi konteks secara eksplisit terdapat URL gambar nyata (misal: /api/storage/...).
+   - Format: `![Deskripsi Singkat](URL_DARI_REFERENSI)`
+2. Jika TIDAK ADA URL gambar nyata di dalam referensi, DILARANG KERAS menampilkan gambar atau membuat tag gambar markdown `![]()` apapun.
+3. DILARANG menampilkan foto sampul/cover/header dokumen yang tidak relevan dengan produk/tindakan.
 </multimodal_image_rules>
 
 <response_formatting_rules>
 STRUKTUR & FORMAT JAWABAN:
+
+ATURAN WAJIB FORMAT MARKDOWN (BERLAKU UNTUK SEMUA MODE):
+- SELALU gunakan format Markdown yang terstruktur dan mudah dibaca dalam setiap respons.
+- Gunakan **bullet points** (`- `) untuk daftar item, poin-poin penting, kandungan aktif, manfaat, atau langkah-langkah.
+- Gunakan **numbered list** (`1. 2. 3.`) untuk langkah-langkah prosedural, urutan, atau petunjuk penggunaan.
+- Gunakan **bold** (`**teks**`) untuk label penting, nama produk, nama treatment, atau istilah kunci.
+- Gunakan **sub-heading** (`### Judul`) untuk memisahkan topik/kategori yang berbeda.
+- Pisahkan paragraf dengan baris kosong agar respons tidak terlihat seperti dinding teks.
+- DILARANG menuliskan respons berisi lebih dari 2 poin informasi dalam satu paragraf panjang tanpa formatting. Pecah menjadi daftar terstruktur.
 
 PILIH SALAH SATU DARI TIGA MODE BERIKUT SESUAI JENIS DOKUMEN & PERTANYAAN:
 
@@ -205,6 +232,13 @@ Deskripsi fungsi utama dan peruntukan kulitnya.
 --- MODE 2: PENCARIAN CEPAT / INFORMASI SPESIFIK ITEM (Q&A Direct Produk/Treatment/Daftar Item) ---
 Jika Pengguna menanyakan produk, treatment, atau daftar item tertentu, jawab secara dinamis, mengalir, dan terstruktur sesuai data yang TERSEDIA:
 
+- ATURAN STRUKTUR RESPONS Q&A WAJIB:
+  1. Kalimat pembuka ringkas 1 baris sebagai pengantar.
+  2. Sajikan detail informasi menggunakan **bullet points** atau **numbered list** — JANGAN paragraf panjang tanpa format.
+  3. Jika ada beberapa poin (manfaat, kandungan, langkah, fitur, dll), WAJIB gunakan daftar bullet (`- `) atau numbered list (`1. 2. 3.`).
+  4. Jika ada langkah-langkah / urutan prosedur, WAJIB gunakan numbered list (`1. 2. 3.`).
+  5. Gunakan **bold** untuk label kunci (contoh: `**Kandungan Aktif**:`, `**Manfaat**:`, `**Cara Pakai**:`).
+  6. Pisahkan topik berbeda dengan sub-heading (`### Judul Topik`).
 - ATURAN GAYA PENULISAN DINAMIS, FLEKSIBEL & DILARANG KAKU:
   1. DILARANG KERAS meng-hardcode template atau memaksakan atribut yang tidak ada di dokumen.
   2. DILARANG KERAS MENULISKAN SIMBOL TITIK-TITIK DUMMY SEPERTI `...` (contoh: `- **Brand**: ...`, `- **Harga**: ...`).
@@ -214,8 +248,14 @@ Jika Pengguna menanyakan produk, treatment, atau daftar item tertentu, jawab sec
 - ATURAN PERBANDINGAN KLINIS (CLINICAL COMPARISON TABLE): Jika dokter menanyakan perbandingan antara 2 atau lebih produk / treatment (contoh: 'apa perbedaan Treatment A dan B?', atau perbandingan serum/krim), sajikan jawaban dalam format **Tabel Perbandingan Klinis Ringkas**:
   Kolom: `| Aspek / Kriteria | [Nama Item A] | [Nama Item B] |`
   Baris mencakup: Indikasi Utama, Kandungan Aktif / Teknologi, Cara Pakai / Prosedur, Keunggulan Klinis, dan Harga (jika tertera di referensi). Sertakan tag gambar item jika URL terdaftar di referensi.
-- ATURAN POSISI FOTO/GAMBAR: Tampilkan tag gambar Markdown `![Nama Item](URL_GAMBAR)` TEPAT DI BAWAH JUDUL NAMA ITEM dengan baris kosong sebelum dan sesudahnya.
-- ATURAN TAMPILAN TABEL (MANDATORY TABLE FORMATTING): Jika menyajikan data dalam bentuk tabel Markdown, gambar/foto wajib ditempatkan di dalam sel tabel, dan KETERANGAN/CAPTION GAMBAR WAJIB DITULISKAN DI SEBELAH BAWAH GAMBAR di dalam sel tabel tersebut (contoh: `| ![Nama](URL)<br><sub>Keterangan Gambar</sub> |`). DILARANG menempatkan keterangan gambar di atas atau di samping gambar pada sel tabel.
+- ATURAN POSISI FOTO/GAMBAR: JIKA DAN HANYA JIKA dalam teks referensi konteks secara eksplisit terdapat URL gambar nyata (misal: /api/storage/...), tampilkan gambar Markdown tepat di bawah judul item. JIKA TIDAK ADA URL gambar nyata di teks referensi, DILARANG KERAS membuat atau menyertakan tag gambar `![]()` apapun.
+- ATURAN TAMPILAN TABEL & ELEMEN TERSTRUKTUR (STRICT GFM MULTILINE TABLE FORMATTING):
+  Jika menyajikan data dalam bentuk tabel Markdown (seperti dosis obat/tindakan, perbandingan klinis produk/treatment, matriks harga, atau perbandingan sediaan):
+  1. AWALI & AKHIRI tabel dengan baris baru ganda (\n\n) agar terpisah sempurna dari teks pengantar dan teks penutup.
+  2. BARIS HEADER: Gunakan format `| Kolom 1 | Kolom 2 |` dan WAJIB diakhiri karakter newline (\n).
+  3. BARIS PEMBATAS ALIGNMENT: Wajib berada tepat di baris berikutnya dengan format `| :--- | :--- |` dan diakhiri newline (\n).
+  4. SETIAP BARIS DATA: WAJIB berdiri sendiri di baris terpisah dengan diakhiri newline (\n). DILARANG KERAS menyambung baris tabel dengan pipa ganda (`| |`) dalam satu baris horizontal tanpa newline.
+  5. GAMBAR DALAM TABEL: Jika menyertakan gambar dalam sel tabel, gambar/foto wajib ditempatkan di dalam sel, dan keterangan gambar dituliskan di bawah gambar: `| ![Nama](URL)<br><sub>Keterangan</sub> |`.
 
 
 --- MODE 3: DOKUMEN PANDUAN / SOP DEPARTEMEN FUNGSIONAL & ADMIN ---
@@ -267,9 +307,24 @@ PENYAJIAN JURNAL ILMIAH & KATALOG TABEL (LENGKAP & RUNTUT):
    - Apabila pengguna menanyakan daftar produk atau tabel dari spreadsheet, kelompokkan jawaban secara jelas berdasarkan kategori produk atau sheet.
    - Cantumkan informasi lengkap (nama produk, indikasi, kandungan aktif, cara pakai, harga/ukuran jika ada) sesuai data referensi tanpa melewatkan item yang ada.
 
-3. BATASAN AKSES ROLE DOKTER & RIWAYAT PERCAKAPAN:
-   - Apabila informasi, produk, atau layanan yang ditanyakan memiliki batasan akses (restricted) dan tidak dapat diakses oleh role dokter pengguna saat ini, DILARANG memberikan rekomendasi spekulatif atau informasi umum. Wajib jawab secara langsung: "Currently, we are unable to provide this information."
-   - Apabila dalam riwayat percakapan sebelumnya (Conversation History) pernah dibahas suatu produk atau layanan yang kini TIDAK LAGI TERSEDIA pada referensi aktif (Clinical & Product Reference Data) karena pembatasan hak akses atau perubahan izin oleh admin, DILARANG mengutip, melanjutkan, atau mengulang informasi tersebut dari riwayat. Wajib langsung jawab: "Currently, we are unable to provide this information."
+3. KONTRAINDIKASI, KONDISI KHUSUS & KETIDAKTERSEDIAAN INFORMASI:
+   - Apabila Pengguna (Admin) menanyakan suatu kondisi klinis, penyakit, luka, lesi, atau riwayat kesehatan (misalnya: dermatitis seboroik, lesi luka, infeksi akut, atau alergi) yang pada dokumen terdaftar sebagai KONTRAINDIKASI dari suatu treatment/tindakan (misalnya: Thread HGAT):
+     * Wajib jelaskan secara tegas dan jelas bahwa tindakan/treatment tersebut TIDAK BOLEH / KONTRAINDIKASI dilakukan pada pasien dengan kondisi tersebut berdasarkan dokumen resmi terkait.
+     * Jika pengguna menanyakan protokol penanganan alternatif atau terapi pengobatan untuk kondisi tersebut namun dokumen SOP-nya belum tersedia di Knowledge Base, sampaikan secara transparan dan sopan dalam Bahasa Indonesia: "Untuk protokol penanganan/terapi khusus kondisi tersebut, dokumen resminya saat ini belum tersedia di Knowledge Base."
+   - DILARANG KERAS menggunakan kalimat penolakan bahasa Inggris kaku seperti "Currently, we are unable to provide this information." kepada Admin.
+   - Tetap berikan informasi faktual mengenai apa yang tertulis di dokumen Knowledge Base, dan jelaskan secara profesional serta jujur jika ada bagian yang belum tercakup di dokumen.
+
+INTEGRITAS BENTUK SEDIAAN & KLASIFIKASI PRODUK (STRICT FORM FACTOR INTEGRITY):
+1. Bedakan tegas taksonomi sediaan produk: Serum/Ampoule/Essence (cair konsentrat) VS Toner/Micellar (penyegar) VS Krim/Gel/Lotion (emulsi) VS Sabun/Cleanser VS Shampo/Hair Tonic.
+2. DILARANG KERAS menyamarkan Toner sebagai Serum atau melabeli sediaan lain sebagai sediaan yang diminta. Jika pengguna menanyakan serum untuk suatu perawatan dan di dokumen hanya ada toner, jelaskan secara jujur bahwa produk yang ada adalah toner dan sediaan serum tidak tersedia.
+3. DILARANG membuat sub-heading `### Serum yang Digunakan` jika isinya adalah Toner.
+
+ATURAN FORMAT TABEL GITHUB FLAVORED MARKDOWN (GFM MULTILINE TABLE):
+- Jika menyajikan perbandingan, data katalog, atau dosis dalam bentuk tabel:
+  1. Awali dan akhiri blok tabel dengan baris baru ganda (\n\n).
+  2. Baris Header diakhiri newline (\n).
+  3. Baris Pembatas (| :--- | :--- |) diakhiri newline (\n).
+  4. Setiap baris data wajib berada di baris terpisah (\n). DILARANG menyambung pipa ganda (| |) dalam satu baris!
 """
 
 
@@ -347,6 +402,31 @@ def log_rag_chat(
     )
 
 
+def repair_markdown_tables(text: str) -> str:
+    """
+    Universal auto-healer for GitHub Flavored Markdown (GFM) tables.
+    Solves LLM streaming / smaller model (GPT-4o-mini) token compression bugs where:
+    1. Table rows are concatenated without newlines (| Val A | | Val B |).
+    2. Header and delimiter rows are joined on a single line (| Col 1 | |--|--|).
+    3. Tables lack double newlines before or after, breaking parser in ReactMarkdown.
+    """
+    if not text or "|" not in text:
+        return text
+
+    repaired = text
+
+    # 1. Break concatenated rows separated by consecutive pipes: | Val A | | Val B | -> | Val A |\n| Val B |
+    repaired = re.sub(r'\|\s*\|', '|\n|', repaired)
+
+    # 2. Ensure a blank line before table start if preceded directly by non-blank text
+    repaired = re.sub(r'([^\n\s|][^\n|]*)\n(\|(?:\s*[^|\n]+\s*\|)+)', r'\1\n\n\2', repaired)
+
+    # 3. Ensure a blank line after table end if followed directly by non-blank text
+    repaired = re.sub(r'(\|[^\n]+\|)\n([^|\n\s])', r'\1\n\n\2', repaired)
+
+    return repaired
+
+
 # --- Dynamic Grounded Image Helpers ---
 
 def _clean_item_name(val: str) -> str:
@@ -356,7 +436,7 @@ def _clean_item_name(val: str) -> str:
     v = re.sub(r'\.(docx|pptx|pdf|doc|xlsx|png|jpg|jpeg)\b', '', v, flags=re.IGNORECASE)
     v = re.sub(r'(?i)\b(Dummy|Documentation|Detail|Dokumentasi|Katalog|Catalog|Spesifikasi|Alat|Mesin|Peralatan|Parameter|Gambar|Foto|Tabel)\b', '', v)
     v = re.sub(r'^\s*[\d\.\)\-\:\•\*\#]+\s*', '', v)
-    v = re.sub(r'[\-_/&]+', ' ', v)
+    v = re.sub(r'[\-_/]+', ' ', v)
     v = re.sub(r'\s+', ' ', v).strip()
     return v
 
@@ -379,12 +459,45 @@ def _is_generic_name(name: str) -> bool:
     return n_lower in generic_words or any(n_lower == gw for gw in generic_words)
 
 
-def _extract_specific_treatment_or_product_name(meta: Dict[str, Any], chunk_text: str = "", doc_title: str = "") -> str:
+def _extract_specific_treatment_or_product_name(
+    meta: Dict[str, Any], 
+    chunk_text: str = "", 
+    doc_title: str = "",
+    target_url: str = ""
+) -> str:
     """
     Dynamically extracts the specific treatment or product name associated with this chunk/image.
     Never blindly takes from document file title (per user explicit instruction:
     'satu file isinya bisa banyak treatment jadi dibuat dinamis saja mengenali ini gambar apa + punya treatment/produk apa jadi nama belakang jangan ambil di title ya').
     """
+    # 0. Check pre-computed image_provenance in metadata first
+    url_candidate = target_url or meta.get("image_url") or meta.get("image") or ""
+    if url_candidate and meta.get("image_provenance"):
+        target_fn = os.path.basename(str(url_candidate)).strip().lower()
+        for p_data in meta.get("image_provenance", []):
+            if isinstance(p_data, dict):
+                p_url = p_data.get("target_url", "")
+                p_fn = os.path.basename(p_url).lower()
+                if (url_candidate and p_url == url_candidate) or (target_fn and p_fn == target_fn):
+                    item = p_data.get("linked_product") or p_data.get("linked_treatment") or p_data.get("caption")
+                    if item:
+                        c_val = _clean_item_name(item)
+                        if c_val and not _is_generic_name(c_val):
+                            return c_val
+
+    # 0B. Check inline markdown alt tag for this specific target_url in chunk_text
+    if url_candidate and chunk_text:
+        target_fn = os.path.basename(str(url_candidate)).strip()
+        pattern = rf'!\[([^\]]+)\]\([^)]*{re.escape(target_fn)}[^)]*\)'
+        m = re.search(pattern, chunk_text)
+        if not m:
+            pattern = rf'!\[([^\]]+)\]\([^)]*{re.escape(str(url_candidate))}[^)]*\)'
+            m = re.search(pattern, chunk_text)
+        if m:
+            cand = _clean_item_name(m.group(1))
+            if cand and not _is_generic_name(cand):
+                return cand
+
     # A. Check explicit metadata fields
     for key in ["treatment_name", "product_name", "treatment", "product", "entity_name"]:
         val = meta.get(key)
@@ -490,63 +603,77 @@ def _extract_specific_treatment_or_product_name(meta: Dict[str, Any], chunk_text
 def _normalize_image_captions_in_text(text: str, results: List[Dict[str, Any]]) -> str:
     """
     Cleans and standardizes image alt text in markdown images within text.
-    Ensures DEVICE_OR_TOOL images are labeled as 'Foto Treatment - <Treatment Name>',
-    never 'Alat / Mesin / Spesifikasi / Parameter'.
-    Replaces static/raw titles with dynamic {image_type} - {specific_treatment_or_product_name}.
+    Relies strictly on pre-computed ImageProvenance from chunk metadata / registry.
+    Suppresses images whose display_policy != INCLUDE.
+    Renders displayable images using prov.format_display_label().
     """
     if not text:
         return text
 
-    # Map image URLs to their dynamic label from retrieved results
-    url_to_label = {}
+    from app.rag.canonical import ImageProvenance, ImageProvenanceRegistry, ImageType
+
+    registry = ImageProvenanceRegistry()
+    url_to_label: Dict[str, str] = {}
+    excluded_urls = set()
+
+    # Register all pre-computed ImageProvenance from retrieved hits
     for hit in results:
         meta = hit.get("metadata", {})
-        chunk_text = hit.get("text") or hit.get("content") or ""
-        urls = []
-        if meta.get("image_url"):
-            urls.append(str(meta.get("image_url")))
-        if meta.get("image"):
-            urls.append(str(meta.get("image")))
-        if meta.get("image_urls") and isinstance(meta.get("image_urls"), list):
-            urls.extend([str(u) for u in meta.get("image_urls")])
+        doc_id = meta.get("document_id", "")
+        src_doc = meta.get("source_file") or meta.get("file_name") or ""
+        prov_list = meta.get("image_provenance") or []
 
-        inline_imgs = re.findall(r'!\[.*?\]\(([^\s\)]+)\)', chunk_text)
-        urls.extend(inline_imgs)
-
-        for u in set(urls):
-            if not (u.startswith("http") or u.startswith("/api/storage/") or u.startswith("/storage/") or u.startswith("images/")):
-                continue
-            img_fn = os.path.basename(u).lower()
-            item_name = _extract_specific_treatment_or_product_name(meta, chunk_text, "")
-            img_type = _determine_image_type(meta, chunk_text, img_fn, meta.get("section", ""), url=u)
-            
-            if item_name:
-                label = f"{img_type} - {item_name}"
+        for p_data in prov_list:
+            if isinstance(p_data, dict):
+                prov = ImageProvenance.from_dict(p_data)
+            elif isinstance(p_data, ImageProvenance):
+                prov = p_data
             else:
-                label = img_type
-            expanded = _format_browser_url(raw_url=u, s3_key=u)
-            url_to_label[u] = label
-            url_to_label[expanded] = label
+                continue
+
+            registry.register(prov)
+            u = prov.target_url
+            if not u:
+                continue
+
+            exp_u = _format_browser_url(raw_url=u, s3_key=u)
+            if prov.should_display():
+                lbl = prov.format_display_label()
+                if lbl:
+                    url_to_label[u] = lbl
+                    url_to_label[exp_u] = lbl
+            else:
+                excluded_urls.add(u)
+                excluded_urls.add(exp_u)
 
     # Replace markdown image alt texts and expand URLs in text
     def _replace_alt(m):
         raw_alt = m.group(1)
         img_url = m.group(2).strip()
         expanded_url = _format_browser_url(raw_url=img_url, s3_key=img_url)
-        
+
+        # 1. Check if explicitly excluded (e.g. document logo, author portrait, decorative)
+        if img_url in excluded_urls or expanded_url in excluded_urls:
+            return ""
+
+        # 2. Check if registered with display label
         if img_url in url_to_label:
             return f"![{url_to_label[img_url]}]({expanded_url})"
         if expanded_url in url_to_label:
             return f"![{url_to_label[expanded_url]}]({expanded_url})"
 
-        img_fn = os.path.basename(img_url).lower()
-        img_type = _determine_image_type({}, text, img_fn, "", url=img_url)
-        item_name = _extract_specific_treatment_or_product_name({}, text, "")
-        if item_name:
-            label = f"{img_type} - {item_name}"
-        else:
-            label = img_type
-        return f"![{label}]({expanded_url})"
+        # 3. Lookup in registry by URL
+        prov = registry.get(img_url) or registry.get(expanded_url)
+        if prov:
+            if prov.should_display():
+                lbl = prov.format_display_label()
+                if lbl:
+                    return f"![{lbl}]({expanded_url})"
+            return ""
+
+        # 4. If image was never registered or provenance is absent:
+        # Principle 9: Default UNKNOWN + EXCLUDE (Defense-in-depth: Never guess or fabricate!)
+        return ""
 
     return re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', _replace_alt, text)
 
@@ -560,81 +687,49 @@ def _determine_image_type(
     url: str = ""
 ) -> str:
     """
-    Dynamically recognizes what type of image this is (Ini gambar apa).
-    Prioritizes specific contextual markers in chunk_text/markdown tables before filename or generic metadata.
+    Returns image type label using persisted ImageProvenance.
+    Strictly avoids semantic reclassification at query-time (Principle 9).
     """
-    fn_lower = (img_filename or "").lower()
-    txt_lower = (chunk_text or "").lower()
-    sec_lower = (section_name or "").lower()
-    role_upper = str(meta.get("role", "")).upper()
+    from app.rag.canonical import ImageProvenance, ImageType, ClinicalStage
 
-    target_pattern = img_filename if (img_filename and len(img_filename) > 4) else url
+    prov_list = meta.get("image_provenance") or []
+    target_fn = os.path.basename(str(url or img_filename or "")).lower()
 
-    # 1. Check specific inline markdown alt tag in chunk_text for this image
-    if target_pattern:
-        pattern = rf'!\[([^\]]*)\]\([^)]*{re.escape(target_pattern)}[^)]*\)'
-        m = re.search(pattern, chunk_text)
-        if m:
-            alt = m.group(1).lower()
-            if any(k in alt for k in ["sesudah", "after", "setelah"]):
-                return "Foto Sesudah Perawatan"
-            if any(k in alt for k in ["before & after", "before after", "sebelum & sesudah", "sebelum sesudah"]):
-                return "Foto Before & After Perawatan"
-            if any(k in alt for k in ["sebelum", "before"]):
-                return "Foto Sebelum Perawatan"
-            if any(k in alt for k in ["produk", "product"]):
+    for p_data in prov_list:
+        if isinstance(p_data, dict):
+            p = ImageProvenance.from_dict(p_data)
+        elif isinstance(p_data, ImageProvenance):
+            p = p_data
+        else:
+            continue
+
+        p_u = p.target_url
+        p_fn = os.path.basename(p_u).lower()
+        if (url and p_u == url) or (target_fn and p_fn == target_fn):
+            if not p.should_display():
+                return ""
+            if p.image_type == ImageType.PRODUCT:
                 return "Foto Produk"
-            if any(k in alt for k in ["treatment", "alat", "device", "mesin", "peralatan"]):
+            elif p.image_type == ImageType.CLINICAL_BEFORE_AFTER:
+                if p.clinical_stage == ClinicalStage.BEFORE:
+                    return "Foto Sebelum Perawatan"
+                elif p.clinical_stage == ClinicalStage.AFTER:
+                    return "Foto Sesudah Perawatan"
+                else:
+                    return "Foto Before & After Perawatan"
+            elif p.image_type == ImageType.EQUIPMENT:
                 return "Foto Treatment"
+            elif p.image_type == ImageType.SCIENTIFIC_FIGURE:
+                return "Gambar Penelitian"
+            elif p.image_type == ImageType.SCIENTIFIC_GRAPH:
+                return "Grafik Penelitian"
+            elif p.image_type == ImageType.ILLUSTRATION:
+                return "Ilustrasi"
+            else:
+                return ""
 
-    # 2. Check table columns in chunk_text (e.g. | BEFORE | AFTER |)
-    if target_pattern:
-        for line in chunk_text.splitlines():
-            if target_pattern in line and "|" in line:
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) >= 3:
-                    for col_idx, col_content in enumerate(parts):
-                        if target_pattern in col_content:
-                            if col_idx == 1:
-                                return "Foto Sebelum Perawatan"
-                            elif col_idx == 2:
-                                return "Foto Sesudah Perawatan"
-
-    # 3. Check filename
-    if any(k in fn_lower for k in ["after", "_aft_"]) or "image3" in fn_lower or "img_3" in fn_lower:
-        return "Foto Sesudah Perawatan"
-    if any(k in fn_lower for k in ["before_after", "beforeafter", "ba_"]):
-        return "Foto Before & After Perawatan"
-    if any(k in fn_lower for k in ["before", "_bef_"]) or "image2" in fn_lower or "img_2" in fn_lower:
-        return "Foto Sebelum Perawatan"
-    if any(k in fn_lower for k in ["device", "alat", "mesin", "peralatan"]) or "image1" in fn_lower or "img_1" in fn_lower:
-        return "Foto Treatment"
-
-    # 4. Check metadata role
-    if role_upper == "CLINICAL_BEFORE_AFTER":
-        return "Foto Before & After Perawatan"
-    if role_upper == "CLINICAL_AFTER":
-        return "Foto Sesudah Perawatan"
-    if role_upper == "CLINICAL_BEFORE":
-        return "Foto Sebelum Perawatan"
-    if role_upper in ("DEVICE_OR_TOOL", "TREATMENT_IMAGE"):
-        return "Foto Treatment"
-    if role_upper in ("PRODUCT_PACKAGING", "PRODUCT"):
-        return "Foto Produk"
-
-    # 5. Check section name
-    if any(k in sec_lower for k in ["before", "sebelum"]) and any(k in sec_lower for k in ["after", "sesudah"]):
-        return "Foto Before & After Perawatan"
-    if any(k in sec_lower for k in ["sesudah", "after", "setelah"]):
-        return "Foto Sesudah Perawatan"
-    if any(k in sec_lower for k in ["sebelum", "before"]):
-        return "Foto Sebelum Perawatan"
-    if any(k in sec_lower for k in ["alat", "device", "mesin", "peralatan", "spesifikasi", "parameter", "treatment"]):
-        return "Foto Treatment"
-    if any(k in sec_lower for k in ["produk", "product"]):
-        return "Foto Produk"
-
-    return "Foto Treatment"
+    # Absence of pre-computed provenance: default to EXCLUDE (no guessing)
+    return ""
 
 
 
@@ -761,7 +856,9 @@ class GenerationPipeline:
 
         history_str = ""
         if history:
-            for msg in history:
+            # Pangkas riwayat chat ke maksimal 1 turn sebelumnya (1 user + 1 assistant) untuk mencegah konteks melayang
+            trimmed_history = history[-2:] if len(history) > 2 else history
+            for msg in trimmed_history:
                 role = "User" if msg.get("role") == "user" else "Assistant"
                 content = msg.get("content", "")
                 history_str += f"{role}: {content}\n"
@@ -808,6 +905,43 @@ class GenerationPipeline:
 
         doctor_context_info = f"Dokter Pengguna: {doc_salutation}" if doctor_name else "Dokter Pengguna: Dokter"
 
+        # Dynamic in-context form factor & table reminders for smaller models (GPT-4o-mini)
+        dynamic_reminders = []
+        if any(w in q_lower for w in ["serum", "ampoule", "essence"]):
+            dynamic_reminders.append(
+                "--- ATURAN KHUSUS SEDIAAN (SERUM) ---\n"
+                "PENGINGAT KETAT: Pengguna menanyakan produk sediaan SERUM / KONSENTRAT.\n"
+                "HANYA sebutkan produk jika di referensi benar-benar berjenis Serum.\n"
+                "DILARANG KERAS menyamarkan produk Toner, Pembersih, atau Krim sebagai Serum!\n"
+                "Jika pada referensi hanya tercantum Toner (misal: Acneact Pore Minimizing Toner), jelaskan secara jujur:\n"
+                "'Berdasarkan protokol resmi perawatan ini, produk yang terdaftar adalah [Nama Produk] yang berjenis Toner (bukan serum). Dokumen resmi saat ini tidak mencantumkan produk berjenis serum.'\n"
+                "DILARANG membuat heading '### Serum yang Digunakan' jika isinya produk Toner!"
+            )
+        elif any(w in q_lower for w in ["toner"]):
+            dynamic_reminders.append(
+                "--- ATURAN KHUSUS SEDIAAN (TONER) ---\n"
+                "PENGINGAT KETAT: Pengguna menanyakan TONER. HANYA rekomendasikan produk yang benar-benar berjenis Toner/Penyegar."
+            )
+        elif any(w in q_lower for w in ["krim malam", "night cream"]):
+            dynamic_reminders.append(
+                "--- ATURAN KHUSUS SEDIAAN (KRIM MALAM) ---\n"
+                "PENGINGAT KETAT: Pengguna menanyakan KRIM MALAM. DILARANG merekomendasikan krim pagi/sunscreen tanpa penegasan transparan."
+            )
+
+        table_keywords = ["tabel", "table", "matriks", "matrix", "perbandingan", "bandingkan", "dosis", "jadwal", "daftar tabular"]
+        if any(w in q_lower for w in table_keywords):
+            dynamic_reminders.append(
+                "--- ATURAN KHUSUS FORMAT TABEL GFM (STRICT MULTILINE) ---\n"
+                "PENGINGAT FORMAT: Pengguna meminta data tabular / perbandingan / dosis / tabel.\n"
+                "Sajikan dalam format tabel GitHub Flavored Markdown (GFM) yang valid:\n"
+                "1. Awali dan akhiri blok tabel dengan baris baru ganda (\\n\\n).\n"
+                "2. Baris Header wajib diakhiri newline (\\n).\n"
+                "3. Baris Pembatas (| :--- | :--- |) wajib di baris baru dan diakhiri newline (\\n).\n"
+                "4. Setiap baris data wajib berada di baris terpisah (\\n). DILARANG menyambung pipa ganda (| |) dalam satu baris horizontal!"
+            )
+
+        dynamic_reminders_block = ("\n\n".join(dynamic_reminders) + "\n\n") if dynamic_reminders else ""
+
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"--- IDENTITAS DOKTER PENGGUNA ---\n"
@@ -817,6 +951,7 @@ class GenerationPipeline:
             f"--- DETECTED INTENT ---\n"
             f"Intent Category: {intent.value}\n"
             f"Specific Instruction: {length_instruction}\n\n"
+            f"{dynamic_reminders_block}"
             f"--- CLINICAL & PRODUCT REFERENCE DATA ---\n"
             f"{context}\n\n"
             f"--- CONVERSATION HISTORY ---\n"
@@ -836,12 +971,67 @@ class GenerationPipeline:
     ) -> Tuple[bool, str]:
         """
         Post-generation sanitization:
+        - Auto-heals GFM markdown tables.
+        - Validates factual claims against Evidence Pack (Pure Validator: Pass / Fail -> Truthful Fallback).
+        - Auto-heals GFM markdown tables without altering clinical facts.
         - Strips literal image_url placeholders (e.g. ![Product](image_url)) if no HTTP URL is present.
         - Strips recurring hardcoded closing clichés.
         - Injects authentic MinIO images specifically above corresponding items.
         """
         import re
         sanitized = answer.strip()
+
+        # 0. Table auto-healing (GFM multiline normalization - pure visual layout)
+        sanitized = repair_markdown_tables(sanitized)
+
+        # 0b. Form factor conflict heading sanitizer (prevents mislabeled headers)
+        q_lower = query.lower()
+        if "serum" in q_lower:
+            def _fix_serum_toner_heading(m):
+                prod_line = m.group(2)
+                if re.search(r'\btoner\b', prod_line, re.IGNORECASE) and not re.search(r'\bserum\b', prod_line, re.IGNORECASE):
+                    return f"### Produk Pendukung (Toner)\n{prod_line}"
+                return m.group(0)
+
+            sanitized = re.sub(
+                r'(###\s*(?:Serum\s+(?:yang\s+digunakan|pendukung|rekomendasi)|Produk\s+Serum)[\s\:\-]*)\n+([^\n]*(?:toner|pore\s+minimizing)[^\n]*)',
+                _fix_serum_toner_heading,
+                sanitized,
+                flags=re.IGNORECASE
+            )
+
+        # 0c. Factual Safety Gate Validator (Pure Gate, Bukan Editor - Task 10)
+        # Validates that LLM does not hallucinate or substitute form factors against Evidence Pack
+        ff_intent = HybridRetriever._detect_form_factor_intent(query)
+        if ff_intent.get("hard_filter"):
+            target_ff = ff_intent["target"]
+            evidence_ffs = set()
+            for r in (results or []):
+                meta = r.get("metadata", {})
+                ff = (meta.get("form_factor") or "").lower()
+                if ff:
+                    evidence_ffs.add(ff)
+                txt = r.get("text", "").lower()
+                for known_ff in ["serum", "toner", "krim", "cleanser", "shampoo", "sunscreen", "masker"]:
+                    if re.search(rf'\b{re.escape(known_ff)}\b', txt):
+                        evidence_ffs.add(known_ff)
+
+            if target_ff not in evidence_ffs:
+                claimed_target = bool(re.search(
+                    rf'(?:rekomendasi\s+{re.escape(target_ff)}|produk\s+{re.escape(target_ff)}|###\s*.*{re.escape(target_ff)})',
+                    sanitized,
+                    re.IGNORECASE
+                ))
+                if claimed_target and not any(w in sanitized.lower() for w in ["produk pendukung", "bukan serum", "sediaan lain"]):
+                    logger.warning(
+                        f"🛡️ [Safety Gate REJECT] Query targeted '{target_ff}', but evidence does not contain it. "
+                        f"LLM hallucinated/substituted '{target_ff}'. Rejecting to truthful fallback."
+                    )
+                    fallback_msg = (
+                        f"Untuk saat ini informasi mengenai produk sediaan {target_ff.upper()} untuk kebutuhan tersebut "
+                        f"belum tersedia di basis data resmi kami. Produk yang tercantum dalam formularium kami adalah sediaan lain."
+                    )
+                    return False, fallback_msg
 
         # Strip literal image_url placeholders
         sanitized = re.sub(r'!\[([^\]]*)\]\((image_url|url|\s*)\)', r'\1', sanitized)
@@ -898,10 +1088,12 @@ class GenerationPipeline:
             # (User note: satu file isinya bisa banyak treatment jadi dibuat dinamis saja
             # mengenali ini gambar apa + punya treatment/produk apa jadi nama belakang jangan ambil di title)
             chunk_text = hit.get("text") or hit.get("content") or ""
-            specific_item_name = _extract_specific_treatment_or_product_name(meta, chunk_text, "")
+            specific_item_name = _extract_specific_treatment_or_product_name(meta, chunk_text, "", target_url=str(img))
 
             # 3. DYNAMICALLY IDENTIFY WHAT TYPE OF IMAGE THIS IS (Ini gambar apa)
             img_type = _determine_image_type(meta, chunk_text, img_filename, section_name, url=str(img))
+            if not img_type:
+                continue
 
             # Query-focus relevance filter:
             # If user asks specifically for Before condition: DO NOT inject Treatment device or After photo
@@ -927,7 +1119,10 @@ class GenerationPipeline:
 
             # Format full dynamic label: {img_type} - {specific_item_name}
             if specific_item_name:
-                display_label = f"{img_type} - {specific_item_name}"
+                if specific_item_name.lower().startswith("foto "):
+                    display_label = specific_item_name
+                else:
+                    display_label = f"{img_type} - {specific_item_name}"
             else:
                 display_label = img_type
 
@@ -987,6 +1182,7 @@ class GenerationPipeline:
         
         # Post-generation sanitization: strip any leaked file names or internal system IDs
         sanitized = strip_internal_document_references(sanitized)
+        sanitized = repair_markdown_tables(sanitized)
         return True, expand_image_urls_in_markdown(sanitized)
 
     def sanitize_history_for_restrictions(
@@ -1068,7 +1264,7 @@ class GenerationPipeline:
                 query=unfilter_q,
                 top_k=5,
                 filter_metadata=None,
-                rerank=True,
+                rerank=False,
                 rerank_top_n=5
             )
             unfiltered_hits = unfiltered_res.get("results", [])
@@ -1379,6 +1575,7 @@ class GenerationPipeline:
 
         return {
             "query": query,
+            "intent": intent.value,
             "answer": final_answer,
             "context": effective_context,
             "results": results,
@@ -1460,13 +1657,14 @@ class GenerationPipeline:
         is_complex = force_agent or QueryIntentDetector.should_use_agent(query, intent)
         agent_used = False
 
-        if is_complex and self.medical_agent:
+        if is_complex and self.medical_agent and settings.rag_agent_enabled:
             effective_context, results = await asyncio.to_thread(
                 self.medical_agent.run_tool_orchestration,
                 question=query,
                 history=history
             )
             agent_used = True
+
         else:
             search_query = self.contextualize_retrieval_query(query, history)
             retrieval_response = await asyncio.to_thread(

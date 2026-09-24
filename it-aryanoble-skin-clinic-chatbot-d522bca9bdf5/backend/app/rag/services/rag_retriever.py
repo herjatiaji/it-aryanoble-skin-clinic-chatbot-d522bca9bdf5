@@ -122,11 +122,12 @@ class BM25Index:
                 for doc in docs:
                     text_val = doc.text or ""
                     meta_val = doc.metadata_ or {}
+                    retrieval_text = meta_val.get("retrieval_text") or text_val
                     self.chunks.append({
                         "text": text_val,
                         "metadata": meta_val
                     })
-                    self.corpus.append(self.tokenize(text_val))
+                    self.corpus.append(self.tokenize(retrieval_text))
                 
                 if self.corpus:
                     self.bm25 = BM25Okapi(self.corpus)
@@ -158,11 +159,12 @@ class BM25Index:
         for chunk in new_chunks:
             text = chunk.get("text", "")
             metadata = chunk.get("metadata", {})
+            retrieval_text = metadata.get("retrieval_text") or text
             self.chunks.append({
                 "text": text,
                 "metadata": metadata
             })
-            self.corpus.append(self.tokenize(text))
+            self.corpus.append(self.tokenize(retrieval_text))
 
         # Re-initialize the BM25 model with the updated corpus
         if self.corpus:
@@ -242,7 +244,21 @@ class BM25Index:
             match = True
             if filter_metadata:
                 for k, v in filter_metadata.items():
-                    if k == "excluded_categories" and isinstance(v, list):
+                    if k in ("clinic_id", "user_clinic_id") and v:
+                        user_clinic = str(v).strip().lower()
+                        chunk_scope = str(meta.get("knowledge_scope") or "").upper()
+                        if chunk_scope in ("GLOBAL", "TENANT"):
+                            continue
+                        chunk_clinic = str(meta.get("clinic_id") or "").strip().lower()
+                        chunk_clinics = meta.get("clinics") or []
+                        if isinstance(chunk_clinics, list):
+                            c_list = [str(c).strip().lower() for c in chunk_clinics]
+                        else:
+                            c_list = [str(chunk_clinics).strip().lower()]
+                        if chunk_clinic and chunk_clinic != user_clinic and user_clinic not in c_list and "all" not in c_list:
+                            match = False
+                            break
+                    elif k == "excluded_categories" and isinstance(v, list):
                         chunk_cats = meta.get("categories", [])
                         if not isinstance(chunk_cats, list):
                             chunk_cats = [chunk_cats] if chunk_cats else []
@@ -290,12 +306,15 @@ class BM25Index:
             results = []
             for idx in top_temp_indices:
                 score = scores[idx]
-                if score == 0.0:  # Skip chunks with absolutely zero term matches
+                doc_tokens = filtered_corpus[idx]
+                matched_count = sum(1 for t in tokenized_query if t in doc_tokens)
+                if score <= 0.0 and matched_count == 0:
                     continue
                 orig_idx = filtered_indices[idx]
+                effective_score = float(score) if score > 0.0 else (0.1 * matched_count)
                 results.append({
                     "text": self.chunks[orig_idx]["text"],
-                    "score": float(score),
+                    "score": effective_score,
                     "metadata": self.chunks[orig_idx]["metadata"]
                 })
             return results
@@ -308,11 +327,14 @@ class BM25Index:
             results = []
             for idx in top_indices:
                 score = scores[idx]
-                if score == 0.0:  # Skip chunks with absolutely zero term matches
+                doc_tokens = self.corpus[idx]
+                matched_count = sum(1 for t in tokenized_query if t in doc_tokens)
+                if score <= 0.0 and matched_count == 0:
                     continue
+                effective_score = float(score) if score > 0.0 else (0.1 * matched_count)
                 results.append({
                     "text": self.chunks[idx]["text"],
-                    "score": float(score),
+                    "score": effective_score,
                     "metadata": self.chunks[idx]["metadata"]
                 })
             return results
@@ -390,88 +412,32 @@ class BM25Index:
             logger.info("No existing BM25 index found in MinIO or disk. Starting with clean index.")
 
 
-# --- Cross-Encoder Reranker ---
-import threading
-
+# --- Lightweight Deterministic Reranker (CPU & RAM Optimized, Zero PyTorch Overhead) ---
 class Reranker:
-    _shared_models: Dict[str, Any] = {}
-    _lock = threading.Lock()
-
-    def __init__(self, model_name: str = "BAAI/bge-reranker-base"):
+    def __init__(self, model_name: str = "deterministic-rrf"):
         self.model_name = model_name
 
     def _ensure_loaded(self):
-        if self.model_name not in Reranker._shared_models or Reranker._shared_models[self.model_name] is None:
-            with Reranker._lock:
-                if self.model_name not in Reranker._shared_models or Reranker._shared_models[self.model_name] is None:
-                    logger.info(f"Loading Cross-Encoder Reranker model: {self.model_name}...")
-                    try:
-                        from sentence_transformers import CrossEncoder
-                        Reranker._shared_models[self.model_name] = CrossEncoder(self.model_name)
-                        logger.info("Cross-Encoder Reranker model loaded successfully.")
-                    except Exception as e:
-                        logger.error(f"Failed to load CrossEncoder model: {e}")
-                        Reranker._shared_models[self.model_name] = None
+        """No-op: lightweight reranker requires zero external weights/model downloads."""
+        pass
 
     @property
     def model(self):
-        self._ensure_loaded()
-        return Reranker._shared_models.get(self.model_name)
+        return None
 
-    def rerank(self, query: str, hits: List[Dict[str, Any]], top_n: int = 3) -> List[Dict[str, Any]]:
+    def rerank(self, query: str, hits: List[Dict[str, Any]], top_n: int = 6) -> List[Dict[str, Any]]:
         """
-        Reranks retrieve search candidates using the Cross-Encoder.
-        Optimized for fast CPU inference (< 200ms) by clipping candidate set to top 5
-        and truncating text snippets to 350 chars.
+        Deterministic CPU/RAM-friendly ranking.
+        Propagates RRF scores without heavy PyTorch forward pass, saving ~800MB RAM and 2-7s CPU.
         """
         if not hits:
             return []
-            
-        self._ensure_loaded()
-        if not self.model:
-            logger.warning("Reranker model is not loaded. Returning original hits limited to top_n.")
-            return hits[:top_n]
-
-        try:
-            # Evaluate top 8 candidates with 600 chars snippet for fast CPU forward pass (< 0.7s on 1.5 vCPU)
-            target_hits = hits[:8]
-            pairs = []
-            for hit in target_hits:
-                meta = hit.get("metadata", {})
-                product_name = meta.get("product_name") or meta.get("title")
-                if not product_name:
-                    source_file = meta.get("source_file", "unknown")
-                    product_name = source_file
-                    for ext in [".pdf", ".docx", ".txt", "_parsed.json"]:
-                        product_name = product_name.replace(ext, "")
-                    product_name = product_name.replace("-", " ").replace("_", " ").strip()
-                
-                section = meta.get("section", "General")
-                text = hit.get("text", "")[:600]
-                
-                enriched_text = f"Product: {product_name} | Section: {section} | Content: {text}"
-                pairs.append([query, enriched_text])
-            
-            import torch
-            with torch.no_grad():
-                scores = self.model.predict(pairs, batch_size=8, show_progress_bar=False)
-            
-            import math
-            reranked_hits = []
-            for hit, raw_score in zip(target_hits, scores):
-                updated_hit = hit.copy()
-                val = float(raw_score)
-                norm_score = 1.0 / (1.0 + math.exp(-val)) if -700 <= val <= 700 else (1.0 if val > 700 else 0.0)
-                updated_hit["rerank_score"] = norm_score
-                reranked_hits.append(updated_hit)
-                
-            sorted_hits = sorted(reranked_hits, key=lambda h: h["rerank_score"], reverse=True)
-            
-            logger.info(f"Successfully reranked {len(target_hits)} candidates. Top score: {sorted_hits[0]['rerank_score']:.4f}")
-            return sorted_hits[:top_n]
-        except Exception as e:
-            logger.error(f"Reranking failed: {e}. Falling back to original rankings.")
-            return hits[:top_n]
+        out = []
+        for hit in hits:
+            updated_hit = hit.copy()
+            updated_hit["rerank_score"] = float(updated_hit.get("rrf_score", updated_hit.get("score", 0.85)))
+            out.append(updated_hit)
+        return out[:top_n]
 
 
 # --- Prompt Context Builder ---
@@ -581,6 +547,9 @@ class PromptContextBuilder:
 # --- Helper Rank Functions ---
 def get_chunk_key(hit: Dict[str, Any]) -> str:
     meta = hit.get("metadata", {})
+    chunk_id = meta.get("chunk_id")
+    if chunk_id:
+        return str(chunk_id)
     source_file = meta.get("source_file")
     chunk_index = meta.get("chunk_index")
     if source_file is not None and chunk_index is not None:
@@ -738,7 +707,8 @@ def reciprocal_rank_fusion(
             rrf_scores[key] = {"hit": hit, "score": 0.0}
         rrf_scores[key]["score"] += sparse_weight * (1.0 / (rrf_k + rank))
 
-    sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k]["score"], reverse=True)
+    # Deterministic RRF sorting: sort by score DESC, then stable chunk_id ASC for reproducible tie-breaking
+    sorted_keys = sorted(rrf_scores.keys(), key=lambda k: (-rrf_scores[k]["score"], str(k)))
 
     fused_hits = []
     for key in sorted_keys:
@@ -884,6 +854,75 @@ class HybridRetriever:
 
         return None
 
+    @staticmethod
+    def _extract_target_form_factor(query: str) -> Optional[str]:
+        """
+        Extracts clinical product form factor / sediaan from query
+        to prevent entity drift & forced substitution in smaller models like gpt-4o-mini.
+        """
+        if not query:
+            return None
+        q_lower = query.lower()
+        form_factors = {
+            "serum": ["serum", "ampoule", "essence"],
+            "toner": ["toner", "micellar", "micellar water"],
+            "krim": ["krim", "cream", "moisturizer", "pelembap", "lotion", "gel"],
+            "cleanser": ["cleanser", "facial wash", "face wash", "sabun wajah", "pembersih wajah"],
+            "shampoo": ["shampoo", "sampo", "hair tonic", "scalp serum"],
+            "sunscreen": ["sunscreen", "tabir surya", "sunblock"],
+            "masker": ["masker", "sheet mask", "clay mask", "peeling"]
+        }
+        for ff_key, aliases in form_factors.items():
+            for alias in aliases:
+                if re.search(rf'\b{re.escape(alias)}\b', q_lower):
+                    return ff_key
+        return None
+
+    @staticmethod
+    def _detect_form_factor_intent(query: str) -> Dict[str, Any]:
+        """
+        Analyzes query for explicit form factor constraints.
+        Distinguishes:
+        - Single-target constraint: e.g. "serum apa untuk acne", "rekomendasi sunscreen oily"
+          -> hard_filter = True, target = 'serum'
+        - Comparative / Multi-target: e.g. "perbedaan serum dan toner", "beda krim vs gel"
+          -> hard_filter = False (comparative intent must retrieve both)
+        - No form factor specified: e.g. "obat untuk bruntusan"
+          -> hard_filter = False, target = None
+        """
+        if not query:
+            return {"hard_filter": False, "target": None, "all_detected": []}
+
+        q_lower = query.lower()
+        form_factors = {
+            "serum": ["serum", "ampoule", "essence"],
+            "toner": ["toner", "micellar", "micellar water"],
+            "krim": ["krim", "cream", "moisturizer", "pelembap", "lotion", "gel"],
+            "cleanser": ["cleanser", "facial wash", "face wash", "sabun wajah", "pembersih wajah"],
+            "shampoo": ["shampoo", "sampo", "hair tonic", "scalp serum"],
+            "sunscreen": ["sunscreen", "tabir surya", "sunblock"],
+            "masker": ["masker", "sheet mask", "clay mask", "peeling"]
+        }
+
+        detected = []
+        for ff_key, aliases in form_factors.items():
+            if any(re.search(rf'\b{re.escape(a)}\b', q_lower) for a in aliases):
+                detected.append(ff_key)
+
+        if not detected:
+            return {"hard_filter": False, "target": None, "all_detected": []}
+
+        comp_patterns = [
+            r'\bperbedaan\b', r'\bbeda\b', r'\bbandingkan\b', r'\bdibandingkan\b',
+            r'\bvs\b', r'\bversus\b', r'\bmana\s+yang\s+lebih\b', r'\bkelebihan\s+dan\s+kekurangan\b'
+        ]
+        is_comparative = any(re.search(p, q_lower) for p in comp_patterns) or len(detected) >= 2
+
+        if is_comparative:
+            return {"hard_filter": False, "target": None, "all_detected": detected, "is_comparative": True}
+
+        return {"hard_filter": True, "target": detected[0], "all_detected": detected, "is_comparative": False}
+
     def retrieve(
         self, 
         query: str, 
@@ -940,16 +979,15 @@ class HybridRetriever:
         fused_hits = reciprocal_rank_fusion(dense_hits, sparse_hits, dense_weight=dense_weight, sparse_weight=sparse_weight)
         logger.debug(f"RRF Fusion completed. Fused {len(fused_hits)} candidates.")
 
-        # Deduplicate
-        seen_texts = set()
+        # Deduplicate using stable chunk_id (Task 8.2)
+        seen_keys = set()
         deduplicated_hits = []
         for hit in fused_hits:
-            text = hit.get("text", "").strip()
-            norm_text = " ".join(text.split()).lower()
-            if norm_text not in seen_texts:
-                seen_texts.add(norm_text)
+            key = get_chunk_key(hit)
+            if key not in seen_keys:
+                seen_keys.add(key)
                 deduplicated_hits.append(hit)
-        logger.debug(f"Deduplicated fused hits from {len(fused_hits)} to {len(deduplicated_hits)} unique candidates.")
+        logger.debug(f"Deduplicated fused hits from {len(fused_hits)} to {len(deduplicated_hits)} unique candidates by chunk_id.")
 
         # Temporal filtering: exclude expired promotional chunks when include_expired=False
         today = datetime.now(timezone.utc).date()
@@ -963,10 +1001,40 @@ class HybridRetriever:
                 vu = meta.get("valid_until") or meta.get("expiry_date")
                 logger.info(f"Filtered out expired promotional chunk: '{p_name}' (valid_until: {vu})")
 
+        # Explicit Structured Constraint: Intent-Aware Form Factor Policy (Task 7)
+        ff_intent = self._detect_form_factor_intent(query)
+        if ff_intent.get("hard_filter"):
+            target_ff = ff_intent["target"]
+            ff_aliases = {
+                "serum": ["serum", "ampoule", "essence"],
+                "toner": ["toner", "micellar"],
+                "krim": ["krim", "cream", "lotion", "gel", "moisturizer", "pelembap"],
+                "cleanser": ["cleanser", "facial wash", "face wash", "sabun wajah"],
+                "shampoo": ["shampoo", "sampo", "hair tonic", "scalp serum"],
+                "sunscreen": ["sunscreen", "tabir surya", "sunblock"],
+                "masker": ["masker", "sheet mask", "clay mask"]
+            }.get(target_ff, [target_ff])
+
+            matching_ff_hits = []
+            for h in active_hits:
+                meta = h.get("metadata", {})
+                chunk_ff = (meta.get("form_factor") or "").lower()
+                chunk_txt = h.get("text", "").lower()
+                if chunk_ff == target_ff or any(re.search(rf'\b{re.escape(a)}\b', chunk_ff) for a in ff_aliases) or any(re.search(rf'\b{re.escape(a)}\b', chunk_txt) for a in ff_aliases):
+                    h["_matches_form_factor"] = True
+                    matching_ff_hits.append(h)
+
+            if matching_ff_hits:
+                logger.info(f"🎯 [Constraint Policy] Hard filter applied: retained {len(matching_ff_hits)} strictly matching chunks for form_factor='{target_ff}'.")
+                active_hits = matching_ff_hits
+            else:
+                logger.info(f"🎯 [Constraint Policy] Hard filter applied: 0 chunks matched form_factor='{target_ff}'. Rejecting substitution to prevent entity drift.")
+                active_hits = []
+
         # Target ingredient extraction for precision filtering & anti-contamination
         target_ingredient = self._extract_target_ingredient(query)
 
-        if target_ingredient:
+        if target_ingredient and active_hits:
             target_ing_lower = target_ingredient.lower()
             matching_active = []
             for h in active_hits:
@@ -982,24 +1050,29 @@ class HybridRetriever:
                 active_hits = matching_active
 
         # Fast-Path / Exact Match Reranker Bypass
-        # If dense and sparse agree on top chunk with high confidence,
-        # we can bypass the heavy PyTorch Cross-Encoder, saving 1.5-2.5s CPU latency.
+        # Fast-Path / Exact Match Reranker Bypass
+        # If active_hits <= 2 or dense/sparse agree on top chunk with high confidence (>= 0.70),
+        # we can bypass the heavy PyTorch Cross-Encoder, saving 2-7s CPU latency.
         skip_heavy_reranker = False
-        if dense_hits and sparse_hits:
+        if len(active_hits) <= 2:
+            skip_heavy_reranker = True
+            logger.info(f"⚡ [Fast-Path Bypass] Only {len(active_hits)} chunk(s) matched. Skipping CPU cross-encoder.")
+        elif dense_hits and sparse_hits:
             top_dense_src = dense_hits[0].get("metadata", {}).get("source_file") or dense_hits[0].get("metadata", {}).get("knowledge_id")
             top_sparse_src = sparse_hits[0].get("metadata", {}).get("source_file") or sparse_hits[0].get("metadata", {}).get("knowledge_id")
             top_dense_score = float(dense_hits[0].get("score", 0.0))
-            if top_dense_src and top_dense_src == top_sparse_src and top_dense_score >= 0.75:
+            if top_dense_src and top_dense_src == top_sparse_src and top_dense_score >= 0.70:
                 skip_heavy_reranker = True
                 logger.info(f"⚡ [Fast-Path Bypass] Dense & Sparse top match agreed on '{top_dense_src}' (score: {top_dense_score:.3f}). Skipping CPU cross-encoder.")
 
         final_hits = active_hits
-        if rerank and self.reranker and active_hits:
-            if skip_heavy_reranker:
+        if active_hits:
+            if not self.reranker or not rerank or skip_heavy_reranker:
                 all_reranked = []
+                default_conf = float(dense_hits[0].get("score", 0.85)) if dense_hits and isinstance(dense_hits[0], dict) else 0.85
                 for h in active_hits:
                     hc = h.copy()
-                    hc["rerank_score"] = float(hc.get("rrf_score", hc.get("score", 0.85)))
+                    hc["rerank_score"] = float(hc.get("rrf_score", hc.get("score", default_conf)))
                     all_reranked.append(hc)
             else:
                 all_reranked = self.reranker.rerank(query, active_hits, top_n=len(active_hits))
@@ -1019,6 +1092,9 @@ class HybridRetriever:
 
             # Target ingredient extraction for precision filtering & anti-contamination
             target_ingredient = self._extract_target_ingredient(query)
+
+            # Target clinical form factor extraction for entity integrity
+            target_form_factor = self._extract_target_form_factor(query)
 
 
             # Clinical indication keywords for automatic medical cross-referencing
@@ -1069,6 +1145,28 @@ class HybridRetriever:
                     boost += 0.10
                 elif is_product_intent and (doc_type_upper == "PRODUCT" or any(s in section_upper for s in ["PRODUCT", "PRODUK", "KATALOG", "SKINCARE"])):
                     boost += 0.05
+
+                # Strict Form Factor (Sediaan) Relevance & Anti-Drift Boost (+0.30)
+                if target_form_factor:
+                    ff_aliases = {
+                        "serum": ["serum", "ampoule", "essence"],
+                        "toner": ["toner", "micellar"],
+                        "krim": ["krim", "cream", "lotion", "gel", "moisturizer", "pelembap"],
+                        "cleanser": ["cleanser", "facial wash", "face wash", "sabun wajah"],
+                        "shampoo": ["shampoo", "sampo", "hair tonic", "scalp serum"],
+                        "sunscreen": ["sunscreen", "tabir surya", "sunblock"],
+                        "masker": ["masker", "sheet mask", "clay mask"]
+                    }.get(target_form_factor, [target_form_factor])
+
+                    hit_text_lower = updated_hit.get("text", "").lower()
+                    meta_lower = str(meta).lower()
+                    has_form_factor = any(re.search(rf'\b{re.escape(a)}\b', hit_text_lower) or re.search(rf'\b{re.escape(a)}\b', meta_lower) for a in ff_aliases)
+                    if has_form_factor:
+                        boost += 0.30
+                        updated_hit["_matches_form_factor"] = True
+                        logger.debug(f"Form factor '{target_form_factor}' matched in '{meta.get('product_name')}'. Boosted +0.30")
+                    else:
+                        updated_hit["_matches_form_factor"] = False
 
                 # Auto-Cross-Reference: Clinical Indication Match Boost (+0.12)
                 hit_indications = meta.get("indications", [])
@@ -1135,6 +1233,13 @@ class HybridRetriever:
                 }
 
         context_string = PromptContextBuilder.build_context(final_hits)
+        if target_form_factor:
+            context_string = (
+                f"[CATATAN INTEGRITAS SEDIAAN: Pengguna menanyakan produk sediaan '{target_form_factor.upper()}'. "
+                f"HANYA rekomendasikan produk yang benar-benar sediaan {target_form_factor.upper()}. "
+                f"Jika produk pada referensi adalah sediaan lain (misal: Toner), jelaskan sediaan aslinya secara faktual dan dilarang menyamarkannya sebagai {target_form_factor.upper()}!]\n\n"
+                + context_string
+            )
 
         return {
             "query": query,

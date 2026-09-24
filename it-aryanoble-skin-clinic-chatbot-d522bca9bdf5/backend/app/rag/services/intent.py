@@ -177,7 +177,7 @@ _INTENT_PATTERNS = [
     (
         QueryIntent.HOW_TO_USE,
         [
-            r"\bcara pakain?ya?\b", r"\bcara pengunaan\b", r"\baturan pakai\b",
+            r"\bcara pakai(?:nya)?\b", r"\bcara peng+unaan(?:nya)?\b", r"\baturan pakai\b",
             r"\bdosis\b", r"\bhow to use\b", r"\bdipakai kapan\b", r"\burutan pakai\b",
             r"\bcara menggunakannya\b", r"\bcara mengoleskan\b",
             r"\b(tahapan|tahapan treatment|tahapan tindakan|prosedur|prosedur tindakan|prosedur treatment|langkah[- ]langkah|protokol|step[- ]by[- ]step|alur tindakan|alur treatment)\b"
@@ -332,20 +332,20 @@ class QueryIntentDetector:
             }
         elif intent == QueryIntent.INGREDIENTS:
             return {
-                "max_sentences": 2,
-                "length_instruction": "Return ONLY the relevant active ingredients in 1-2 sentences or a concise list. Do not add unsolicited product recommendations or clinical advice.",
+                "max_sentences": 6,
+                "length_instruction": "Return the relevant active ingredients using a structured bullet-point list (- **Ingredient**: description). Group by category if multiple ingredients exist. Do not add unsolicited product recommendations.",
                 "missing_fallback": "Untuk saat ini informasi tersebut belum tersedia."
             }
         elif intent == QueryIntent.PRODUCT_FUNCTION or intent == QueryIntent.BENEFITS:
             return {
-                "max_sentences": 3,
-                "length_instruction": "Return ONLY the primary product function/benefits in maximum 2-3 sentences. Do not add unsolicited clinical regimens, extra product recommendations, or disclaimers.",
+                "max_sentences": 8,
+                "length_instruction": "Describe the product function/benefits using structured formatting: start with a brief intro sentence, then list each benefit or function as a bullet point (- **Benefit**: explanation). Use sub-headings (###) if there are distinct categories of benefits.",
                 "missing_fallback": "Untuk saat ini informasi tersebut belum tersedia."
             }
         elif intent == QueryIntent.HOW_TO_USE:
             return {
-                "max_sentences": 6,
-                "length_instruction": "Return ONLY the usage instructions, treatment steps, or clinical procedure in a clear step-by-step manner. Do not add extra product recommendations or clinical disclaimers.",
+                "max_sentences": 10,
+                "length_instruction": "Return the usage instructions or clinical procedure as a clear numbered step-by-step list (1. Step one 2. Step two...). Use bold for key terms. If there are morning vs evening routines, separate them with sub-headings (### Pagi Hari / ### Malam Hari). Do not add extra product recommendations.",
                 "missing_fallback": "Untuk saat ini informasi tersebut belum tersedia."
             }
         elif intent == QueryIntent.PRICE:
@@ -356,8 +356,8 @@ class QueryIntentDetector:
             }
         elif intent == QueryIntent.WARNING:
             return {
-                "max_sentences": 3,
-                "length_instruction": "Return ONLY safety warnings, contraindications, or pregnancy notes mentioned in context in maximum 2-3 sentences. Do not provide medical advice outside retrieved context.",
+                "max_sentences": 6,
+                "length_instruction": "Return safety warnings, contraindications, or pregnancy notes using bullet points for each warning item (- **Warning**: detail). Highlight critical warnings with bold text. Do not provide medical advice outside retrieved context.",
                 "missing_fallback": "Untuk saat ini informasi tersebut belum tersedia."
             }
         elif intent == QueryIntent.COMPARISON:
@@ -380,7 +380,7 @@ class QueryIntentDetector:
             }
         else:
             return {
-                "max_sentences": 3,
-                "length_instruction": "Answer the question concisely in maximum 2-3 sentences using ONLY the retrieved context. Do not over-explain or provide unsolicited recommendations.",
+                "max_sentences": 8,
+                "length_instruction": "Answer the question using structured Markdown formatting. Start with a brief intro, then use bullet points or numbered lists for key details. Use bold for important terms and sub-headings to separate topics. Do not over-explain or provide unsolicited recommendations.",
                 "missing_fallback": "Untuk saat ini informasi tersebut belum tersedia."
             }

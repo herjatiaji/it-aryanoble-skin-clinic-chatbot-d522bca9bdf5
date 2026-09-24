@@ -128,7 +128,11 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 		setIsEditMode(false);
 	};
 
-	if (error) {
+	if (isLoading && !data) {
+		return <KnowledgeDetailSkeleton />;
+	}
+
+	if (error && !data) {
 		return (
 			<div className="flex flex-col items-center justify-center h-full gap-4 p-6 text-center">
 				<div className="p-3 bg-red-50 text-red-600 rounded-full">
@@ -151,10 +155,6 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 				</Button>
 			</div>
 		);
-	}
-
-	if (isLoading && !data) {
-		return <KnowledgeDetailSkeleton />;
 	}
 
 	return (

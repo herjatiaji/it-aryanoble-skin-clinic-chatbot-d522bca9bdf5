@@ -173,37 +173,38 @@ def _clean_invalid_image_markdown(text: str, title: str = "") -> str:
             return ""
 
         if url.startswith("http://") or url.startswith("https://") or url.startswith("/api/storage/") or url.startswith("/storage/"):
-            # Never strip clinical, treatment, or product images if physical asset exists
-            is_clinical_or_treatment = any(k in alt_lower or k in u_lower for k in [
-                "sebelum", "sesudah", "before", "after", "alat", "device", "treatment",
-                "perawatan", "tindakan", "klinis", "clinical", "hasil", "spot", "wash",
-                "moisturizer", "truwhite", "acneact", "serum", "s3_img", "s4_img"
-            ])
-            if is_clinical_or_treatment:
-                fn = os.path.basename(u_lower)
-                if any(k in alt_lower or k in fn for k in ["sesudah", "after", "setelah", "image3", "img_3"]):
-                    img_type = "Foto Sesudah Perawatan"
-                elif any(k in alt_lower or k in fn for k in ["before_after", "before-after", "sebelum_sesudah"]) or ("before" in alt_lower and "after" in alt_lower):
-                    img_type = "Foto Before & After Perawatan"
-                elif any(k in alt_lower or k in fn for k in ["sebelum", "before", "image2", "img_2"]):
-                    img_type = "Foto Sebelum Perawatan"
-                elif any(k in alt_lower or k in fn for k in ["alat", "device", "mesin", "peralatan", "image1", "img_1"]):
-                    img_type = "Foto Treatment"
-                elif any(k in alt_lower or k in fn for k in ["produk", "product", "wash", "spot", "moisturizer", "serum"]):
-                    img_type = "Foto Produk"
-                else:
-                    img_type = "Foto Treatment"
+            from app.rag.canonical import classify_image_provenance, ImageType
 
-                if item_label:
-                    new_alt = f"{img_type} - {item_label}"
-                else:
-                    new_alt = img_type
-                return f"![{new_alt}]({url})"
+            # Extract table context if within table
+            tbl_context = ""
+            if "|" in text:
+                for line in text.splitlines():
+                    if url in line and "|" in line:
+                        tbl_context = line
+                        break
 
-            # Strip generic document cover/header slide images ONLY if explicitly presentation cover slide
-            if ("pptx_img_1_" in u_lower or "pptx_img_2_" in u_lower or "cover" in u_lower) and (alt_text == title or "cover" in alt_lower):
+            prov = classify_image_provenance(
+                target_url=url,
+                alt_text=alt_text,
+                table_context=tbl_context,
+                chunk_text=text,
+                section=title
+            )
+
+            # Suppress document artifacts or images that should not be displayed
+            if not prov.should_display():
                 return ""
-            return f"![{alt_text}]({url})"
+
+            if item_label and not prov.linked_product and not prov.linked_treatment:
+                if prov.image_type == ImageType.PRODUCT:
+                    prov.linked_product = item_label
+                elif prov.image_type in (ImageType.CLINICAL_BEFORE_AFTER, ImageType.EQUIPMENT):
+                    prov.linked_treatment = item_label
+
+            new_alt = prov.format_display_label()
+            if not new_alt:
+                return ""
+            return f"![{new_alt}]({url})"
         # Strip invalid/placeholder image tag
         return ""
 

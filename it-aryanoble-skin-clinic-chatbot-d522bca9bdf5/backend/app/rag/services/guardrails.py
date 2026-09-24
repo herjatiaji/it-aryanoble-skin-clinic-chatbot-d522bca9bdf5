@@ -8,6 +8,7 @@ All guards use lightweight regex + keyword matching — no external dependencies
 """
 
 import re
+import unicodedata
 from typing import Dict, Any, Optional, Tuple
 from loguru import logger
 
@@ -146,12 +147,16 @@ _WHITELIST_PHRASES: list[str] = [
     "platelet rich plasma", "comedo extraction", "ekstraksi komedo",
     "suntik jerawat", "injeksi jerawat", "infus whitening", "uji klinis",
     # ERHA brand, clinic operations & services
-    "erha derma center", "erha clinic", "erha skin", "erha apotheke",
+    "erha derma center", "erha clinic", "erha skin", "erha apotheke", "erha ultimate",
     "arya noble", "erha buddy", "erha connect", "jam buka", "jam operasional",
     "hari praktek", "hari praktik", "jadwal praktek", "jadwal praktik",
     "janji temu", "rekam medis", "biaya tindakan", "biaya perawatan",
     "efek samping", "side effect", "bahan aktif", "active ingredient",
     "aturan pakai", "cara pakai", "how to use", "interaksi obat",
+    # Arya Noble & Partner Brands
+    "lumera", "luméra", "dermies", "skincode",
+    # Skin barrier & physiological terms
+    "skin barrier", "skin-barrier", "barrier defense", "barrier repair",
     # Clinical consultation & treatment recommendation phrases
     "rekomendasi produk", "rekomendasi treatment", "rekomendasi tindakan",
     "rekomendasi skincare", "rekomendasi dokter", "rekomendasi obat",
@@ -160,8 +165,10 @@ _WHITELIST_PHRASES: list[str] = [
 ]
 
 _WHITELIST_KEYWORDS: set[str] = {
-    # Skin & anatomy
+    # Skin & anatomy & physiology
     "kulit", "skin", "derma", "dermatologi", "dermatologis", "epidermis", "dermis",
+    "barrier", "skinbarrier", "pelindung", "hidrasi", "hydration", "hydrating",
+    "soothing", "calming", "repair", "protect", "protection", "defense",
     "wajah", "muka", "face", "facial", "badan", "body", "leher", "mata", "bibir",
     "rambut", "hair", "kepala", "scalp", "ketombe", "dandruff", "alis", "bulumata",
     "kuku", "nail", "pori", "pore", "sebum", "minyak", "kering", "sensitif",
@@ -188,7 +195,7 @@ _WHITELIST_KEYWORDS: set[str] = {
 
     # Products & preparations
     "krim", "cream", "serum", "gel", "lotion", "cleanser", "toner", "essence",
-    "ampoule", "moisturizer", "pelembab", "scrub", "masker", "mask", "sabun",
+    "ampoule", "moisturizer", "moisturizers", "pelembab", "pelembap", "scrub", "masker", "mask", "sabun",
     "soap", "salep", "ointment", "balm", "bedak", "powder", "cushion", "mist",
     "emulsi", "emulsion", "kapsul", "capsule", "tablet", "pil", "suplemen",
     "produk", "product", "sku", "kemasan", "botol", "sachet", "tube", "jar",
@@ -203,7 +210,7 @@ _WHITELIST_KEYWORDS: set[str] = {
     "rf", "radiofrequency", "hifu", "cauterisasi",
 
     # Clinic, doctors, administration & services
-    "erha", "arya", "noble", "klinik", "clinic", "dokter", "dok", "doctor", "dr",
+    "erha", "arya", "noble", "lumera", "dermies", "skincode", "klinik", "clinic", "dokter", "dok", "doctor", "dr",
     "spkk", "spdve", "dermatologist", "resepsionis", "perawat", "nurse", "apoteker",
     "pharmacist", "apotek", "apotheke", "konsultasi", "telekonsultasi", "appointment",
     "janji", "booking", "reservasi", "daftar", "pendaftaran", "registrasi",
@@ -216,6 +223,7 @@ _WHITELIST_KEYWORDS: set[str] = {
     # Clinical pharmacology & safety
     "resep", "preskripsi", "racik", "racikan", "etiket", "sediaan", "dosis",
     "dosage", "frekuensi", "indikasi", "kontraindikasi", "efek", "samping",
+    "manfaat", "kegunaan", "fungsi", "khasiat", "keunggulan", "efikasi", "efektivitas", "kandungan", "komposisi",
     "toksisitas", "alergi", "hipersensitif", "interaksi", "obat", "keamanan",
     "safety", "uji", "klinis", "bpom", "batch", "expired", "kedaluwarsa",
     "simpan", "penyimpanan", "kulkas", "hamil", "bumil", "kehamilan", "pregnancy",
@@ -347,32 +355,44 @@ class InputGuard:
         Evaluates whether the query belongs to the ERHA medical/clinic domain using:
         1. Multi-word phrase matching
         2. Word token and Indonesian stem/root matching
+        3. English plural/suffix normalizations
         Returns (is_matched, matched_terms).
         """
         query_lower = query.lower()
+        # Normalize accents (e.g. LUMÉRA -> lumera, café -> cafe)
+        query_norm = unicodedata.normalize("NFKD", query).encode("ASCII", "ignore").decode("utf-8").lower()
         matched: list[str] = []
 
         # 1. Multi-word phrase matching
         for phrase in _WHITELIST_PHRASES:
-            if phrase in query_lower:
+            phrase_norm = unicodedata.normalize("NFKD", phrase).encode("ASCII", "ignore").decode("utf-8").lower()
+            if phrase in query_lower or phrase_norm in query_norm:
                 matched.append(phrase)
 
-        # 2. Tokenize words (letters and numbers only)
-        tokens = re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", query_lower)
+        # 2. Tokenize words (letters and numbers only from normalized query)
+        tokens = re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", query_norm)
 
         for token in tokens:
             # Disambiguation for Indonesian homonyms: 'resep' in culinary context ('resep masakan', 'resep kue') is not medical
-            if token == "resep" and re.search(r"\bresep\s+(?:masak|masakan|kue|makanan|minuman|kuliner|baking)\b", query_lower):
+            if token == "resep" and re.search(r"\bresep\s+(?:masak|masakan|kue|makanan|minuman|kuliner|baking)\b", query_norm):
                 continue
 
             if token in _WHITELIST_KEYWORDS:
                 matched.append(token)
                 continue
-            
-            # 3. Indonesian stemming candidates
+
+            # 3. English plural / suffix stripping (e.g. moisturizers -> moisturizer, creams -> cream)
+            if token.endswith("s") and len(token) > 3 and token[:-1] in _WHITELIST_KEYWORDS:
+                matched.append(f"{token}->{token[:-1]}")
+                continue
+            if token.endswith("es") and len(token) > 4 and token[:-2] in _WHITELIST_KEYWORDS:
+                matched.append(f"{token}->{token[:-2]}")
+                continue
+
+            # 4. Indonesian stemming candidates
             stems = _stem_indonesian_word(token)
             for stem in stems:
-                if stem == "resep" and re.search(r"\bresep\s+(?:masak|masakan|kue|makanan|minuman|kuliner|baking)\b", query_lower):
+                if stem == "resep" and re.search(r"\bresep\s+(?:masak|masakan|kue|makanan|minuman|kuliner|baking)\b", query_norm):
                     continue
                 if stem in _WHITELIST_KEYWORDS:
                     matched.append(f"{token}->{stem}")

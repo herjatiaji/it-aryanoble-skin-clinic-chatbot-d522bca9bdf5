@@ -2,6 +2,7 @@ from fastapi import Depends, HTTPException, status, Request, Header
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from typing import Optional
 from jose import jwt, JWTError
 import uuid
 import base64
@@ -154,6 +155,19 @@ async def get_current_user_flexible(
         
     return await get_current_user(request, db)
 
+# --- High-Performance In-Memory RBAC Permission Cache (5-Minute TTL) ---
+import time
+_USER_ACCESS_CACHE: dict[uuid.UUID, tuple[float, set[str]]] = {}
+_ACCESS_CACHE_TTL_SECONDS = 300.0  # 5 minutes
+
+def invalidate_user_access_cache(user_id: Optional[uuid.UUID] = None):
+    """Invalidates the cached permissions for a specific user, or all users if user_id is None."""
+    global _USER_ACCESS_CACHE
+    if user_id:
+        _USER_ACCESS_CACHE.pop(user_id, None)
+    else:
+        _USER_ACCESS_CACHE.clear()
+
 class RequireAccess:
     def __init__(self, required_access: str | list[str]):
         if isinstance(required_access, str):
@@ -167,22 +181,28 @@ class RequireAccess:
         if current_user.type != UserType.STAFF:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Staff access required")
             
-        stmt_acc = (
-            select(Access.name)
-            .join(RoleAccess, RoleAccess.access_id == Access.id)
-            .join(UserRole, UserRole.role_id == RoleAccess.role_id)
-            .where(UserRole.user_id == current_user.id)
-        )
-        
-        stmt_user_acc = (
-            select(Access.name)
-            .join(UserAccess, UserAccess.access_id == Access.id)
-            .where(UserAccess.user_id == current_user.id)
-        )
-        
-        union_stmt = stmt_acc.union(stmt_user_acc)
-        result = await db.execute(union_stmt)
-        user_accesses = set(result.scalars().all())
+        now = time.time()
+        cached = _USER_ACCESS_CACHE.get(current_user.id)
+        if cached and (now - cached[0]) < _ACCESS_CACHE_TTL_SECONDS:
+            user_accesses = cached[1]
+        else:
+            stmt_acc = (
+                select(Access.name)
+                .join(RoleAccess, RoleAccess.access_id == Access.id)
+                .join(UserRole, UserRole.role_id == RoleAccess.role_id)
+                .where(UserRole.user_id == current_user.id)
+            )
+            
+            stmt_user_acc = (
+                select(Access.name)
+                .join(UserAccess, UserAccess.access_id == Access.id)
+                .where(UserAccess.user_id == current_user.id)
+            )
+            
+            union_stmt = stmt_acc.union(stmt_user_acc)
+            result = await db.execute(union_stmt)
+            user_accesses = set(result.scalars().all())
+            _USER_ACCESS_CACHE[current_user.id] = (now, user_accesses)
         
         # Check if user has at least one of the required accesses
         if not any(req in user_accesses for req in self.required_accesses):
@@ -190,3 +210,4 @@ class RequireAccess:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Required access: {req_str}")
             
         return current_user
+

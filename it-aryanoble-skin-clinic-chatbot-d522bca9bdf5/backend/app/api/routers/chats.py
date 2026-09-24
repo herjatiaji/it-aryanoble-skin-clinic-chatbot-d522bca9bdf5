@@ -102,7 +102,8 @@ async def process_ai_response(session_id: uuid.UUID, user_query: str):
                 bm25_index.load(rag_settings.bm25_index_path)
             except Exception:
                 pass
-            reranker = Reranker(model_name=rag_settings.reranker_model_name)
+            enable_reranker = os.getenv("ENABLE_RERANKER", "false").lower() in ("true", "1", "yes")
+            reranker = AdapterFactory.get_reranker() if enable_reranker else None
             retriever = HybridRetriever(vector_store=vector_store, bm25_index=bm25_index, reranker=reranker)
             llm_adapter = await AdapterFactory.get_dynamic_llm(db)
             pipeline = GenerationPipeline(retriever=retriever, llm_adapter=llm_adapter)
@@ -220,91 +221,111 @@ def clean_and_shorten_session_title(text: Optional[str], max_len: int = 70) -> s
     return clean_heuristic_title(text, max_len=max_len)
 
 async def _hydrate_chat_session(session: ChatSession, db: AsyncSession) -> dict:
-    session_dict = {
-        "id": session.id,
-        "user_id": session.user_id,
-        "branch_id": session.branch_id,
-        "session_type": session.session_type,
-        "status": session.status,
-        "summary": session.summary,
-        "rating": session.rating,
-        "feedback": session.feedback,
-        "has_data_issue": session.has_data_issue,
-        "is_feedback_read": session.is_feedback_read,
-        "allow_file_attachments": await _is_file_attachments_allowed(db),
-        "created_at": session.created_at,
-        "updated_at": session.updated_at,
-        "query": "",
-        "messages": 0,
-        "doctor": "Unknown",
-        "user_name": "Unknown",
-        "user_type": None,
-        "branch": "General Prompt" if not session.branch_id else "Unknown Branch"
-    }
-    
-    # Get total message count
-    stmt_count = select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session.id)
-    result_count = await db.execute(stmt_count)
-    session_dict["messages"] = result_count.scalar() or 0
-    
-    # 1. If LLM-generated title/summary already exists, use it directly (like Gemini/ChatGPT)
-    if session.summary and session.summary.strip():
-        session_dict["query"] = sanitize_llm_title(session.summary)
-    else:
-        # Prioritize the first USER message as the fallback
-        stmt_first_user = (
-            select(ChatMessage.content)
-            .where(ChatMessage.session_id == session.id, ChatMessage.role == ChatRole.USER)
-            .order_by(ChatMessage.created_at.asc())
-            .limit(1)
+    hydrated = await _hydrate_chat_sessions_batch([session], db)
+    return hydrated[0] if hydrated else {}
+
+async def _hydrate_chat_sessions_batch(sessions: List[ChatSession], db: AsyncSession) -> List[dict]:
+
+    if not sessions:
+        return []
+        
+    allow_attachments = await _is_file_attachments_allowed(db)
+    session_ids = [s.id for s in sessions]
+    user_ids = list({s.user_id for s in sessions if s.user_id})
+    branch_ids = list({s.branch_id for s in sessions if s.branch_id})
+
+    # Batch fetch Users
+    user_map = {}
+    if user_ids:
+        user_stmt = select(User.id, User.name, User.dr_type, User.type).where(User.id.in_(user_ids))
+        u_res = await db.execute(user_stmt)
+        for uid, uname, dr_type, utype in u_res.all():
+            user_map[uid] = {
+                "name": uname or "Unknown",
+                "dr_type": dr_type,
+                "user_type": utype.value if hasattr(utype, 'value') else str(utype)
+            }
+
+    # Batch fetch Branches
+    branch_map = {}
+    if branch_ids:
+        b_stmt = select(Branch.id, Branch.name).where(Branch.id.in_(branch_ids))
+        b_res = await db.execute(b_stmt)
+        for bid, bname in b_res.all():
+            branch_map[bid] = bname or "Unknown Branch"
+
+    # Batch fetch Message Counts
+    count_map = {}
+    cnt_stmt = (
+        select(ChatMessage.session_id, func.count(ChatMessage.id))
+        .where(ChatMessage.session_id.in_(session_ids))
+        .group_by(ChatMessage.session_id)
+    )
+    cnt_res = await db.execute(cnt_stmt)
+    for sid, count in cnt_res.all():
+        count_map[sid] = count
+
+    # Batch fetch First Messages for sessions lacking summaries
+    missing_summary_sids = [s.id for s in sessions if not (s.summary and s.summary.strip())]
+    first_msg_map = {}
+    if missing_summary_sids:
+        msg_stmt = (
+            select(ChatMessage.session_id, ChatMessage.content, ChatMessage.role)
+            .where(ChatMessage.session_id.in_(missing_summary_sids))
+            .order_by(ChatMessage.session_id, ChatMessage.created_at.asc())
         )
-        res_user_msg = await db.execute(stmt_first_user)
-        raw_query = res_user_msg.scalar_one_or_none()
+        msg_res = await db.execute(msg_stmt)
+        for sid, content, role in msg_res.all():
+            if sid not in first_msg_map:
+                first_msg_map[sid] = content
+            elif role == ChatRole.USER and first_msg_map.get(f"{sid}_role") != ChatRole.USER:
+                first_msg_map[sid] = content
+                first_msg_map[f"{sid}_role"] = ChatRole.USER
 
-        # Fallback to the very first message if no user message found
-        if not raw_query:
-            stmt_first_msg = (
-                select(ChatMessage.content)
-                .where(ChatMessage.session_id == session.id)
-                .order_by(ChatMessage.created_at.asc())
-                .limit(1)
-            )
-            res_any_msg = await db.execute(stmt_first_msg)
-            raw_query = res_any_msg.scalar_one_or_none()
-
-        if raw_query:
-            session_dict["query"] = clean_heuristic_title(raw_query)
-            # Asynchronously schedule LLM title generation so future fetches use persistent LLM title
-            import asyncio
-            asyncio.create_task(generate_and_save_chat_title(session.id, raw_query))
+    hydrated = []
+    for session in sessions:
+        u_info = user_map.get(session.user_id, {"name": "Unknown", "dr_type": None, "user_type": None})
+        b_name = branch_map.get(session.branch_id, "General Assistant" if not session.branch_id else "Unknown Branch")
+        
+        if session.summary and session.summary.strip():
+            query_title = sanitize_llm_title(session.summary)
         else:
-            session_dict["query"] = "Percakapan Baru"
-    
-    # Get the user's name, user_type, and doctor type
-    stmt_user = select(User.name, User.dr_type, User.type).where(User.id == session.user_id)
-    result_user = await db.execute(stmt_user)
-    user_row = result_user.first()
-    if user_row:
-        user_name = user_row[0] or "Unknown"
-        session_dict["doctor"] = user_name
-        session_dict["user_name"] = user_name
-        session_dict["doctor_type"] = user_row[1]
-        session_dict["user_type"] = user_row[2].value if hasattr(user_row[2], 'value') else str(user_row[2])
-    else:
-        session_dict["doctor"] = "Unknown"
-        session_dict["user_name"] = "Unknown"
-        session_dict["doctor_type"] = None
-        session_dict["user_type"] = None
-    
-    # Get the branch name
-    if session.branch_id:
-        stmt_branch = select(Branch.name).where(Branch.id == session.branch_id)
-        result_branch = await db.execute(stmt_branch)
-        session_dict["branch"] = result_branch.scalar() or "Unknown Branch"
-    else:
-        session_dict["branch"] = "General Assistant"
-    
-    return session_dict
+            raw_query = first_msg_map.get(session.id)
+            if raw_query:
+                query_title = clean_heuristic_title(raw_query)
+            else:
+                query_title = "Percakapan Baru"
+
+        session_dict = {
+            "id": session.id,
+            "session_id": session.id,
+            "user_id": session.user_id,
+            "branch_id": session.branch_id,
+            "session_type": session.session_type,
+            "status": session.status,
+            "summary": session.summary,
+            "rating": session.rating,
+            "feedback": session.feedback,
+            "has_data_issue": session.has_data_issue,
+            "is_feedback_read": session.is_feedback_read,
+            "allow_file_attachments": allow_attachments,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "query": query_title,
+            "messages": count_map.get(session.id, 0),
+            "doctor": u_info["name"],
+            "user_name": u_info["name"],
+            "doctor_type": u_info["dr_type"],
+            "user_type": u_info["user_type"],
+            "branch": b_name
+        }
+        hydrated.append(session_dict)
+
+    return hydrated
+
+async def _hydrate_chat_session(session: ChatSession, db: AsyncSession) -> dict:
+    hydrated_list = await _hydrate_chat_sessions_batch([session], db)
+    return hydrated_list[0] if hydrated_list else {}
 
 from app.schemas.pagination import PaginatedResponse
 from typing import List, Optional, Union
@@ -338,7 +359,7 @@ async def list_chat_feedbacks(
         paginated_stmt = stmt.offset((page - 1) * p_size).limit(p_size)
         result = await db.execute(paginated_stmt)
         sessions = result.scalars().all()
-        hydrated = [await _hydrate_chat_session(s, db) for s in sessions]
+        hydrated = await _hydrate_chat_sessions_batch(list(sessions), db)
 
         return PaginatedResponse[ChatHistoryResponse](
             items=hydrated,
@@ -350,8 +371,7 @@ async def list_chat_feedbacks(
     
     result = await db.execute(stmt)
     sessions = result.scalars().all()
-    
-    return [await _hydrate_chat_session(s, db) for s in sessions]
+    return await _hydrate_chat_sessions_batch(list(sessions), db)
 
 from pydantic import BaseModel
 class MarkFeedbackReadRequest(BaseModel):
@@ -444,39 +464,53 @@ async def list_chat_sessions(
     elif doctor_id:
         stmt = stmt.where(ChatSession.user_id == doctor_id)
 
-    result = await db.execute(stmt)
-    sessions = result.scalars().all()
-
-    hydrated = [await _hydrate_chat_session(s, db) for s in sessions]
-
     if search:
-        s_clean = search.lower().strip()
-        hydrated = [
-            h for h in hydrated
-            if s_clean in (h.get("query") or "").lower()
-            or s_clean in (h.get("summary") or "").lower()
-            or s_clean in (h.get("doctor") or "").lower()
-            or s_clean in (h.get("user_name") or "").lower()
-            or s_clean in (h.get("branch") or "").lower()
-            or s_clean in (h.get("session_type") or "").lower()
-        ]
+        s_pattern = f"%{search.strip()}%"
+        matching_msg_session_ids = (
+            select(ChatMessage.session_id)
+            .where(ChatMessage.content.ilike(s_pattern))
+            .distinct()
+            .subquery()
+        )
+        stmt = (
+            stmt.outerjoin(User, ChatSession.user_id == User.id)
+            .outerjoin(Branch, ChatSession.branch_id == Branch.id)
+            .where(
+                or_(
+                    ChatSession.summary.ilike(s_pattern),
+                    User.name.ilike(s_pattern),
+                    Branch.name.ilike(s_pattern),
+                    ChatSession.session_type.ilike(s_pattern),
+                    ChatSession.id.in_(select(matching_msg_session_ids.c.session_id))
+                )
+            )
+        )
 
     if page is not None:
         p_size = page_size or 10
-        total = len(hydrated)
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        count_res = await db.execute(count_stmt)
+        total = count_res.scalar() or 0
         total_pages = max(1, math.ceil(total / p_size))
-        start_idx = (page - 1) * p_size
-        items = hydrated[start_idx : start_idx + p_size]
+
+        paginated_stmt = stmt.offset((page - 1) * p_size).limit(p_size)
+        result = await db.execute(paginated_stmt)
+        sessions = result.scalars().all()
+        hydrated = await _hydrate_chat_sessions_batch(list(sessions), db)
 
         return PaginatedResponse[ChatHistoryResponse](
-            items=items,
+            items=hydrated,
             total=total,
             page=page,
             page_size=p_size,
             total_pages=total_pages
         )
 
-    return hydrated
+    result = await db.execute(stmt)
+    sessions = result.scalars().all()
+    return await _hydrate_chat_sessions_batch(list(sessions), db)
+
+
 
 @router.post("/", response_model=ChatSessionResponse, status_code=status.HTTP_201_CREATED)
 async def create_chat_session(
@@ -655,21 +689,7 @@ async def list_chat_messages(
 
 from fastapi import Form, UploadFile, File
 import json
-
-ALLOWED_MIME_TYPES = {
-    "application/pdf",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.ms-excel",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.ms-powerpoint",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "text/plain",
-    "text/csv",
-    "image/jpeg",
-    "image/png",
-    "image/webp"
-}
+from app.api.routers.knowledge import is_allowed_file_type, ALLOWED_MIME_TYPES
 
 @router.post("/{session_id}/messages", status_code=status.HTTP_201_CREATED)
 async def create_chat_message(
@@ -729,7 +749,7 @@ async def create_chat_message(
         from app.rag.services.attachment_parser import AttachmentParser
         parser = AttachmentParser()
         for file in files:
-            if file.content_type not in ALLOWED_MIME_TYPES:
+            if not is_allowed_file_type(file.content_type, file.filename):
                 raise HTTPException(status_code=400, detail=f"File type {file.content_type} not allowed for file {file.filename}")
             try:
                 extracted_text, meta = await parser.extract_from_upload(file)
@@ -777,109 +797,109 @@ async def create_chat_message(
     if extracted_attachment_texts:
         effective_query = f"{content}\n\n" + "\n\n".join(extracted_attachment_texts)
 
-    # For user message, we stream the AI response back via SSE
+    # Fetch recent history upfront using index (last 20 messages for prompt context)
+    stmt_msg = select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.desc()).limit(20)
+    result_msg = await db.execute(stmt_msg)
+    messages = list(reversed(result_msg.scalars().all()))
+    history = [{"role": msg.role.value.lower(), "content": msg.content} for msg in messages if msg.role.value in ["USER", "ASSISTANT"]]
+    if history and history[-1]["role"] == "user":
+        history.pop()
+
+
+    # Pre-initialize RAG components with the active DB session
+    from app.rag.services.factory import AdapterFactory
+    from app.rag.services.rag_retriever import HybridRetriever
+    from app.rag.services.rag_generator import GenerationPipeline
+
+    vector_store = AdapterFactory.get_vector_store()
+    bm25_index = AdapterFactory.get_bm25_index()
+    enable_reranker = os.getenv("ENABLE_RERANKER", "false").lower() in ("true", "1", "yes")
+    reranker = AdapterFactory.get_reranker() if enable_reranker else None
+    retriever = HybridRetriever(vector_store=vector_store, bm25_index=bm25_index, reranker=reranker)
+    llm_adapter = await AdapterFactory.get_dynamic_llm(db)
+    pipeline = GenerationPipeline(retriever=retriever, llm_adapter=llm_adapter)
+    branch_id_val = chat_session.branch_id
+    user_id_val = current_user.id
+    user_name_val = current_user.name
+
+    # For user message, we stream the AI response back via SSE without holding the DB connection
     async def sse_generator():
         try:
-            from app.rag.services.factory import AdapterFactory
-            from app.rag.services.rag_retriever import HybridRetriever, BM25Index, Reranker
-            from app.rag.services.rag_generator import GenerationPipeline
-            from app.rag.config import settings as rag_settings
-        except ImportError as e:
-            logger.error(f"AI dependencies missing: {e}")
-            yield f"data: {json.dumps({'error': 'AI configuration error'})}\n\n"
-            return
+            ai_response_text = ""
+            context_chunks = []
+            
+            # Immediately yield keep-alive comment so reverse proxy/client connection never times out
+            yield ": keep-alive\n\n"
 
-        async with AsyncSessionLocal() as session:
-            try:
-                vector_store = AdapterFactory.get_vector_store()
-                bm25_index = AdapterFactory.get_bm25_index()
-                reranker = AdapterFactory.get_reranker()
-                retriever = HybridRetriever(vector_store=vector_store, bm25_index=bm25_index, reranker=reranker)
-                llm_adapter = await AdapterFactory.get_dynamic_llm(session)
-                pipeline = GenerationPipeline(retriever=retriever, llm_adapter=llm_adapter)
-                
-                stmt_msg = select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc())
-                result_msg = await session.execute(stmt_msg)
-                messages = result_msg.scalars().all()
-                
-                history = [{"role": msg.role.value.lower(), "content": msg.content} for msg in messages if msg.role.value in ["USER", "ASSISTANT"]]
-                if history and history[-1]["role"] == "user":
-                    history.pop()
+            token_queue = asyncio.Queue()
+            generator_done = asyncio.Event()
 
-                ai_response_text = ""
-                context_chunks = []
-                
-                # Immediately yield keep-alive comment so reverse proxy/client connection never times out
-                yield ": keep-alive\n\n"
-
-                token_queue = asyncio.Queue()
-                generator_done = asyncio.Event()
-
-                async def keep_alive_task():
-                    while not generator_done.is_set():
-                        try:
-                            await asyncio.wait_for(generator_done.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            if not generator_done.is_set():
-                                await token_queue.put(("keep_alive", None))
-
-                async def stream_producer():
+            async def keep_alive_task():
+                while not generator_done.is_set():
                     try:
-                        async for chunk in pipeline.generate_answer_stream(
-                            query=effective_query,
-                            top_k=8,
-                            rerank=True,
-                            history=history,
-                            filter_metadata=doctor_filter or None,
-                            doctor_name=current_user.name
-                        ):
-                            await token_queue.put(("chunk", chunk))
-                    except Exception as prod_err:
-                        await token_queue.put(("error", prod_err))
-                    finally:
-                        generator_done.set()
-                        await token_queue.put(("done", None))
+                        await asyncio.wait_for(generator_done.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        if not generator_done.is_set():
+                            await token_queue.put(("keep_alive", None))
 
-                producer_task = asyncio.create_task(stream_producer())
-                pinger_task = asyncio.create_task(keep_alive_task())
-
+            async def stream_producer():
                 try:
-                    while True:
-                        msg_type, data = await token_queue.get()
-                        if msg_type == "keep_alive":
-                            if await request.is_disconnected():
-                                logger.info(f"Client disconnected during keep-alive for session {session_id}")
-                                break
-                            yield ": keep-alive\n\n"
-                        elif msg_type == "chunk":
-                            if await request.is_disconnected():
-                                logger.info(f"Client disconnected from chat session {session_id}")
-                                break
-                            chunk = data
-                            if chunk.startswith('{"type": "context"'):
-                                yield f"data: {chunk}\n\n"
-                                try:
-                                    ctx_json = json.loads(chunk)
-                                    context_chunks = [c.get("content", "") for c in ctx_json.get("chunks", [])]
-                                except Exception:
-                                    pass
-                            else:
-                                ai_response_text += chunk
-                                payload = json.dumps({"type": "token", "content": chunk})
-                                yield f"data: {payload}\n\n"
-                        elif msg_type == "error":
-                            raise data
-                        elif msg_type == "done":
-                            break
+                    async for chunk in pipeline.generate_answer_stream(
+                        query=effective_query,
+                        top_k=8,
+                        rerank=True,
+                        history=history,
+                        filter_metadata=doctor_filter or None,
+                        doctor_name=user_name_val
+                    ):
+                        await token_queue.put(("chunk", chunk))
+                except Exception as prod_err:
+                    await token_queue.put(("error", prod_err))
                 finally:
                     generator_done.set()
-                    producer_task.cancel()
-                    pinger_task.cancel()
-                
-                # Signal end of stream
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                
-                # Save the final AI message to the DB and update session activity
+                    await token_queue.put(("done", None))
+
+            producer_task = asyncio.create_task(stream_producer())
+            pinger_task = asyncio.create_task(keep_alive_task())
+
+            try:
+                while True:
+                    msg_type, data = await token_queue.get()
+                    if msg_type == "keep_alive":
+                        if await request.is_disconnected():
+                            logger.info(f"Client disconnected during keep-alive for session {session_id}")
+                            break
+                        yield ": keep-alive\n\n"
+                    elif msg_type == "chunk":
+                        if await request.is_disconnected():
+                            logger.info(f"Client disconnected from chat session {session_id}")
+                            break
+                        chunk = data
+                        if chunk.startswith('{"type": "context"'):
+                            yield f"data: {chunk}\n\n"
+                            try:
+                                ctx_json = json.loads(chunk)
+                                context_chunks = [c.get("content", "") for c in ctx_json.get("chunks", [])]
+                            except Exception:
+                                pass
+                        else:
+                            ai_response_text += chunk
+                            payload = json.dumps({"type": "token", "content": chunk})
+                            yield f"data: {payload}\n\n"
+                    elif msg_type == "error":
+                        raise data
+                    elif msg_type == "done":
+                        break
+            finally:
+                generator_done.set()
+                producer_task.cancel()
+                pinger_task.cancel()
+            
+            # Signal end of stream
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+            # Persist the final AI response to DB in a dedicated short-lived session (<5ms)
+            async with AsyncSessionLocal() as session:
                 ai_msg = ChatMessage(
                     session_id=session_id,
                     role="ASSISTANT",
@@ -900,8 +920,8 @@ async def create_chat_message(
                 from app.services.token_service import record_knowledge_not_found_event
                 await record_chat_token_usage(
                     db=session,
-                    user_id=current_user.id,
-                    branch_id=chat_session.branch_id,
+                    user_id=user_id_val,
+                    branch_id=branch_id_val,
                     input_tokens=in_tokens,
                     output_tokens=out_tokens
                 )
@@ -914,23 +934,32 @@ async def create_chat_message(
                 if is_no_context or is_missing_kw:
                     await record_knowledge_not_found_event(
                         db=session,
-                        user_id=current_user.id,
-                        branch_id=chat_session.branch_id,
+                        user_id=user_id_val,
+                        branch_id=branch_id_val,
                         user_query=content
                     )
+                await session.commit()
 
-                
-            except Exception as e:
-                logger.error(f"Error streaming AI response: {e}")
-                fallback = "Maaf, terjadi kesalahan pada pemrosesan AI."
-                yield f"data: {json.dumps({'type': 'token', 'content': fallback})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                
+        except Exception as e:
+            logger.error(f"Error streaming AI response: {e}")
+            fallback = "Maaf, terjadi kesalahan pada pemrosesan AI."
+            yield f"data: {json.dumps({'type': 'token', 'content': fallback})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+            async with AsyncSessionLocal() as session:
                 ai_msg = ChatMessage(session_id=session_id, role="ASSISTANT", content=fallback)
                 session.add(ai_msg)
                 await session.commit()
                 
-    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive"
+        }
+    )
 
 @router.post("/{session_id}/messages/stream")
 async def stream_chat_message(
@@ -997,7 +1026,7 @@ async def stream_chat_message(
         from app.rag.services.attachment_parser import AttachmentParser
         parser = AttachmentParser()
         for file in files:
-            if file.content_type not in ALLOWED_MIME_TYPES:
+            if not is_allowed_file_type(file.content_type, file.filename):
                 raise HTTPException(status_code=400, detail=f"File type {file.content_type} not allowed for file {file.filename}")
             try:
                 extracted_text, meta = await parser.extract_from_upload(file)
@@ -1044,108 +1073,109 @@ async def stream_chat_message(
     if extracted_attachment_texts:
         effective_query = f"{content}\n\n" + "\n\n".join(extracted_attachment_texts)
 
+    # Fetch recent history upfront using index (last 20 messages for prompt context)
+    stmt_msg = select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.desc()).limit(20)
+    result_msg = await db.execute(stmt_msg)
+    messages = list(reversed(result_msg.scalars().all()))
+    history = [{"role": msg.role.value.lower(), "content": msg.content} for msg in messages if msg.role.value in ["USER", "ASSISTANT"]]
+    if history and history[-1]["role"] == "user":
+        history.pop()
+
+
+    # Pre-initialize RAG components with the active DB session
+    from app.rag.services.factory import AdapterFactory
+    from app.rag.services.rag_retriever import HybridRetriever
+    from app.rag.services.rag_generator import GenerationPipeline
+
+    vector_store = AdapterFactory.get_vector_store()
+    bm25_index = AdapterFactory.get_bm25_index()
+    enable_reranker = os.getenv("ENABLE_RERANKER", "false").lower() in ("true", "1", "yes")
+    reranker = AdapterFactory.get_reranker() if enable_reranker else None
+    retriever = HybridRetriever(vector_store=vector_store, bm25_index=bm25_index, reranker=reranker)
+    llm_adapter = await AdapterFactory.get_dynamic_llm(db)
+    pipeline = GenerationPipeline(retriever=retriever, llm_adapter=llm_adapter)
+    branch_id_val = chat_session.branch_id
+    user_id_val = current_user.id
+    user_name_val = current_user.name
+    existing_summary = chat_session.summary
+
     async def sse_generator():
         try:
-            from app.rag.services.factory import AdapterFactory
-            from app.rag.services.rag_retriever import HybridRetriever, BM25Index, Reranker
-            from app.rag.services.rag_generator import GenerationPipeline
-            from app.rag.config import settings as rag_settings
-        except ImportError as e:
-            logger.error(f"AI dependencies missing: {e}")
-            yield f"data: {json.dumps({'error': 'AI configuration error'})}\n\n"
-            return
+            ai_response_text = ""
+            context_chunks = []
+            
+            # Immediately yield keep-alive comment so reverse proxy/client connection never times out
+            yield ": keep-alive\n\n"
 
-        async with AsyncSessionLocal() as session:
-            try:
-                vector_store = AdapterFactory.get_vector_store()
-                bm25_index = AdapterFactory.get_bm25_index()
-                reranker = AdapterFactory.get_reranker()
-                retriever = HybridRetriever(vector_store=vector_store, bm25_index=bm25_index, reranker=reranker)
-                llm_adapter = await AdapterFactory.get_dynamic_llm(session)
-                pipeline = GenerationPipeline(retriever=retriever, llm_adapter=llm_adapter)
-                
-                stmt_msg = select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc())
-                result_msg = await session.execute(stmt_msg)
-                messages = result_msg.scalars().all()
-                
-                history = [{"role": msg.role.value.lower(), "content": msg.content} for msg in messages if msg.role.value in ["USER", "ASSISTANT"]]
-                if history and history[-1]["role"] == "user":
-                    history.pop()
+            token_queue = asyncio.Queue()
+            generator_done = asyncio.Event()
 
-                ai_response_text = ""
-                context_chunks = []
-                
-                # Immediately yield keep-alive comment so reverse proxy/client connection never times out
-                yield ": keep-alive\n\n"
-
-                token_queue = asyncio.Queue()
-                generator_done = asyncio.Event()
-
-                async def keep_alive_task():
-                    while not generator_done.is_set():
-                        try:
-                            await asyncio.wait_for(generator_done.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            if not generator_done.is_set():
-                                await token_queue.put(("keep_alive", None))
-
-                async def stream_producer():
+            async def keep_alive_task():
+                while not generator_done.is_set():
                     try:
-                        async for chunk in pipeline.generate_answer_stream(
-                            query=effective_query,
-                            top_k=5,
-                            rerank=True,
-                            history=history,
-                            filter_metadata=doctor_filter or None,
-                            doctor_name=current_user.name
-                        ):
-                            await token_queue.put(("chunk", chunk))
-                    except Exception as prod_err:
-                        await token_queue.put(("error", prod_err))
-                    finally:
-                        generator_done.set()
-                        await token_queue.put(("done", None))
+                        await asyncio.wait_for(generator_done.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        if not generator_done.is_set():
+                            await token_queue.put(("keep_alive", None))
 
-                producer_task = asyncio.create_task(stream_producer())
-                pinger_task = asyncio.create_task(keep_alive_task())
-
+            async def stream_producer():
                 try:
-                    while True:
-                        msg_type, data = await token_queue.get()
-                        if msg_type == "keep_alive":
-                            if await request.is_disconnected():
-                                logger.info(f"Client disconnected during keep-alive for session {session_id}")
-                                break
-                            yield ": keep-alive\n\n"
-                        elif msg_type == "chunk":
-                            if await request.is_disconnected():
-                                logger.info(f"Client disconnected from chat session {session_id}")
-                                break
-                            chunk = data
-                            if chunk.startswith('{"type": "context"'):
-                                yield f"data: {chunk}\n\n"
-                                try:
-                                    ctx_json = json.loads(chunk)
-                                    context_chunks = [c.get("content", "") for c in ctx_json.get("chunks", [])]
-                                except Exception:
-                                    pass
-                            else:
-                                ai_response_text += chunk
-                                payload = json.dumps({"type": "token", "content": chunk})
-                                yield f"data: {payload}\n\n"
-                        elif msg_type == "error":
-                            raise data
-                        elif msg_type == "done":
-                            break
+                    async for chunk in pipeline.generate_answer_stream(
+                        query=effective_query,
+                        top_k=5,
+                        rerank=True,
+                        history=history,
+                        filter_metadata=doctor_filter or None,
+                        doctor_name=user_name_val
+                    ):
+                        await token_queue.put(("chunk", chunk))
+                except Exception as prod_err:
+                    await token_queue.put(("error", prod_err))
                 finally:
                     generator_done.set()
-                    producer_task.cancel()
-                    pinger_task.cancel()
-                
-                # Signal end of stream
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                
-                # Save the final AI message to the DB and update session activity
+                    await token_queue.put(("done", None))
+
+            producer_task = asyncio.create_task(stream_producer())
+            pinger_task = asyncio.create_task(keep_alive_task())
+
+            try:
+                while True:
+                    msg_type, data = await token_queue.get()
+                    if msg_type == "keep_alive":
+                        if await request.is_disconnected():
+                            logger.info(f"Client disconnected during keep-alive for session {session_id}")
+                            break
+                        yield ": keep-alive\n\n"
+                    elif msg_type == "chunk":
+                        if await request.is_disconnected():
+                            logger.info(f"Client disconnected from chat session {session_id}")
+                            break
+                        chunk = data
+                        if chunk.startswith('{"type": "context"'):
+                            yield f"data: {chunk}\n\n"
+                            try:
+                                ctx_json = json.loads(chunk)
+                                context_chunks = [c.get("content", "") for c in ctx_json.get("chunks", [])]
+                            except Exception:
+                                pass
+                        else:
+                            ai_response_text += chunk
+                            payload = json.dumps({"type": "token", "content": chunk})
+                            yield f"data: {payload}\n\n"
+                    elif msg_type == "error":
+                        raise data
+                    elif msg_type == "done":
+                        break
+            finally:
+                generator_done.set()
+                producer_task.cancel()
+                pinger_task.cancel()
+            
+            # Signal end of stream
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+            # Persist the final AI response to DB in a dedicated short-lived session (<5ms)
+            async with AsyncSessionLocal() as session:
                 ai_msg = ChatMessage(
                     session_id=session_id,
                     role="ASSISTANT",
@@ -1165,25 +1195,34 @@ async def stream_chat_message(
                 
                 await record_chat_token_usage(
                     db=session,
-                    user_id=current_user.id,
-                    branch_id=chat_session.branch_id,
+                    user_id=user_id_val,
+                    branch_id=branch_id_val,
                     input_tokens=in_tokens,
                     output_tokens=out_tokens
                 )
 
                 # Trigger ChatGPT/Gemini-style title generation in background if title not yet generated
-                if not chat_session.summary or chat_session.summary == "Percakapan Baru":
+                if not existing_summary or existing_summary == "Percakapan Baru":
                     from app.services.chat_title_service import generate_and_save_chat_title
                     asyncio.create_task(generate_and_save_chat_title(session_id, content, ai_response_text))
+                await session.commit()
                 
-            except Exception as e:
-                logger.error(f"Error streaming AI response: {e}")
-                fallback = "Maaf, terjadi kesalahan pada pemrosesan AI."
-                yield f"data: {json.dumps({'type': 'token', 'content': fallback})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                
+        except Exception as e:
+            logger.error(f"Error streaming AI response: {e}")
+            fallback = "Maaf, terjadi kesalahan pada pemrosesan AI."
+            yield f"data: {json.dumps({'type': 'token', 'content': fallback})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+            async with AsyncSessionLocal() as session:
                 ai_msg = ChatMessage(session_id=session_id, role="ASSISTANT", content=fallback)
                 session.add(ai_msg)
                 await session.commit()
                 
-    return EventSourceResponse(sse_generator())
+    return EventSourceResponse(
+        sse_generator(),
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive"
+        }
+    )

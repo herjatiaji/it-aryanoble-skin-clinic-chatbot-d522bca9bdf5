@@ -5,43 +5,74 @@ from typing import List
 import uuid
 
 from app.core.database import get_db
-from app.api.dependencies import get_current_user, RequireAccess
+from app.api.dependencies import get_current_user, RequireAccess, invalidate_user_access_cache
 from app.models.user import User, Role, Access, RoleAccess, UserRole
 from app.schemas.role import RoleResponse, RoleCreate, RoleUpdate, AccessResponse
+from app.schemas.pagination import PaginatedResponse
+from collections import defaultdict
+from typing import List, Optional, Union
+from fastapi import Query
+import math
 
 router = APIRouter(tags=["Roles"])
 
-async def _hydrate_role(role: Role, db: AsyncSession) -> RoleResponse:
-    # Fetch accesses for this role
-    if role.name.upper() == "ADMIN":
+async def _hydrate_roles_batch(roles: List[Role], db: AsyncSession) -> List[RoleResponse]:
+    if not roles:
+        return []
+
+    role_ids = [r.id for r in roles]
+    has_admin = any(r.name.upper() == "ADMIN" for r in roles)
+
+    # 1. Fetch all accesses if ADMIN role is present
+    all_access_names: List[str] = []
+    if has_admin:
         stmt_all = select(Access.name)
         acc_res = await db.execute(stmt_all)
-        accesses = list(acc_res.scalars().all())
-    else:
-        stmt_acc = (
-            select(Access.name)
-            .join(RoleAccess, RoleAccess.access_id == Access.id)
-            .where(RoleAccess.role_id == role.id)
-        )
-        acc_res = await db.execute(stmt_acc)
-        accesses = list(acc_res.scalars().all())
+        all_access_names = list(acc_res.scalars().all())
 
-    # Fetch assigned user count
+    # 2. Batch fetch role accesses
+    role_access_map: dict[uuid.UUID, list[str]] = defaultdict(list)
+    stmt_acc = (
+        select(RoleAccess.role_id, Access.name)
+        .join(Access, RoleAccess.access_id == Access.id)
+        .where(RoleAccess.role_id.in_(role_ids))
+    )
+    for r_id, acc_name in (await db.execute(stmt_acc)).all():
+        role_access_map[r_id].append(acc_name)
+
+    # 3. Batch fetch user counts
+    user_count_map: dict[uuid.UUID, int] = defaultdict(int)
     stmt_users = (
-        select(func.count(UserRole.user_id))
-        .where(UserRole.role_id == role.id)
+        select(UserRole.role_id, func.count(UserRole.user_id))
+        .where(UserRole.role_id.in_(role_ids))
+        .group_by(UserRole.role_id)
     )
-    count_res = await db.execute(stmt_users)
-    user_count = count_res.scalar() or 0
+    for r_id, count in (await db.execute(stmt_users)).all():
+        user_count_map[r_id] = count or 0
 
-    return RoleResponse(
-        id=role.id,
-        name=role.name,
-        accesses=accesses,
-        user_count=user_count,
-        created_at=role.created_at,
-        updated_at=role.updated_at
-    )
+    # 4. Construct responses
+    responses: List[RoleResponse] = []
+    for role in roles:
+        if role.name.upper() == "ADMIN":
+            accesses = all_access_names
+        else:
+            accesses = role_access_map.get(role.id, [])
+
+        responses.append(
+            RoleResponse(
+                id=role.id,
+                name=role.name,
+                accesses=accesses,
+                user_count=user_count_map.get(role.id, 0),
+                created_at=role.created_at,
+                updated_at=role.updated_at
+            )
+        )
+    return responses
+
+async def _hydrate_role(role: Role, db: AsyncSession) -> RoleResponse:
+    hydrated = await _hydrate_roles_batch([role], db)
+    return hydrated[0]
 
 @router.get("/accesses", response_model=List[AccessResponse])
 async def list_available_accesses(
@@ -51,11 +82,6 @@ async def list_available_accesses(
     stmt = select(Access).order_by(Access.name)
     result = await db.execute(stmt)
     return result.scalars().all()
-
-from app.schemas.pagination import PaginatedResponse
-from typing import List, Optional, Union
-from fastapi import Query
-import math
 
 @router.get("/", response_model=Union[PaginatedResponse[RoleResponse], List[RoleResponse]])
 async def list_roles(
@@ -79,8 +105,8 @@ async def list_roles(
 
         paginated_stmt = stmt.offset((page - 1) * p_size).limit(p_size)
         result = await db.execute(paginated_stmt)
-        roles = result.scalars().all()
-        hydrated = [await _hydrate_role(role, db) for role in roles]
+        roles = list(result.scalars().all())
+        hydrated = await _hydrate_roles_batch(roles, db)
 
         return PaginatedResponse[RoleResponse](
             items=hydrated,
@@ -91,8 +117,8 @@ async def list_roles(
         )
 
     result = await db.execute(stmt)
-    roles = result.scalars().all()
-    return [await _hydrate_role(role, db) for role in roles]
+    roles = list(result.scalars().all())
+    return await _hydrate_roles_batch(roles, db)
 
 @router.get("/{role_id}", response_model=RoleResponse)
 async def get_role(
@@ -138,6 +164,7 @@ async def create_role(
 
     await db.commit()
     await db.refresh(role)
+    invalidate_user_access_cache()
     return await _hydrate_role(role, db)
 
 @router.put("/{role_id}", response_model=RoleResponse)
@@ -177,6 +204,7 @@ async def update_role(
 
     await db.commit()
     await db.refresh(role)
+    invalidate_user_access_cache()
     return await _hydrate_role(role, db)
 
 @router.delete("/{role_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -197,3 +225,4 @@ async def delete_role(
     await db.execute(delete(UserRole).where(UserRole.role_id == role_id))
     await db.delete(role)
     await db.commit()
+    invalidate_user_access_cache()

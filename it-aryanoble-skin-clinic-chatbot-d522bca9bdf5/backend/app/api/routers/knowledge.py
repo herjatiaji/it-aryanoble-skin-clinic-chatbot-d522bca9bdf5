@@ -602,28 +602,99 @@ async def list_knowledge(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(RequireAccess("knowledge:read"))
 ):
-    # 1. Fetch DB records
+    # 1. Build Base Query with SQL Filters
     stmt = select(Knowledge).where(Knowledge.deleted_at.is_(None))
-    if project_id:
+    if isinstance(project_id, uuid.UUID):
         stmt = stmt.where(Knowledge.project_id == project_id)
+    if isinstance(status, str) and status.upper() != "ALL":
+        try:
+            k_status = KnowledgeStatus[status.upper()]
+            stmt = stmt.where(Knowledge.status == k_status)
+        except KeyError:
+            pass
+    if isinstance(search, str) and search.strip():
+        s_clean = f"%{search.strip()}%"
+        stmt = stmt.where(
+            (Knowledge.title.ilike(s_clean)) |
+            (Knowledge.file_name.ilike(s_clean)) |
+            (Knowledge.ai_summary.ilike(s_clean))
+        )
     stmt = stmt.order_by(Knowledge.created_at.desc())
+
+    # 2. Paginated Path (Optimized SQL execution)
+    if isinstance(page, int):
+        p_size = page_size if isinstance(page_size, int) else 10
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        count_res = await db.execute(count_stmt)
+        total = count_res.scalar() or 0
+        total_pages = max(1, math.ceil(total / p_size))
+
+        paginated_stmt = stmt.offset((page - 1) * p_size).limit(p_size)
+        result = await db.execute(paginated_stmt)
+        db_items = list(result.scalars().all())
+
+        # Batch load uploader names for the current page only
+        user_ids = {item.uploaded_by for item in db_items if item.uploaded_by}
+        user_name_map = {}
+        if user_ids:
+            user_stmt = select(User.id, User.name).where(User.id.in_(user_ids))
+            user_res = await db.execute(user_stmt)
+            user_name_map = {row[0]: row[1] for row in user_res.all()}
+
+        # Active category sanitization
+        cat_stmt = select(Category.name).where(Category.deleted_at.is_(None))
+        cat_res = await db.execute(cat_stmt)
+        active_cat_set = {c.strip().lower(): c for c in cat_res.scalars().all() if c}
+
+        items_page = []
+        for item in db_items:
+            item_metadata = dict(item.metadata_) if isinstance(item.metadata_, dict) else {}
+            if "categories" in item_metadata and isinstance(item_metadata["categories"], list):
+                item_metadata["categories"] = [
+                    active_cat_set[str(c.get("name") if isinstance(c, dict) else c).strip().lower()]
+                    for c in item_metadata["categories"]
+                    if str(c.get("name") if isinstance(c, dict) else c).strip().lower() in active_cat_set
+                ]
+            if "suggested_categories" in item_metadata and isinstance(item_metadata["suggested_categories"], list):
+                item_metadata["suggested_categories"] = [
+                    active_cat_set[str(c.get("name") if isinstance(c, dict) else c).strip().lower()]
+                    for c in item_metadata["suggested_categories"]
+                    if str(c.get("name") if isinstance(c, dict) else c).strip().lower() in active_cat_set
+                ]
+
+            items_page.append(KnowledgeResponse(
+                id=item.id,
+                title=item.title,
+                content=item.content,
+                file_name=item.file_name,
+                original_path=item.original_path,
+                mime_type=item.mime_type,
+                file_size=item.file_size,
+                type=item.type,
+                status=item.status,
+                ai_summary=item.ai_summary,
+                ai_confidence=float(item.ai_confidence) * 100.0 if (item.ai_confidence is not None and 0 < float(item.ai_confidence) <= 1.0) else (float(item.ai_confidence) if item.ai_confidence is not None else None),
+                uploaded_by=item.uploaded_by,
+                uploaded_by_name=user_name_map.get(item.uploaded_by) or "Admin",
+                approved_by=item.approved_by,
+                approved_at=item.updated_at if item.status == KnowledgeStatus.APPROVED else None,
+                project_id=item.project_id,
+                metadata_=item_metadata,
+                created_at=item.created_at,
+                updated_at=item.updated_at
+            ))
+
+        return PaginatedResponse[KnowledgeResponse](
+            items=items_page,
+            total=total,
+            page=page,
+            page_size=p_size,
+            total_pages=total_pages
+        )
+
+    # 3. Unpaginated fallback
     result = await db.execute(stmt)
     db_items = list(result.scalars().all())
-
-    # 2. Out-of-band sync DB items with RAG staging files (data/pending or data/output)
-    del_proj_stmt = select(Project.id).where(Project.deleted_at.is_not(None))
-    del_proj_res = await db.execute(del_proj_stmt)
-    deleted_proj_ids = set(del_proj_res.scalars().all())
-
-    db_by_id = {str(item.id): item for item in db_items}
-    updated_db = False
-    db_responses: List[KnowledgeResponse] = []
-
-    for item in db_items:
-        if item.project_id and item.project_id in deleted_proj_ids:
-            item.project_id = None
-            updated_db = True
-
     user_ids = {item.uploaded_by for item in db_items if item.uploaded_by}
     user_name_map = {}
     if user_ids:
@@ -631,37 +702,20 @@ async def list_knowledge(
         user_res = await db.execute(user_stmt)
         user_name_map = {row[0]: row[1] for row in user_res.all()}
 
+    cat_stmt = select(Category.name).where(Category.deleted_at.is_(None))
+    cat_res = await db.execute(cat_stmt)
+    active_cat_set = {c.strip().lower(): c for c in cat_res.scalars().all() if c}
+
+    responses = []
     for item in db_items:
-        k_id_str = str(item.id)
-        if item.status == KnowledgeStatus.APPROVED:
-            target_file = resolve_approved_file(k_id_str)
-        else:
-            target_file = resolve_pending_file(k_id_str) or resolve_approved_file(k_id_str)
         item_metadata = dict(item.metadata_) if isinstance(item.metadata_, dict) else {}
-
-        if target_file and os.path.exists(target_file):
-            try:
-                with open(target_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    new_status = KnowledgeStatus.APPROVED if "output" in target_file else KnowledgeStatus.PENDING
-                    if item.status != new_status and item.status != KnowledgeStatus.APPROVED:
-                        item.status = new_status
-                        updated_db = True
-                    latest_summary = data.get("summary", "")
-                    if latest_summary and item.ai_summary != latest_summary:
-                        item.ai_summary = latest_summary
-                        updated_db = True
-                    latest_title = data.get("title", "")
-                    if latest_title and item.title != latest_title:
-                        item.title = latest_title
-                        updated_db = True
-                    item_metadata = {**item_metadata, **data}
-            except Exception as e:
-                pass
-
-        # Build KnowledgeResponse before any commit to prevent MissingGreenlet from expired attributes
-        db_responses.append(KnowledgeResponse(
+        if "categories" in item_metadata and isinstance(item_metadata["categories"], list):
+            item_metadata["categories"] = [
+                active_cat_set[str(c.get("name") if isinstance(c, dict) else c).strip().lower()]
+                for c in item_metadata["categories"]
+                if str(c.get("name") if isinstance(c, dict) else c).strip().lower() in active_cat_set
+            ]
+        responses.append(KnowledgeResponse(
             id=item.id,
             title=item.title,
             content=item.content,
@@ -683,148 +737,7 @@ async def list_knowledge(
             updated_at=item.updated_at
         ))
 
-    if updated_db:
-        try:
-            await db.commit()
-        except Exception:
-            pass
-
-    # 3. Fallback scan: Include any staged JSON files from data/pending or data/output missing in DB
-    now = datetime.now(timezone.utc)
-    
-    # Query soft-deleted IDs to prevent zombie resurrection (match strictly by unique UUID)
-    del_stmt = select(Knowledge.id).where(Knowledge.deleted_at.is_not(None))
-    del_res = await db.execute(del_stmt)
-    deleted_records = del_res.all()
-    deleted_ids = {str(row[0]).lower() for row in deleted_records}
-    
-    seen_ids = set(db_by_id.keys()).union(deleted_ids)
-    staged_responses = []
-
-    for folder in ["data/pending", "data/output"]:
-        if os.path.exists(folder):
-            for f in os.listdir(folder):
-                if f.endswith(".json") and f != "bm25_index.pkl":
-                    file_path = os.path.join(folder, f)
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as fp:
-                            data = json.load(fp)
-                        if isinstance(data, dict):
-                            raw_id = str(data.get("knowledge_id") or f.replace("_parsed.json", "").replace(".json", "")).lower()
-                            file_name = str(data.get("file_name", f))
-                            
-                            # Clean up and skip if this matches a soft-deleted UUID
-                            if raw_id in deleted_ids:
-                                try:
-                                    os.remove(file_path)
-                                    logger.info(f"Purged stale/deleted staging file during list scan: {file_path}")
-                                except Exception:
-                                    pass
-                                continue
-
-                            if raw_id not in seen_ids:
-                                seen_ids.add(raw_id)
-                                try:
-                                    k_uuid = uuid.UUID(str(raw_id))
-                                except ValueError:
-                                    k_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, str(raw_id))
-
-                                title = data.get("title", file_name)
-                                summary = data.get("summary", "")
-                                k_type = KnowledgeType.GENERAL
-
-                                doc_status = KnowledgeStatus.APPROVED if "output" in folder else KnowledgeStatus.PENDING
-
-                                staged_uploader_id = UUID(int=0)
-                                if data.get("uploaded_by"):
-                                    try:
-                                        staged_uploader_id = UUID(str(data.get("uploaded_by")))
-                                    except Exception:
-                                        pass
-                                staged_uploader_name = data.get("uploaded_by_name") or data.get("uploader_name") or "Admin"
-
-                                staged_responses.append(KnowledgeResponse(
-                                    id=k_uuid,
-                                    title=title,
-                                    content=summary,
-                                    file_name=file_name,
-                                    original_path=f"data/temp/{file_name}",
-                                    mime_type="application/pdf",
-                                    file_size=None,
-                                    type=k_type,
-                                    status=doc_status,
-                                    ai_summary=summary,
-                                    ai_confidence=95.0,
-                                    uploaded_by=staged_uploader_id,
-                                    uploaded_by_name=staged_uploader_name,
-                                    approved_by=None,
-                                    approved_at=now if doc_status == KnowledgeStatus.APPROVED else None,
-                                    metadata_=data,
-                                    created_at=now,
-                                    updated_at=now
-                                ))
-                    except Exception as err:
-                        pass
-
-    all_items = db_responses + staged_responses
-
-    # Sanitize categories across all returned items to exclude soft-deleted records
-    try:
-        cat_stmt = select(Category.name).where(Category.deleted_at.is_(None))
-        cat_res = await db.execute(cat_stmt)
-        active_cat_set = {c.strip().lower(): c for c in cat_res.scalars().all() if c}
-        for item in all_items:
-            if isinstance(item.metadata_, dict):
-                if "categories" in item.metadata_ and isinstance(item.metadata_["categories"], list):
-                    item.metadata_["categories"] = [
-                        active_cat_set[str(c.get("name") if isinstance(c, dict) else c).strip().lower()]
-                        for c in item.metadata_["categories"]
-                        if str(c.get("name") if isinstance(c, dict) else c).strip().lower() in active_cat_set
-                    ]
-                if "suggested_categories" in item.metadata_ and isinstance(item.metadata_["suggested_categories"], list):
-                    item.metadata_["suggested_categories"] = [
-                        active_cat_set[str(c.get("name") if isinstance(c, dict) else c).strip().lower()]
-                        for c in item.metadata_["suggested_categories"]
-                        if str(c.get("name") if isinstance(c, dict) else c).strip().lower() in active_cat_set
-                    ]
-    except Exception as e:
-        logger.warning(f"Failed to sanitize categories in list_knowledge: {e}")
-
-    # 4. Optional Project Filter
-    if project_id:
-        all_items = [item for item in all_items if item.project_id == project_id]
-
-    # 5. Optional In-Memory Status Filter
-    if status and status.upper() != "ALL":
-        all_items = [item for item in all_items if str(item.status.value if hasattr(item.status, "value") else item.status).upper() == status.upper()]
-
-    # 6. Optional Search Filter
-    if search and search.strip():
-        q = search.strip().lower()
-        all_items = [
-            item for item in all_items 
-            if q in item.title.lower() 
-            or q in item.file_name.lower() 
-            or (item.ai_summary and q in item.ai_summary.lower())
-        ]
-
-    # 7. Pagination Support
-    if page is not None and page_size is not None:
-        total = len(all_items)
-        total_pages = math.ceil(total / page_size) if total > 0 else 1
-        start = (page - 1) * page_size
-        end = start + page_size
-        items_page = all_items[start:end]
-
-        return PaginatedResponse[KnowledgeResponse](
-            items=items_page,
-            total=total,
-            page=page,
-            page_size=page_size,
-            total_pages=total_pages
-        )
-
-    return all_items
+    return responses
 
 @router.get("/{knowledge_id}", response_model=KnowledgeResponse)
 async def get_knowledge(
@@ -1632,6 +1545,17 @@ async def knowledge_chat(
         pipeline=pipeline
     )
 
+# Explicitly register office and document MIME types to prevent Debian/Alpine slim OS container mismatches
+mimetypes.add_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx")
+mimetypes.add_type("application/vnd.ms-excel", ".xls")
+mimetypes.add_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")
+mimetypes.add_type("application/msword", ".doc")
+mimetypes.add_type("application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx")
+mimetypes.add_type("application/vnd.ms-powerpoint", ".ppt")
+mimetypes.add_type("application/pdf", ".pdf")
+mimetypes.add_type("text/csv", ".csv")
+mimetypes.add_type("text/plain", ".txt")
+
 ALLOWED_MIME_TYPES = {
     "application/pdf",
     "application/msword",
@@ -1647,6 +1571,35 @@ ALLOWED_MIME_TYPES = {
     "image/png",
     "image/webp"
 }
+
+ALLOWED_EXTENSIONS = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pdf": "application/pdf",
+    ".csv": "text/csv",
+    ".txt": "text/plain",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp"
+}
+
+def is_allowed_file_type(raw_ctype: str, filename: str) -> bool:
+    """Robust, OS-independent validation of file MIME type and extension."""
+    clean_ctype = (raw_ctype or "").lower().strip()
+    if clean_ctype in ALLOWED_MIME_TYPES:
+        return True
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ALLOWED_EXTENSIONS:
+        return True
+    guessed_type, _ = mimetypes.guess_type(filename)
+    if guessed_type and guessed_type.lower().strip() in ALLOWED_MIME_TYPES:
+        return True
+    return False
 
 @router.post("/upload", status_code=status.HTTP_202_ACCEPTED)
 async def upload_knowledge_file(
@@ -1664,13 +1617,11 @@ async def upload_knowledge_file(
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     for target_file in upload_list:
         raw_ctype = (target_file.content_type or "").lower().strip()
-        if raw_ctype not in ALLOWED_MIME_TYPES:
-            guessed_type, _ = mimetypes.guess_type(target_file.filename or "")
-            if not guessed_type or guessed_type.lower().strip() not in ALLOWED_MIME_TYPES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File type '{target_file.content_type}' not allowed for file '{target_file.filename}'. Allowed types: PDF, Word, Excel, PowerPoint, Text, CSV, and Images."
-                )
+        if not is_allowed_file_type(raw_ctype, target_file.filename or ""):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type '{target_file.content_type}' not allowed for file '{target_file.filename}'. Allowed types: PDF, Word, Excel, PowerPoint, Text, CSV, and Images."
+            )
 
         # Validate file size against MAX_UPLOAD_SIZE_MB
         f_size = getattr(target_file, "size", None)
@@ -1789,13 +1740,11 @@ async def upload_knowledge_chunk(
 
     # Validate file type using filename and chunk
     raw_ctype = (chunk.content_type or "").lower().strip()
-    if raw_ctype not in ALLOWED_MIME_TYPES:
-        guessed_type, _ = mimetypes.guess_type(clean_filename)
-        if not guessed_type or guessed_type.lower().strip() not in ALLOWED_MIME_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File type '{clean_filename}' not allowed. Allowed types: PDF, Word, Excel, PowerPoint, Text, CSV, and Images."
-            )
+    if not is_allowed_file_type(raw_ctype, clean_filename):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{clean_filename}' not allowed. Allowed types: PDF, Word, Excel, PowerPoint, Text, CSV, and Images."
+        )
 
     chunk_dir = os.path.join("data", "temp", "chunks", clean_upload_id)
     os.makedirs(chunk_dir, exist_ok=True)
@@ -2090,13 +2039,11 @@ async def replace_knowledge_file_endpoint(
         raise HTTPException(status_code=404, detail="Knowledge document not found.")
 
     raw_ctype = (file.content_type or "").lower().strip()
-    if raw_ctype not in ALLOWED_MIME_TYPES:
-        guessed_type, _ = mimetypes.guess_type(file.filename or "")
-        if not guessed_type or guessed_type.lower().strip() not in ALLOWED_MIME_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File type '{file.content_type}' not allowed for file '{file.filename}'. Allowed types: PDF, Word, Excel, PowerPoint, Text, CSV, and Images."
-            )
+    if not is_allowed_file_type(raw_ctype, file.filename or ""):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{file.content_type}' not allowed for file '{file.filename}'. Allowed types: PDF, Word, Excel, PowerPoint, Text, CSV, and Images."
+        )
 
     # Validate file size against MAX_UPLOAD_SIZE_MB
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024

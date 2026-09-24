@@ -359,61 +359,79 @@ async def unified_search(
         res_chat = await db.execute(stmt_chat)
         chat_sessions = res_chat.scalars().all()
 
+        session_ids = [s.id for s in chat_sessions]
+        user_ids = list({s.user_id for s in chat_sessions if s.user_id})
+        branch_ids = list({s.branch_id for s in chat_sessions if s.branch_id})
+
+        # Batch fetch users
+        user_map = {}
+        if user_ids:
+            u_stmt = select(User.id, User.name).where(User.id.in_(user_ids))
+            for uid, uname in (await db.execute(u_stmt)).all():
+                user_map[uid] = uname or "Unknown"
+
+        # Batch fetch branches
+        branch_map = {}
+        if branch_ids:
+            b_stmt = select(Branch.id, Branch.name).where(Branch.id.in_(branch_ids))
+            for bid, bname in (await db.execute(b_stmt)).all():
+                branch_map[bid] = bname or "Unknown Branch"
+
+        # Batch fetch message counts
+        count_map = {}
+        if session_ids:
+            cnt_stmt = select(ChatMessage.session_id, func.count(ChatMessage.id)).where(ChatMessage.session_id.in_(session_ids)).group_by(ChatMessage.session_id)
+            for sid, c in (await db.execute(cnt_stmt)).all():
+                count_map[sid] = c
+
+        # Batch fetch first messages
+        first_msg_map = {}
+        needed_first_msg_sids = [s.id for s in chat_sessions if not (s.summary and s.summary.strip())]
+        if needed_first_msg_sids:
+            f_stmt = (
+                select(ChatMessage.session_id, ChatMessage.content, ChatMessage.role)
+                .where(ChatMessage.session_id.in_(needed_first_msg_sids))
+                .order_by(ChatMessage.session_id, ChatMessage.created_at.asc())
+            )
+            for sid, content, role in (await db.execute(f_stmt)).all():
+                if sid not in first_msg_map:
+                    first_msg_map[sid] = content
+                elif role == ChatRole.USER and first_msg_map.get(f"{sid}_role") != ChatRole.USER:
+                    first_msg_map[sid] = content
+                    first_msg_map[f"{sid}_role"] = ChatRole.USER
+
+        # Batch fetch matched messages
+        matched_msg_map = {}
+        if session_ids and words:
+            m_stmt = (
+                select(ChatMessage.session_id, ChatMessage.role, ChatMessage.content)
+                .where(
+                    ChatMessage.session_id.in_(session_ids),
+                    or_(*[ChatMessage.content.ilike(f"%{w}%") for w in words])
+                )
+                .order_by(ChatMessage.session_id, ChatMessage.created_at.asc())
+            )
+            for sid, m_role, m_content in (await db.execute(m_stmt)).all():
+                if sid not in matched_msg_map:
+                    matched_msg_map[sid] = (m_role, m_content)
+
+        from app.services.chat_title_service import sanitize_llm_title, clean_heuristic_title
+
         for session in chat_sessions:
-            stmt_count = select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session.id)
-            res_count = await db.execute(stmt_count)
-            msg_count = res_count.scalar() or 0
+            msg_count = count_map.get(session.id, 0)
+            doctor_name = user_map.get(session.user_id, "Unknown")
+            branch_name = branch_map.get(session.branch_id, "General Prompt" if not session.branch_id else "Unknown Branch")
 
-            stmt_user = select(User.name).where(User.id == session.user_id)
-            res_user = await db.execute(stmt_user)
-            doctor_name = res_user.scalar_one_or_none() or "Unknown"
-
-            branch_name = "General Prompt"
-            if session.branch_id:
-                stmt_branch = select(Branch.name).where(Branch.id == session.branch_id)
-                res_branch = await db.execute(stmt_branch)
-                branch_name = res_branch.scalar_one_or_none() or "Unknown Branch"
-
-            from app.services.chat_title_service import sanitize_llm_title, clean_heuristic_title
-
+            first_msg_content = first_msg_map.get(session.id)
             if session.summary and session.summary.strip():
                 title = sanitize_llm_title(session.summary)
             else:
-                stmt_first_msg = (
-                    select(ChatMessage.content)
-                    .where(ChatMessage.session_id == session.id, ChatMessage.role == ChatRole.USER)
-                    .order_by(ChatMessage.created_at.asc())
-                    .limit(1)
-                )
-                res_first_msg = await db.execute(stmt_first_msg)
-                first_msg_content = res_first_msg.scalar_one_or_none()
-                if not first_msg_content:
-                    stmt_fallback = (
-                        select(ChatMessage.content)
-                        .where(ChatMessage.session_id == session.id)
-                        .order_by(ChatMessage.created_at.asc())
-                        .limit(1)
-                    )
-                    res_fallback = await db.execute(stmt_fallback)
-                    first_msg_content = res_fallback.scalar_one_or_none()
-
                 title = clean_heuristic_title(first_msg_content) if first_msg_content else "Percakapan Baru"
 
             match_role = "SUMMARY"
             snippet = None
 
-            stmt_matched_msg = (
-                select(ChatMessage.role, ChatMessage.content)
-                .where(
-                    ChatMessage.session_id == session.id,
-                    or_(*[ChatMessage.content.ilike(f"%{w}%") for w in words])
-                )
-                .order_by(ChatMessage.created_at.asc())
-                .limit(1)
-            )
-            res_matched_msg = await db.execute(stmt_matched_msg)
-            matched_msg_row = res_matched_msg.first()
-
+            matched_msg_row = matched_msg_map.get(session.id)
             if matched_msg_row:
                 raw_role, raw_content = matched_msg_row
                 match_role = raw_role.value if hasattr(raw_role, "value") else str(raw_role).upper()
@@ -423,6 +441,7 @@ async def unified_search(
                 snippet = extract_snippet(session.summary, query_str)
             else:
                 snippet = extract_snippet(first_msg_content or session.summary, query_str)
+
 
             chat_results.append(
                 ChatSearchResult(

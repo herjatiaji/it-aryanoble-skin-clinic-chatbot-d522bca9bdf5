@@ -57,6 +57,18 @@ function resolveImageUrl(src, apiBaseUrl) {
 	return encodeURI(decodeURI(fullUrl));
 }
 
+function repairMarkdownTables(text) {
+	if (!text || !text.includes("|")) return text;
+	let repaired = text;
+	// 1. Break concatenated rows separated by consecutive pipes: | Val A | | Val B | -> | Val A |\n| Val B |
+	repaired = repaired.replace(/\|\s*\|/g, "|\n|");
+	// 2. Ensure double newline before table start if preceded directly by non-blank text
+	repaired = repaired.replace(/([^\n\s|][^\n|]*)\n(\|(?:\s*[^|\n]+\s*\|)+)/g, "$1\n\n$2");
+	// 3. Ensure double newline after table end if followed directly by non-blank text
+	repaired = repaired.replace(/(\|[^\n]+\|)\n([^|\n\s])/g, "$1\n\n$2");
+	return repaired;
+}
+
 function stripInternalMetadata(text) {
 	if (!text) return "";
 	let cleaned = text;
@@ -83,6 +95,9 @@ function stripInternalMetadata(text) {
 
 	// Normalize unicode bullet symbols (•, ●, ◦) to standard markdown list syntax
 	cleaned = cleaned.replace(/^[ \t]*[•●◦][ \t]*/gm, "- ");
+
+	// Auto-heal GFM markdown tables
+	cleaned = repairMarkdownTables(cleaned);
 
 	return cleaned.trim();
 }
@@ -743,6 +758,16 @@ export default function FloatingChatbot({
 																		onPreview={setPreviewImage}
 																	/>
 																),
+																table: ({ children }) => (
+																	<div className="fc-table-wrapper">
+																		<table className="fc-table">{children}</table>
+																	</div>
+																),
+																thead: ({ children }) => <thead className="fc-thead">{children}</thead>,
+																tbody: ({ children }) => <tbody className="fc-tbody">{children}</tbody>,
+																tr: ({ children }) => <tr className="fc-tr">{children}</tr>,
+																th: ({ children }) => <th className="fc-th">{children}</th>,
+																td: ({ children }) => <td className="fc-td">{children}</td>,
 															}}
 														>
 															{stripInternalMetadata(msg.content)}

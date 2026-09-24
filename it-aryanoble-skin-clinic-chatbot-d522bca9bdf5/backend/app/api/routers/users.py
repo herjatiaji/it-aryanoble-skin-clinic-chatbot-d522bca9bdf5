@@ -3,9 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List, Optional
 import uuid
-
 from app.core.database import get_db
-from app.api.dependencies import get_current_user, RequireAccess
+from app.api.dependencies import get_current_user, RequireAccess, invalidate_user_access_cache
 from app.models.user import User, UserType, Role, UserRole, UserTokenUsage
 from app.models.branch import Branch, UserBranch
 from app.models.category import Category, UserCategoryExclusion
@@ -18,139 +17,211 @@ from app.core.security import get_password_hash
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-# Helper function to hydrate a user with relationships
-async def _hydrate_user(user: User, db: AsyncSession) -> dict:
-    user_dict = {
-        "id": user.id,
-        "type": user.type,
-        "email": user.email,
-        "name": user.name,
-        "cis_id": user.cis_id,
-        "token_limit": user.token_limit,
-        "employee_id": user.employee_id,
-        "dr_type": user.dr_type,
-        "user_type_code": user.user_type_code,
-        "ecosystem": user.ecosystem,
-        "created_at": user.created_at,
-        "status": "Inactive" if user.deleted_at else "Active",
-        "roles": [],
-        "branches": [],
-        "categories": [],
-        "tokens_used": 0
-    }
-    
-    if user.type == UserType.STAFF:
-        from app.models.user import RoleAccess, Access
-        
-        stmt = select(Role).join(UserRole, UserRole.role_id == Role.id).where(UserRole.user_id == user.id)
-        result = await db.execute(stmt)
-        roles = result.scalars().all()
-        user_dict["roles"] = [{"id": r.id, "name": r.name} for r in roles]
-        
-        stmt_acc = (
-            select(Access.name)
+# Helper function to batch-hydrate users with relationships in bulk
+async def _hydrate_users_batch(users: List[User], db: AsyncSession) -> List[dict]:
+    if not users:
+        return []
+
+    current_ym = datetime.now(timezone.utc).strftime("%Y-%m")
+    staff_users = [u for u in users if u.type == UserType.STAFF]
+    doctor_users = [u for u in users if u.type == UserType.DOCTOR]
+
+    staff_ids = [u.id for u in staff_users]
+    doctor_ids = [u.id for u in doctor_users]
+
+    # --- Batch Staff Data ---
+    staff_roles_map: dict[uuid.UUID, list] = {uid: [] for uid in staff_ids}
+    staff_accesses_map: dict[uuid.UUID, set] = {uid: set() for uid in staff_ids}
+    staff_tokens_map: dict[uuid.UUID, int] = {uid: 0 for uid in staff_ids}
+
+    if staff_ids:
+        from app.models.user import RoleAccess, Access, UserAccess
+        # Roles
+        r_stmt = select(UserRole.user_id, Role.id, Role.name).join(Role, UserRole.role_id == Role.id).where(UserRole.user_id.in_(staff_ids))
+        r_res = await db.execute(r_stmt)
+        for uid, rid, rname in r_res.all():
+            staff_roles_map[uid].append({"id": rid, "name": rname})
+
+        # Role Accesses
+        acc_stmt = (
+            select(UserRole.user_id, Access.name)
             .join(RoleAccess, RoleAccess.access_id == Access.id)
             .join(UserRole, UserRole.role_id == RoleAccess.role_id)
-            .where(UserRole.user_id == user.id)
+            .where(UserRole.user_id.in_(staff_ids))
         )
-        result_acc = await db.execute(stmt_acc)
-        user_dict["accesses"] = list(result_acc.scalars().all())
-        
-        # Calculate staff tokens used (current month)
-        current_ym = datetime.now(timezone.utc).strftime("%Y-%m")
-        stmt_token = select(func.sum(UserTokenUsage.tokens_used)).where(
-            UserTokenUsage.user_id == user.id,
-            UserTokenUsage.year_month == current_ym
+        acc_res = await db.execute(acc_stmt)
+        for uid, aname in acc_res.all():
+            staff_accesses_map[uid].add(aname)
+
+        # Direct User Accesses
+        u_acc_stmt = (
+            select(UserAccess.user_id, Access.name)
+            .join(UserAccess, UserAccess.access_id == Access.id)
+            .where(UserAccess.user_id.in_(staff_ids))
         )
-        result_token = await db.execute(stmt_token)
-        user_dict["tokens_used"] = result_token.scalar() or 0
-        
-    elif user.type == UserType.DOCTOR:
-        stmt_branch = (
-            select(Branch)
+        u_acc_res = await db.execute(u_acc_stmt)
+        for uid, aname in u_acc_res.all():
+            staff_accesses_map[uid].add(aname)
+
+        # Staff Tokens
+        st_tok_stmt = (
+            select(UserTokenUsage.user_id, func.sum(UserTokenUsage.tokens_used))
+            .where(UserTokenUsage.user_id.in_(staff_ids), UserTokenUsage.year_month == current_ym)
+            .group_by(UserTokenUsage.user_id)
+        )
+        st_tok_res = await db.execute(st_tok_stmt)
+        for uid, tok_sum in st_tok_res.all():
+            staff_tokens_map[uid] = tok_sum or 0
+
+    # --- Batch Doctor Data ---
+    doctor_branches_map: dict[uuid.UUID, list] = {uid: [] for uid in doctor_ids}
+    doctor_exclusions_map: dict[uuid.UUID, set] = {uid: set() for uid in doctor_ids}
+    doctor_tokens_map: dict[uuid.UUID, int] = {uid: 0 for uid in doctor_ids}
+    all_categories = []
+
+    if doctor_ids:
+        # Doctor Branches
+        b_stmt = (
+            select(UserBranch.user_id, Branch)
             .join(UserBranch, UserBranch.branch_id == Branch.id)
             .where(
-                UserBranch.user_id == user.id,
+                UserBranch.user_id.in_(doctor_ids),
                 UserBranch.status == 1,
                 UserBranch.deleted_at.is_(None),
                 Branch.deleted_at.is_(None)
             )
         )
-        result_branch = await db.execute(stmt_branch)
-        branches = result_branch.scalars().all()
-        current_ym = datetime.now(timezone.utc).strftime("%Y-%m")
-        user_dict["branches"] = []
-        for b in branches:
-            b_usage_stmt = select(func.sum(UserTokenUsage.tokens_used)).where(
-                UserTokenUsage.user_id == user.id,
-                UserTokenUsage.branch_id == b.id,
-                UserTokenUsage.year_month == current_ym
-            )
-            b_used_res = await db.execute(b_usage_stmt)
-            doc_branch_used = b_used_res.scalar() or 0
-            user_dict["branches"].append({
-                "id": b.id,
-                "external_id": b.external_id,
-                "name": b.name,
-                "code": b.code,
-                "ecosystem": b.ecosystem,
-                "token_limit": b.token_limit,
-                "tokens_used": doc_branch_used,
-                "created_at": b.created_at,
-                "updated_at": b.updated_at
-            })
-        
-        stmt_cat = select(Category).where(
-            Category.deleted_at.is_(None),
-            ~Category.id.in_(
-                select(UserCategoryExclusion.category_id).where(UserCategoryExclusion.user_id == user.id)
-            )
+        b_res = await db.execute(b_stmt)
+        doctor_branch_objs: dict[uuid.UUID, list] = {uid: [] for uid in doctor_ids}
+        for uid, branch_obj in b_res.all():
+            doctor_branch_objs[uid].append(branch_obj)
+
+        # Branch Token Usage per user & branch
+        br_tok_stmt = (
+            select(UserTokenUsage.user_id, UserTokenUsage.branch_id, func.sum(UserTokenUsage.tokens_used))
+            .where(UserTokenUsage.user_id.in_(doctor_ids), UserTokenUsage.year_month == current_ym)
+            .group_by(UserTokenUsage.user_id, UserTokenUsage.branch_id)
         )
-        result_cat = await db.execute(stmt_cat)
-        categories = result_cat.scalars().all()
-        user_dict["categories"] = [{"id": c.id, "name": c.name, "description": c.description, "created_at": c.created_at, "updated_at": c.updated_at} for c in categories]
-        
-        # Calculate tokens used (current month)
-        current_ym = datetime.now(timezone.utc).strftime("%Y-%m")
-        stmt_token = select(func.sum(UserTokenUsage.tokens_used)).where(UserTokenUsage.user_id == user.id, UserTokenUsage.year_month == current_ym)
-        result_token = await db.execute(stmt_token)
-        tokens_used = result_token.scalar() or 0
-        user_dict["tokens_used"] = tokens_used
-        
-        # Check global token mode for status
+        br_tok_res = await db.execute(br_tok_stmt)
+        doc_br_tok_map: dict[tuple, int] = {}
+        for uid, bid, btok in br_tok_res.all():
+            doc_br_tok_map[(uid, bid)] = btok or 0
+
+        for uid, branches in doctor_branch_objs.items():
+            for b in branches:
+                doc_branch_used = doc_br_tok_map.get((uid, b.id), 0)
+                doctor_branches_map[uid].append({
+                    "id": b.id,
+                    "external_id": b.external_id,
+                    "name": b.name,
+                    "code": b.code,
+                    "ecosystem": b.ecosystem,
+                    "token_limit": b.token_limit,
+                    "tokens_used": doc_branch_used,
+                    "created_at": b.created_at,
+                    "updated_at": b.updated_at
+                })
+
+        # All Active Categories
+        cat_stmt = select(Category).where(Category.deleted_at.is_(None))
+        cat_res = await db.execute(cat_stmt)
+        all_categories = list(cat_res.scalars().all())
+
+        # Exclusions per doctor
+        excl_stmt = select(UserCategoryExclusion.user_id, UserCategoryExclusion.category_id).where(UserCategoryExclusion.user_id.in_(doctor_ids))
+        excl_res = await db.execute(excl_stmt)
+        for uid, cid in excl_res.all():
+            doctor_exclusions_map[uid].add(cid)
+
+        # Doctor Total Tokens Used
+        doc_tok_stmt = (
+            select(UserTokenUsage.user_id, func.sum(UserTokenUsage.tokens_used))
+            .where(UserTokenUsage.user_id.in_(doctor_ids), UserTokenUsage.year_month == current_ym)
+            .group_by(UserTokenUsage.user_id)
+        )
+        doc_tok_res = await db.execute(doc_tok_stmt)
+        for uid, tok_sum in doc_tok_res.all():
+            doctor_tokens_map[uid] = tok_sum or 0
+
+    # Global config check (queried once)
+    is_global_mode = False
+    global_spkk_limit = 0
+    global_gp_limit = 0
+
+    if doctor_ids:
         from app.models.config import AppConfig
-        cfg_stmt = select(AppConfig.value).where(AppConfig.key == "GLOBAL_TOKEN_LIMIT_ACTIVE")
+        cfg_stmt = select(AppConfig.key, AppConfig.value).where(
+            AppConfig.key.in_(["GLOBAL_TOKEN_LIMIT_ACTIVE", "GLOBAL_SPKK_LIMIT_ACTIVE", "GLOBAL_GP_LIMIT_ACTIVE", "TOKEN_LIMIT_SPKK", "TOKEN_LIMIT_GP"])
+        )
         cfg_res = await db.execute(cfg_stmt)
-        cfg_val = cfg_res.scalar_one_or_none()
-        is_global_mode = (cfg_val or "false").lower() == "true"
+        cfg_dict = {row[0]: row[1] for row in cfg_res.all()}
 
+        is_global_mode = (cfg_dict.get("GLOBAL_TOKEN_LIMIT_ACTIVE") or "false").lower() == "true"
         if is_global_mode:
-            # Check Doctor Type limits (SpDVE vs GP Plus) only if sub-flag is active
-            dr_type_clean = (user.dr_type or "").upper()
-            is_spkk = any(k in dr_type_clean for k in ["SPDVE", "SP.DVE", "SPKK", "SP.KK", "SPDV"])
-            is_gp = any(k in dr_type_clean for k in ["GP", "GP PLUS", "UMUM"])
-            
-            global_doc_limit = 0
-            if is_spkk:
-                spkk_act = (await db.execute(select(AppConfig.value).where(AppConfig.key == "GLOBAL_SPKK_LIMIT_ACTIVE"))).scalar_one_or_none()
-                if (spkk_act or "false").lower() == "true":
-                    t_val = (await db.execute(select(AppConfig.value).where(AppConfig.key == "TOKEN_LIMIT_SPKK"))).scalar_one_or_none()
-                    global_doc_limit = int(t_val) if (t_val and t_val.isdigit() and int(t_val) > 0) else 0
-            elif is_gp:
-                gp_act = (await db.execute(select(AppConfig.value).where(AppConfig.key == "GLOBAL_GP_LIMIT_ACTIVE"))).scalar_one_or_none()
-                if (gp_act or "false").lower() == "true":
-                    t_val = (await db.execute(select(AppConfig.value).where(AppConfig.key == "TOKEN_LIMIT_GP"))).scalar_one_or_none()
-                    global_doc_limit = int(t_val) if (t_val and t_val.isdigit() and int(t_val) > 0) else 0
+            if (cfg_dict.get("GLOBAL_SPKK_LIMIT_ACTIVE") or "false").lower() == "true":
+                t_val = cfg_dict.get("TOKEN_LIMIT_SPKK") or ""
+                global_spkk_limit = int(t_val) if t_val.isdigit() and int(t_val) > 0 else 0
+            if (cfg_dict.get("GLOBAL_GP_LIMIT_ACTIVE") or "false").lower() == "true":
+                t_val = cfg_dict.get("TOKEN_LIMIT_GP") or ""
+                global_gp_limit = int(t_val) if t_val.isdigit() and int(t_val) > 0 else 0
 
-            # If user has custom override (user.token_limit > 0), prioritize it; otherwise use global limit if active
-            effective_limit = user.token_limit if (user.token_limit is not None and user.token_limit > 0) else global_doc_limit
-            if user_dict["status"] == "Active" and effective_limit > 0 and tokens_used >= effective_limit * 0.9:
-                user_dict["status"] = "Warning"
-        elif user_dict["status"] == "Active" and user.token_limit and user.token_limit > 0:
-            if tokens_used >= user.token_limit * 0.9:
-                user_dict["status"] = "Warning"
-                
-    return user_dict
+    # --- Build Response Dictionaries ---
+    hydrated_list = []
+    for user in users:
+        user_dict = {
+            "id": user.id,
+            "type": user.type,
+            "email": user.email,
+            "name": user.name,
+            "cis_id": user.cis_id,
+            "token_limit": user.token_limit,
+            "employee_id": user.employee_id,
+            "dr_type": user.dr_type,
+            "user_type_code": user.user_type_code,
+            "ecosystem": user.ecosystem,
+            "created_at": user.created_at,
+            "status": "Inactive" if user.deleted_at else "Active",
+            "roles": [],
+            "accesses": [],
+            "branches": [],
+            "categories": [],
+            "tokens_used": 0
+        }
+
+        if user.type == UserType.STAFF:
+            user_dict["roles"] = staff_roles_map.get(user.id, [])
+            user_dict["accesses"] = list(staff_accesses_map.get(user.id, set()))
+            user_dict["tokens_used"] = staff_tokens_map.get(user.id, 0)
+        elif user.type == UserType.DOCTOR:
+            user_dict["branches"] = doctor_branches_map.get(user.id, [])
+            excl_set = doctor_exclusions_map.get(user.id, set())
+            user_dict["categories"] = [
+                {"id": c.id, "name": c.name, "description": c.description, "created_at": c.created_at, "updated_at": c.updated_at}
+                for c in all_categories if c.id not in excl_set
+            ]
+            tokens_used = doctor_tokens_map.get(user.id, 0)
+            user_dict["tokens_used"] = tokens_used
+
+            if is_global_mode:
+                dr_type_clean = (user.dr_type or "").upper()
+                is_spkk = any(k in dr_type_clean for k in ["SPDVE", "SP.DVE", "SPKK", "SP.KK", "SPDV"])
+                is_gp = any(k in dr_type_clean for k in ["GP", "GP PLUS", "UMUM"])
+                global_doc_limit = global_spkk_limit if is_spkk else (global_gp_limit if is_gp else 0)
+
+                effective_limit = user.token_limit if (user.token_limit is not None and user.token_limit > 0) else global_doc_limit
+                if user_dict["status"] == "Active" and effective_limit > 0 and tokens_used >= effective_limit * 0.9:
+                    user_dict["status"] = "Warning"
+            elif user_dict["status"] == "Active" and user.token_limit and user.token_limit > 0:
+                if tokens_used >= user.token_limit * 0.9:
+                    user_dict["status"] = "Warning"
+
+        hydrated_list.append(user_dict)
+
+    return hydrated_list
+
+async def _hydrate_user(user: User, db: AsyncSession) -> dict:
+    hydrated_list = await _hydrate_users_batch([user], db)
+    return hydrated_list[0] if hydrated_list else {}
 
 @router.get("/me", response_model=UserResponse)
 async def read_users_me(
@@ -195,8 +266,8 @@ async def list_users(
 
         paginated_stmt = stmt.offset((page - 1) * p_size).limit(p_size)
         result = await db.execute(paginated_stmt)
-        users = result.scalars().all()
-        hydrated_items = [await _hydrate_user(u, db) for u in users]
+        users = list(result.scalars().all())
+        hydrated_items = await _hydrate_users_batch(users, db)
 
         return PaginatedResponse[UserResponse](
             items=hydrated_items,
@@ -207,8 +278,8 @@ async def list_users(
         )
 
     result = await db.execute(stmt)
-    users = result.scalars().all()
-    return [await _hydrate_user(u, db) for u in users]
+    users = list(result.scalars().all())
+    return await _hydrate_users_batch(users, db)
 
 @router.post("/staff", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_staff(
@@ -341,6 +412,7 @@ async def update_user(
         
     await db.commit()
     await db.refresh(user)
+    invalidate_user_access_cache(user_id)
     return await _hydrate_user(user, db)
 
 
@@ -392,6 +464,7 @@ async def update_user_roles(
         db.add(UserRole(user_id=user.id, role_id=role.id))
         
     await db.commit()
+    invalidate_user_access_cache(user_id)
     return await _hydrate_user(user, db)
 
 @router.put("/{user_id}/accesses", response_model=UserResponse)
@@ -419,6 +492,7 @@ async def update_user_accesses(
             db.add(UserAccess(user_id=user.id, access_id=acc.id))
             
     await db.commit()
+    invalidate_user_access_cache(user_id)
     return await _hydrate_user(user, db)
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -435,4 +509,5 @@ async def delete_user(
         
     user.deleted_at = datetime.now(timezone.utc)
     await db.commit()
+    invalidate_user_access_cache(user_id)
 

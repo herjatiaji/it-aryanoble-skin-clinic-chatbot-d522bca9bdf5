@@ -389,7 +389,15 @@ async def stream_to_backend(request: Request, path: str):
         finally:
             await client.aclose()
 
-    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive"
+        }
+    )
 
 @app.get("/api/chats/")
 async def proxy_get_chats(request: Request):

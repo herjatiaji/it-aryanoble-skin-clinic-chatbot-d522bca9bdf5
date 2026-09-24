@@ -1515,21 +1515,43 @@ class DocumentParser:
                                     current_table_rows = []
                                 continue
 
-                            # Single non-empty cell without image tag -> Title/Heading or Meta line
+                            # Single non-empty cell without image tag: Distinguish true structural heading vs note/continuation vs data
                             if len(non_empty) == 1 and "![" not in non_empty[0][1]:
-                                txt = non_empty[0][1]
+                                col_idx, txt = non_empty[0]
+                                txt_lower = txt.lower().strip()
+
+                                is_explicit_heading = any(k in txt_lower for k in [
+                                    "cheatsheet", "katalog", "daftar", "panduan", "tabel", "bab", "section",
+                                    "kategori", "protokol", "sop", "overview"
+                                ])
+                                is_note_or_meta = (
+                                    txt.startswith("*") or txt.endswith("*") or
+                                    any(txt_lower.startswith(k) for k in ["catatan", "note", "nb:", "perhatian", "peringatan", "disclaimer", "updated", "tanggal"])
+                                )
+                                is_short_title = (
+                                    len(txt) <= 60 and 
+                                    not txt.endswith((".", ",", ";", ":")) and 
+                                    col_idx == 0 and 
+                                    (txt.isupper() or txt.istitle())
+                                )
+
+                                # If inside an ongoing table and this is a note/continuation, keep it with the table rows instead of breaking table
+                                if current_table_rows and not (is_explicit_heading or (is_short_title and len(current_table_rows) > 3 and not is_note_or_meta)):
+                                    current_table_rows.append(raw_row)
+                                    continue
+
                                 if current_table_rows:
                                     blocks.append({"type": "table", "rows": current_table_rows})
                                     current_table_rows = []
 
-                                txt_lower = txt.lower()
                                 if txt_lower in ["nama tindakan"]:
                                     # Redundant merge artifact row directly above table header
                                     continue
-                                if any(k in txt_lower for k in ["cheatsheet", "katalog", "daftar", "panduan", "tabel"]):
+
+                                if is_explicit_heading or is_short_title:
                                     blocks.append({"type": "heading", "level": 3, "text": txt})
-                                elif "updated" in txt_lower or "tanggal" in txt_lower:
-                                    blocks.append({"type": "meta", "text": f"*{txt}*"})
+                                elif is_note_or_meta:
+                                    blocks.append({"type": "meta", "text": f"*{txt.strip('*')}*"})
                                 else:
                                     blocks.append({"type": "text", "text": txt})
                             else:

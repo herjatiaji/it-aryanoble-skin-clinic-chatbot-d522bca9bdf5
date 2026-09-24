@@ -158,6 +158,9 @@ def setup_logging(log_level: str = "INFO"):
 
     # 4. Intercept standard library loggers
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+    for noisy in ("botocore", "boto3", "s3transfer", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi", "sqlalchemy.engine", "httpx", "urllib3", "huggingface_hub", "transformers", "sentence_transformers"):
         mod_logger = logging.getLogger(logger_name)
         mod_logger.handlers = [InterceptHandler()]

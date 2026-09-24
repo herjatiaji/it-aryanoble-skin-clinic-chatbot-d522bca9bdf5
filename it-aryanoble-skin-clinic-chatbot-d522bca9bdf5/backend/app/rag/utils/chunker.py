@@ -310,8 +310,6 @@ class CustomChunker:
 
         meta = {
             "source_file": source_file,
-            "product_name": entity_name,
-            "treatment_name": entity_name,
             "entity": entity_name,
             "section": entity_name,
             "page": 1,
@@ -326,25 +324,38 @@ class CustomChunker:
             "doctors": visibility_settings.get("doctors", ["all"]),
         }
 
+        # Enforce strict separation: Product != Treatment
+        doc_type_upper = (doc_type or "").upper()
+        if "TREATMENT" in doc_type_upper or any(w in entity_name.lower() for w in ["treatment", "peeling", "facial", "laser", "tindakan", "sop"]):
+            meta["treatment_name"] = entity_name
+            meta["product_name"] = None
+        else:
+            meta["product_name"] = entity_name
+            meta["treatment_name"] = None
+
         # Extract contextual image_url from markdown image tags in chunk text
         if chunk_text:
             img_matches = re.findall(r'!\[.*?\]\(([^\s\)]+)\)', chunk_text)
             if img_matches:
                 meta["image_url"] = img_matches[0]
 
-            # Extract SKU
+            # Extract SKU (colon, equals, or markdown table row)
             sku_match = re.search(
                 r'(?:-\s*\*\*SKU\*\*|\bSKU\b)\s*[:=]\s*([A-Za-z0-9\-\_]+)',
                 chunk_text, re.IGNORECASE
             )
+            if not sku_match:
+                sku_match = re.search(r'\|\s*SKU\s*\|\s*([A-Za-z0-9\-\_]+)\s*\|', chunk_text, re.IGNORECASE)
             if sku_match:
                 meta["sku"] = sku_match.group(1).strip()
 
-            # Extract Price/Harga
+            # Extract Price/Harga (colon, equals, or markdown table row)
             price_match = re.search(
                 r'(?:-\s*\*\*(?:Harga|Price|Harga Normal|Harga Promo)\*\*|\b(?:Harga|Price)\b)\s*[:=]\s*([^\n\r]+)',
                 chunk_text, re.IGNORECASE
             )
+            if not price_match:
+                price_match = re.search(r'\|\s*(?:Harga|Price|Harga Normal|Harga Promo)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
             if price_match:
                 meta["price"] = price_match.group(1).strip()
 
@@ -408,6 +419,7 @@ class CustomChunker:
         # Match H3/H4 headers, but NOT bold key-value pairs or numbered list items
         entity_h3_h4_pattern = re.compile(r"^(?:#{3,4}\s+)", re.IGNORECASE)
         bold_entity_pattern = re.compile(r"^\*\*([A-Z0-9][A-Za-z0-9\s\.\-]+)\*\*\s*$", re.IGNORECASE)
+        last_sheet_name = None
 
         for page_data in pages:
             page_num = page_data.get("page", 1)
@@ -417,18 +429,26 @@ class CustomChunker:
             if not page_text:
                 continue
 
+            # Reset entity context when crossing sheet boundaries to prevent cross-sheet context contamination
+            curr_sheet = page_data.get("sheet_name")
+            if curr_sheet and curr_sheet != last_sheet_name:
+                current_entity = ""
+                current_section = f"Sheet: {curr_sheet}"
+                last_sheet_name = curr_sheet
+
             lines = page_text.split("\n")
             current_entity_lines = []
             current_table_lines = []
+
+            sheet_name_val = curr_sheet or (current_section.split(":", 1)[1].strip() if current_section and current_section.lower().startswith("sheet:") else None)
 
             def _build_meta(chunk_text: str = "") -> Dict[str, Any]:
                 meta = {
                     "section": current_section,
                     "entity": current_entity,
-                    "page": page_num
+                    "page": page_num,
+                    "sheet_name": sheet_name_val
                 }
-                if current_section and current_section.lower().startswith("sheet:"):
-                    meta["sheet_name"] = current_section.split(":", 1)[1].strip()
 
                 extracted_urls = []
                 if chunk_text:
@@ -437,9 +457,71 @@ class CustomChunker:
                         if u not in extracted_urls:
                             extracted_urls.append(u)
 
+                    # Extract SKU (colon, equals, or markdown table row)
                     sku_match = re.search(r'(?:-\s*\*\*SKU\*\*|\bSKU\b)\s*[:=]\s*([A-Za-z0-9\-\_]+)', chunk_text, re.IGNORECASE)
+                    if not sku_match:
+                        sku_match = re.search(r'\|\s*SKU\s*\|\s*([A-Za-z0-9\-\_]+)\s*\|', chunk_text, re.IGNORECASE)
                     if sku_match:
                         meta["sku"] = sku_match.group(1).strip()
+
+                    # Extract Treatment Name vs Product Name (strict separation: Product != Treatment)
+                    treat_match = re.search(r'(?:-\s*\*\*(?:Nama Treatment|Treatment|Nama Tindakan|Tindakan)\*\*|\b(?:Nama Treatment|Nama Tindakan)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not treat_match:
+                        treat_match = re.search(r'\|\s*(?:Nama Treatment|Treatment|Nama Tindakan|Tindakan)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if treat_match:
+                        meta["treatment_name"] = treat_match.group(1).strip()
+
+                    prod_match = re.search(r'(?:-\s*\*\*(?:Nama Produk|Produk|Product Name)\*\*|\b(?:Nama Produk)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not prod_match:
+                        prod_match = re.search(r'\|\s*(?:Nama Produk|Produk|Product Name)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if prod_match:
+                        meta["product_name"] = prod_match.group(1).strip()
+                    elif current_entity and not meta.get("treatment_name"):
+                        if any(w in current_section.lower() for w in ["treatment", "tindakan", "prosedur", "sop"]):
+                            meta["treatment_name"] = current_entity
+                        else:
+                            meta["product_name"] = current_entity
+
+                    # Extract Form Factor / Sediaan cleanly without synthetic values
+                    t_lower = chunk_text.lower()
+                    form_factors = {
+                        "serum": ["serum", "ampoule", "essence"],
+                        "toner": ["toner", "micellar"],
+                        "krim": ["krim", "cream", "lotion", "gel", "moisturizer", "pelembap"],
+                        "cleanser": ["cleanser", "facial wash", "face wash", "sabun wajah"],
+                        "shampoo": ["shampoo", "sampo", "hair tonic", "scalp serum"],
+                        "sunscreen": ["sunscreen", "tabir surya", "sunblock"],
+                        "masker": ["masker", "sheet mask", "clay mask"]
+                    }
+                    for ff_key, aliases in form_factors.items():
+                        if any(re.search(rf'\b{re.escape(a)}\b', t_lower) for a in aliases):
+                            meta["form_factor"] = ff_key
+                            break
+
+                    # Extract Dose / Dosis (colon, equals, or markdown table row)
+                    dose_match = re.search(r'(?:-\s*\*\*(?:Dosis|Dose|Aturan Dosis)\*\*|\b(?:Dosis|Dose)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not dose_match:
+                        dose_match = re.search(r'\|\s*(?:Dosis|Dose|Aturan Dosis)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if dose_match:
+                        meta["dose"] = dose_match.group(1).strip()
+
+                    # Extract Frequency / Frekuensi (colon, equals, or markdown table row)
+                    freq_match = re.search(r'(?:-\s*\*\*(?:Frekuensi|Frequency|Cara Pakai)\*\*|\b(?:Frekuensi|Frequency)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not freq_match:
+                        freq_match = re.search(r'\|\s*(?:Frekuensi|Frequency|Cara Pakai)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if freq_match:
+                        meta["frequency"] = freq_match.group(1).strip()
+                    else:
+                        daily_freq = re.search(r'\b(\d+\s*x\s*(?:sehari|seminggu|per\s*hari|sehari\s*sekali))\b', chunk_text, re.IGNORECASE)
+                        if daily_freq:
+                            meta["frequency"] = daily_freq.group(1).strip()
+
+                    # Extract Indication / Indikasi / Manfaat (colon, equals, or markdown table row)
+                    ind_match = re.search(r'(?:-\s*\*\*(?:Indikasi|Indication|Manfaat|Benefits)\*\*|\b(?:Indikasi|Indication)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not ind_match:
+                        ind_match = re.search(r'\|\s*(?:Indikasi|Indication|Manfaat|Benefits)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if ind_match:
+                        meta["indication"] = ind_match.group(1).strip()
 
                     # Extract promo validity period (YYYY-MM-DD) per product chunk if present
                     date_matches = re.findall(r'\b(20\d{2}-\d{2}-\d{2})\b', chunk_text)
@@ -449,8 +531,10 @@ class CustomChunker:
                     elif len(date_matches) == 1:
                         meta["valid_until"] = date_matches[0]
 
-                    # Extract Price / Harga per product chunk if present
+                    # Extract Price / Harga per product chunk if present (colon, equals, or markdown table row)
                     price_match = re.search(r'(?:-\s*\*\*(?:Harga|Price|Harga Normal|Harga Promo)\*\*|\b(?:Harga|Price)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not price_match:
+                        price_match = re.search(r'\|\s*(?:Harga|Price|Harga Normal|Harga Promo)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
                     if price_match:
                         meta["price"] = price_match.group(1).strip()
 

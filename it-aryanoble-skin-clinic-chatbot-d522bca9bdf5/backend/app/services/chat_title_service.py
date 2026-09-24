@@ -112,9 +112,11 @@ async def generate_and_save_chat_title(
                 select(ChatMessage)
                 .where(ChatMessage.session_id == session_id)
                 .order_by(ChatMessage.created_at.asc())
+                .limit(4)
             )
             msg_res = await db.execute(stmt_msgs)
             all_msgs = msg_res.scalars().all()
+
             for m in all_msgs:
                 if m.role == ChatRole.USER and not user_query:
                     user_query = m.content

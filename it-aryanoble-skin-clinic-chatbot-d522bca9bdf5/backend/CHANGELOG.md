@@ -2,6 +2,50 @@
 
 All notable changes to the Arya Noble AI Chatbot Backend are documented in this file.
 
+## [1.5.1] - 2026-09-24
+
+### Knowledge Re-Ingestion Lifecycle, Soft-Delete Filtering & UI Error Fixes
+- **Filtered Soft-Deleted Records on Ingestion (`app/rag/router.py`)**:
+  - In `_process_single_upload_file`, added `Knowledge.deleted_at.is_(None)` check when querying existing database documents.
+  - Ensured re-ingested files receive a clean UUID, fresh timestamps, and reset metadata.
+- **Active Record Verification in `detect_duplicate_lifecycle` (`app/rag/router.py`)**:
+  - Implemented `is_knowledge_record_active` helper to query PostgreSQL and check if matched files are active or deleted.
+  - Automatically unlinks and removes orphaned local staging/output files belonging to soft-deleted records.
+
+---
+
+## [1.5.0] - 2026-09-24
+
+### Database Performance, Resource Optimization & RAG Enhancements
+- **Composite Performance Indexes (`alembic/versions/a9b8c7d6e5f4_add_performance_composite_indexes.py`)**:
+  - `ix_chat_messages_session_created`: Composite index on `chat_messages(session_id, created_at)`.
+  - `ix_chat_session_user_status`: Composite index on `chat_session(user_id, status)`.
+  - `ix_chat_session_branch_id`: Index on `chat_session(branch_id)`.
+  - `ix_chat_session_feedback_issue`: Composite index on `chat_session(has_data_issue, session_type)`.
+  - `ix_chat_session_updated_at`: Index on `chat_session(updated_at)`.
+  - `ix_user_branch_branch_status`: Composite index on `user_branch(branch_id, status)`.
+- **Streaming Connection Management (`app/api/routers/chats.py`)**:
+  - Isolated database query execution from long-running SSE response generation.
+  - Pushed chat search filters (`summary`, `doctor`, `branch`, `content`) directly into PostgreSQL subqueries and applied SQL `LIMIT`/`OFFSET` pagination.
+- **Batch Hydration (`app/api/routers/`)**:
+  - `users.py`: Batch loads roles, direct accesses, doctor branch assignments, and monthly token usages in `_hydrate_users_batch`.
+  - `roles.py`: Batch loads assigned accesses and user counts in `_hydrate_roles_batch`.
+  - `branches.py`: Batch loads token usages, configuration overrides, and doctor assignments in `_hydrate_branches_batch`.
+  - `search.py`: Batch resolves users, branches, message counts, and first messages.
+  - `knowledge.py`: Pushes pagination and status filters to SQL query level.
+- **RBAC Caching & Dynamic Invalidation (`app/api/dependencies.py`, `app/api/routers/users.py`, `app/api/routers/roles.py`)**:
+  - Cached permission checks for 5 minutes via `_USER_ACCESS_CACHE`.
+  - Added cache eviction via `invalidate_user_access_cache` across user and role mutations and deletions.
+- **Bounded Chat Title Service History (`app/services/chat_title_service.py`)**:
+  - Limited initial message fetch to the first 4 messages for LLM conversation titling.
+- **Vector Store JSONB & Coalesce Filtering (`app/rag/services/vector_store.py`)**:
+  - Switched `DocumentChunk.metadata_` from generic `JSON` to PostgreSQL `JSONB`.
+  - Handled `excluded_categories` using `not_(func.coalesce(DocumentChunk.metadata_["categories"].astext, "").ilike(f"%{item}%"))`.
+- **Medical Agent Feature Flag (`app/rag/services/rag_generator.py`)**:
+  - Added `settings.rag_agent_enabled` guard check before orchestrating multi-step medical tool agents.
+
+---
+
 ## [1.4.0] - 2026-09-14
 
 ### AWS S3 IRSA Authentication, Storage Diagnostics & Clean Relative Image Paths

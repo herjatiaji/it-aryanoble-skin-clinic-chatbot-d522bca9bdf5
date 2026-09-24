@@ -197,3 +197,25 @@ class RAGEvaluationResponse(BaseModel):
     total_queries: int = Field(..., description="Total benchmark queries evaluated")
     evaluated_at: str = Field(..., description="ISO Timestamp of benchmark execution")
     details: List[RAGEvaluationQueryResult] = Field(default=[], description="Detailed per-query evaluation breakdowns")
+
+
+# --- Canonical Knowledge Model Re-exports ---
+from app.rag.canonical import (
+    CanonicalChunk,
+    KnowledgeScope,
+    KnowledgeType,
+    EvidenceUnit,
+    CompactEvidencePack,
+    generate_stable_chunk_id,
+    build_canonical_retrieval_text,
+    ImageType,
+    ImageRelevance,
+    ImageDisplayPolicy,
+    ClinicalStage,
+    FORM_FACTOR_TAXONOMY,
+    extract_canonical_form_factor,
+    generate_stable_image_id,
+    ImageProvenance,
+    ImageProvenanceRegistry,
+    classify_image_provenance
+)

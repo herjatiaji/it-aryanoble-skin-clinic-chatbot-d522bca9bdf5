@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     embedding_model_name: str = "text-embedding-3-small"
     
     # Reranker Settings
+    enable_reranker: bool = False
     reranker_model_name: str = "BAAI/bge-reranker-base"
     rerank_confidence_threshold: float = 0.1
     
@@ -43,9 +44,9 @@ class Settings(BaseSettings):
     # BM25 Settings
     bm25_index_path: str = "./data/output/bm25_index.pkl"
 
-    # AI Agent Settings (ReAct Agent with Tool Calling)
-    rag_agent_enabled: bool = True
-    rag_agent_max_iterations: int = 5
+    # AI Agent Settings (ReAct Agent with Tool Calling - disabled by default for 3-5x faster responses)
+    rag_agent_enabled: bool = False
+    rag_agent_max_iterations: int = 3
 
     # Guardrails Settings
     guardrails_enabled: bool = True
