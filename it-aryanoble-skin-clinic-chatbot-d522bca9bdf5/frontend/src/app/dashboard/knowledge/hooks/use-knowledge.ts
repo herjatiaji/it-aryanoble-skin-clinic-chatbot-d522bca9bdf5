@@ -138,7 +138,8 @@ export const useKnowledgeBatch = (batchId: string) => {
 	});
 };
 
-const CHUNK_SIZE_BYTES = 4 * 1024 * 1024; // 4 MB chunks to stay strictly within corporate 5 MB WAF/Ingress limits
+// 800 KB chunks (0.78 MB) to strictly comply with corporate 3-layer restrictions (Layer 1: 1 MB limit, Layer 2 & 3: 5 MB limits)
+const CHUNK_SIZE_BYTES = 800 * 1024;
 
 async function uploadFilesWithAutoChunking(
 	data: FormData,
@@ -167,7 +168,7 @@ async function uploadFilesWithAutoChunking(
 		return response.data;
 	}
 
-	// Multi-file or large file: process file-by-file with 4 MB chunk slicing
+	// Multi-file or large file: process file-by-file with 800 KB chunk slicing (Layer 1 safe)
 	let lastResponseData: any = null;
 	const totalFiles = files.length;
 
@@ -276,7 +277,7 @@ export const useReplaceKnowledgeFile = () => {
 			const file = formData.get("file") as File | null;
 			const prompt = (formData.get("prompt") as string) || "";
 
-			// If file exceeds 4 MB, slice and upload via chunked pipeline
+			// If file exceeds 800 KB, slice and upload via chunked pipeline (Layer 1 safe)
 			if (file && typeof file.size === "number" && file.size > CHUNK_SIZE_BYTES) {
 				const totalChunks = Math.ceil(file.size / CHUNK_SIZE_BYTES);
 				const uploadId =
