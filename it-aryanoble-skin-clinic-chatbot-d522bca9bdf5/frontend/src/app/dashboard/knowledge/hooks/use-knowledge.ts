@@ -169,7 +169,7 @@ async function uploadFilesWithAutoChunking(
 	}
 
 	// Multi-file or large file: process file-by-file with 800 KB chunk slicing (Layer 1 safe)
-	let lastResponseData: any = null;
+	let lastResponseData: unknown = null;
 	const totalFiles = files.length;
 
 	for (let fIdx = 0; fIdx < totalFiles; fIdx++) {

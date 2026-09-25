@@ -301,6 +301,7 @@ export function ChatPreview({
 	const [localSummary, setLocalSummary] = useState(incomingSummary);
 	const [backupManualSummary, setBackupManualSummary] = useState<string>("");
 	const [manualEditRevision, setManualEditRevision] = useState(0);
+	const [editingImage, setEditingImage] = useState<{ url: string; label: string; oldAlt?: string } | null>(null);
 
 	const handleRetryFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
 		const selectedFile = e.target.files?.[0];
@@ -340,6 +341,9 @@ export function ChatPreview({
 
 	/** Handles image deletion from edit mode: removes the ![alt](src) markdown tag and directly updates local summary */
 	const handleDeleteImage = (src: string, altText?: string) => {
+		if (editingImage?.url === src) {
+			setEditingImage(null);
+		}
 		const currentContent =
 			localSummary ||
 			(firstAssistantIndex >= 0 ? messages[firstAssistantIndex]?.content : "") ||
@@ -403,11 +407,91 @@ export function ChatPreview({
 		setManualEditRevision((r) => r + 1);
 	};
 
+	/** Handles editing image label: updates ![oldAlt](src) with ![newAlt](src) in markdown and reloads editor */
+	const handleUpdateImageLabel = (src: string, newAlt: string, oldAlt?: string) => {
+		const cleanNewAlt = newAlt.trim();
+		if (!cleanNewAlt) {
+			toast.error("Label gambar tidak boleh kosong");
+			return;
+		}
+
+		if (cleanNewAlt === oldAlt?.trim()) {
+			setEditingImage(null);
+			return;
+		}
+
+		const currentContent =
+			localSummary ||
+			(firstAssistantIndex >= 0 ? messages[firstAssistantIndex]?.content : "") ||
+			aiSummary ||
+			knowledge?.ai_summary ||
+			"";
+		if (!currentContent || !src) return;
+
+		// Normalize src: strip resolved backend base URL to get the relative path as stored in markdown
+		const backendBase = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api").replace(/\/api\/?$/, "");
+		let normalizedSrc = src.trim();
+		if (normalizedSrc.startsWith(backendBase)) {
+			normalizedSrc = normalizedSrc.slice(backendBase.length);
+		}
+		const decodedSrc = decodeURIComponent(normalizedSrc);
+		const encodedSrc = encodeURI(decodedSrc);
+		const srcVariants = Array.from(new Set([normalizedSrc, decodedSrc, src.trim(), encodedSrc]));
+
+		let updated = currentContent;
+
+		// 1. Try matching by exact URL variants
+		for (const variant of srcVariants) {
+			const escapedSrc = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const exactPattern = new RegExp(`!\\[[^\\]]*\\]\\s*\\(\\s*${escapedSrc}(?:\\s+["'][^"']*["'])?\\s*\\)`, "g");
+			if (exactPattern.test(updated)) {
+				updated = updated.replace(exactPattern, `![${cleanNewAlt}](${variant})`);
+				break;
+			}
+			const htmlPattern = new RegExp(`<img([^>]*src=["']${escapedSrc}["'][^>]*)alt=["'][^"']*["']([^>]*\\/?>)`, "gi");
+			if (htmlPattern.test(updated)) {
+				updated = updated.replace(htmlPattern, `<img$1alt="${cleanNewAlt}"$2`);
+				break;
+			}
+		}
+
+		// 2. Fallback to basename filename matching if not yet replaced
+		if (updated === currentContent) {
+			const filename = normalizedSrc.split("/").pop()?.split("?")[0];
+			if (filename && filename.length > 3) {
+				const escapedFile = filename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+				const filePattern = new RegExp(`!\\[[^\\]]*\\]\\s*\\(([^)]*${escapedFile}[^)]*)\\)`, "g");
+				if (filePattern.test(updated)) {
+					updated = updated.replace(filePattern, `![${cleanNewAlt}]($1)`);
+				}
+			}
+		}
+
+		// 3. Fallback to oldAlt matching if still not replaced
+		if (updated === currentContent && oldAlt && oldAlt.trim().length > 2) {
+			const escapedOldAlt = oldAlt.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const altPattern = new RegExp(`!\\[\\s*${escapedOldAlt}\\s*\\]\\s*\\(([^)]+)\\)`, "g");
+			if (altPattern.test(updated)) {
+				updated = updated.replace(altPattern, `![${cleanNewAlt}]($1)`);
+			}
+		}
+
+		if (updated !== currentContent) {
+			handleSummaryChange(updated);
+			setManualEditRevision((r) => r + 1);
+			setEditingImage(null);
+			toast.success("Label gambar berhasil diperbarui");
+		} else {
+			toast.error("Gagal menemukan tag gambar di dokumen");
+		}
+	};
+
 	const handleStartManualEdit = (currentDisplayContent: string) => {
 		const rawText = localSummary || currentDisplayContent;
 		const initialText = rawText.replace(/!\[([^\]]*)\]\s*\n+\s*\(([^)]+)\)/g, "![$1]($2)");
 		setBackupManualSummary(initialText);
 		setLocalSummary(initialText);
+		setEditingImage(null);
 		setManualEditRevision((r) => r + 1);
 		setIsManualEditing(true);
 	};
@@ -415,6 +499,7 @@ export function ChatPreview({
 	const handleCancelManualEdit = () => {
 		setLocalSummary(backupManualSummary);
 		onChangeSummary?.(backupManualSummary);
+		setEditingImage(null);
 		setIsManualEditing(false);
 	};
 
@@ -422,6 +507,7 @@ export function ChatPreview({
 		const finalVal = typeof newSummary === "string" ? newSummary : localSummary;
 		handleSummaryChange(finalVal);
 		setBackupManualSummary(finalVal);
+		setEditingImage(null);
 		setIsManualEditing(false);
 	};
 
@@ -1557,49 +1643,144 @@ export function ChatPreview({
 										Foto Terdeteksi ({docImages.length} foto)
 									</span>
 									<span className="text-[11px] text-blue-700 hidden sm:inline">
-										— Foto visual dalam dokumen. Klik ikon sampah merah untuk menghapus foto dari dokumen.
+										— Foto visual dalam dokumen. Klik ikon pensil untuk mengubah label gambar, atau ikon sampah merah untuk menghapus foto.
 									</span>
 								</div>
 								<div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 pt-1">
-									{docImages.map((img, idx) => (
-										<div
-											key={idx}
-											className="flex items-center gap-2.5 bg-white border border-blue-200/80 rounded-lg p-2 shadow-xs hover:border-blue-400 transition-colors"
-										>
-											{/* eslint-disable-next-line @next/next/no-img-element */}
-											<img
-												src={resolveImageUrl(img.url)}
-												alt={img.alt || `Gambar ${idx + 1}`}
-												className="size-14 object-contain rounded-md border border-zinc-200 bg-zinc-50 shrink-0"
-												onError={(e) => {
-													(e.currentTarget as HTMLElement).style.display = "none";
-												}}
-											/>
-											<div className="flex flex-col flex-1 min-w-0 pr-1">
-												<span className="text-xs font-semibold text-zinc-900 truncate" title={img.alt}>
-													{img.alt || `Gambar ${idx + 1}`}
-												</span>
-												<span className="text-[10px] text-zinc-400 font-mono truncate" title={img.url}>
-													{img.url.split("/").pop()}
-												</span>
-												<span className="text-[10px] text-emerald-600 font-medium">
-													✓ Terhubung ke dokumen
-												</span>
-											</div>
-											<button
-												type="button"
-												onClick={(e) => {
-													e.stopPropagation();
-													e.preventDefault();
-													handleDeleteImage(img.url, img.alt);
-												}}
-												className="size-8 rounded-lg bg-red-50 hover:bg-red-600 text-red-600 hover:text-white border border-red-200 hover:border-red-600 flex items-center justify-center shrink-0 cursor-pointer transition-colors shadow-xs"
-												title={`Hapus foto ${img.alt || ""}`}
+									{docImages.map((img, idx) => {
+										const isEditing = editingImage?.url === img.url;
+										return (
+											<div
+												key={idx}
+												className={`flex items-center gap-2.5 bg-white border rounded-lg p-2 shadow-xs transition-colors ${
+													isEditing
+														? "border-blue-500 ring-1 ring-blue-500/20"
+														: "border-blue-200/80 hover:border-blue-400"
+												}`}
 											>
-												<RiDeleteBin7Line className="size-4" />
-											</button>
-										</div>
-									))}
+												{/* eslint-disable-next-line @next/next/no-img-element */}
+												<img
+													src={resolveImageUrl(img.url)}
+													alt={img.alt || `Gambar ${idx + 1}`}
+													className="size-14 object-contain rounded-md border border-zinc-200 bg-zinc-50 shrink-0"
+													onError={(e) => {
+														(e.currentTarget as HTMLElement).style.display = "none";
+													}}
+												/>
+												{isEditing ? (
+													<div className="flex flex-col flex-1 min-w-0 pr-1 gap-1">
+														<input
+															type="text"
+															value={editingImage.label}
+															onChange={(e) =>
+																setEditingImage({ ...editingImage, label: e.target.value })
+															}
+															onKeyDown={(e) => {
+																if (e.key === "Enter") {
+																	e.preventDefault();
+																	handleUpdateImageLabel(img.url, editingImage.label, img.alt);
+																} else if (e.key === "Escape") {
+																	e.preventDefault();
+																	setEditingImage(null);
+																}
+															}}
+															placeholder="Label gambar..."
+															autoFocus
+															className="w-full text-xs font-medium text-zinc-900 bg-white border border-blue-400 focus:border-blue-600 focus:ring-1 focus:ring-blue-500 rounded px-1.5 py-0.5 outline-none"
+														/>
+														<span className="text-[10px] text-zinc-400 font-mono truncate" title={img.url}>
+															{img.url.split("/").pop()}
+														</span>
+													</div>
+												) : (
+													<div className="flex flex-col flex-1 min-w-0 pr-1">
+														<span
+															className="text-xs font-semibold text-zinc-900 truncate cursor-pointer hover:text-blue-600 transition-colors"
+															title={`Klik untuk edit: ${img.alt || `Gambar ${idx + 1}`}`}
+															onClick={(e) => {
+																e.stopPropagation();
+																setEditingImage({
+																	url: img.url,
+																	label: img.alt || `Gambar ${idx + 1}`,
+																	oldAlt: img.alt,
+																});
+															}}
+														>
+															{img.alt || `Gambar ${idx + 1}`}
+														</span>
+														<span className="text-[10px] text-zinc-400 font-mono truncate" title={img.url}>
+															{img.url.split("/").pop()}
+														</span>
+														<span className="text-[10px] text-emerald-600 font-medium">
+															✓ Terhubung ke dokumen
+														</span>
+													</div>
+												)}
+
+												<div className="flex items-center gap-1 shrink-0">
+													{isEditing ? (
+														<>
+															<button
+																type="button"
+																onClick={(e) => {
+																	e.stopPropagation();
+																	e.preventDefault();
+																	handleUpdateImageLabel(img.url, editingImage.label, img.alt);
+																}}
+																className="size-8 rounded-lg bg-emerald-50 hover:bg-emerald-600 text-emerald-600 hover:text-white border border-emerald-200 hover:border-emerald-600 flex items-center justify-center shrink-0 cursor-pointer transition-colors shadow-xs"
+																title="Simpan label (Enter)"
+															>
+																<RiCheckLine className="size-4" />
+															</button>
+															<button
+																type="button"
+																onClick={(e) => {
+																	e.stopPropagation();
+																	e.preventDefault();
+																	setEditingImage(null);
+																}}
+																className="size-8 rounded-lg bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border border-zinc-200 flex items-center justify-center shrink-0 cursor-pointer transition-colors shadow-xs"
+																title="Batal (Esc)"
+															>
+																<RiCloseLine className="size-4" />
+															</button>
+														</>
+													) : (
+														<>
+															<button
+																type="button"
+																onClick={(e) => {
+																	e.stopPropagation();
+																	e.preventDefault();
+																	setEditingImage({
+																		url: img.url,
+																		label: img.alt || `Gambar ${idx + 1}`,
+																		oldAlt: img.alt,
+																	});
+																}}
+																className="size-8 rounded-lg bg-blue-50 hover:bg-blue-600 text-blue-600 hover:text-white border border-blue-200 hover:border-blue-600 flex items-center justify-center shrink-0 cursor-pointer transition-colors shadow-xs"
+																title="Edit label gambar"
+															>
+																<RiEdit2Line className="size-4" />
+															</button>
+															<button
+																type="button"
+																onClick={(e) => {
+																	e.stopPropagation();
+																	e.preventDefault();
+																	handleDeleteImage(img.url, img.alt);
+																}}
+																className="size-8 rounded-lg bg-red-50 hover:bg-red-600 text-red-600 hover:text-white border border-red-200 hover:border-red-600 flex items-center justify-center shrink-0 cursor-pointer transition-colors shadow-xs"
+																title={`Hapus foto ${img.alt || ""}`}
+															>
+																<RiDeleteBin7Line className="size-4" />
+															</button>
+														</>
+													)}
+												</div>
+											</div>
+										);
+									})}
 								</div>
 							</div>
 						);
@@ -1608,6 +1789,7 @@ export function ChatPreview({
 					<WysiwygEditor
 						key={manualEditRevision}
 						initialContent={localSummary || displayContent}
+						onChange={handleSummaryChange}
 						onSave={(markdown) => handleSaveManualEdit(markdown)}
 						onCancel={handleCancelManualEdit}
 					/>
