@@ -5,6 +5,7 @@ export const knowledgeKeys = {
     [...knowledgeKeys.lists(), filters] as const,
   details: () => [...knowledgeKeys.all, "detail"] as const,
   detail: (id: string) => [...knowledgeKeys.details(), id] as const,
+  qualityGate: (id: string) => [...knowledgeKeys.all, "quality-gate", id] as const,
 };
 
 export const projectKeys = {

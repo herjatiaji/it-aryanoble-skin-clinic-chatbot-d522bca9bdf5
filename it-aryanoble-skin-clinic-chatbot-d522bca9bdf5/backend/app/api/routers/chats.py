@@ -131,7 +131,7 @@ async def process_ai_response(session_id: uuid.UUID, user_query: str):
 
             response_dict = pipeline.generate_answer(
                 query=user_query,
-                top_k=5,
+                top_k=8,
                 rerank=True,
                 history=history,
                 filter_metadata=doctor_filter,
@@ -176,12 +176,15 @@ async def _is_file_attachments_allowed(db: AsyncSession) -> bool:
     val = res.scalar_one_or_none()
     return val == "true"
 
-async def _build_doctor_filter_metadata(db: AsyncSession, user: User) -> dict:
+async def _build_doctor_filter_metadata(db: AsyncSession, user: User) -> Optional[dict]:
     """Build filter_metadata dict for doctor-level knowledge restrictions.
     
     Mirrors the logic in knowledge.py to ensure consistent access control
     across both the Knowledge Chat and Live Chat endpoints.
     """
+    from app.models.user import UserType
+    if getattr(user, "type", None) == UserType.STAFF:
+        return None
     # Fetch user branches (active connections only)
     stmt_branches = select(UserBranch.branch_id).where(
         UserBranch.user_id == user.id,
@@ -506,7 +509,9 @@ async def list_chat_sessions(
             total_pages=total_pages
         )
 
-    result = await db.execute(stmt)
+    # For unpaginated requests, cap at 200 items to prevent database exhaustion and lag
+    capped_stmt = stmt.limit(200)
+    result = await db.execute(capped_stmt)
     sessions = result.scalars().all()
     return await _hydrate_chat_sessions_batch(list(sessions), db)
 
@@ -685,7 +690,12 @@ async def list_chat_messages(
     # Get messages
     stmt_msg = select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc())
     result_msg = await db.execute(stmt_msg)
-    return result_msg.scalars().all()
+    messages = result_msg.scalars().all()
+    from app.services.storage import expand_image_urls_in_markdown
+    for msg in messages:
+        if msg.role == "ASSISTANT" and msg.content:
+            msg.content = expand_image_urls_in_markdown(msg.content)
+    return messages
 
 from fastapi import Form, UploadFile, File
 import json
@@ -790,7 +800,11 @@ async def create_chat_message(
         raise HTTPException(status_code=403, detail=reason)
 
     # Build doctor-level knowledge filter (branch, dr_type, excluded categories)
-    doctor_filter = await _build_doctor_filter_metadata(db, current_user)
+    from app.models.user import UserType
+    if chat_session.branch_id is None or current_user.type == UserType.STAFF:
+        doctor_filter = None
+    else:
+        doctor_filter = await _build_doctor_filter_metadata(db, current_user)
 
     # Effective query enriched with attachment text
     effective_query = content
@@ -824,8 +838,11 @@ async def create_chat_message(
 
     # For user message, we stream the AI response back via SSE without holding the DB connection
     async def sse_generator():
+        from app.services.storage import expand_image_urls_in_markdown
+        from app.rag.utils.text_hygiene import normalize_markdown_text
         try:
             ai_response_text = ""
+            final_answer_text = ""
             context_chunks = []
             
             # Immediately yield keep-alive comment so reverse proxy/client connection never times out
@@ -882,6 +899,10 @@ async def create_chat_message(
                                 context_chunks = [c.get("content", "") for c in ctx_json.get("chunks", [])]
                             except Exception:
                                 pass
+                        elif chunk.startswith('{"type": "final"'):
+                            final_answer_text = json.loads(chunk).get("content") or ""
+                            final_answer_text = expand_image_urls_in_markdown(normalize_markdown_text(final_answer_text))
+                            yield f"data: {json.dumps({'type': 'final', 'content': final_answer_text})}\n\n"
                         else:
                             ai_response_text += chunk
                             payload = json.dumps({"type": "token", "content": chunk})
@@ -895,15 +916,22 @@ async def create_chat_message(
                 producer_task.cancel()
                 pinger_task.cancel()
             
+            # Every stream ends with the answer to display: early-exit paths (guardrail rejection,
+            # greeting, closing, no evidence, restricted access) produce no validated 'final' of their own
+            if not final_answer_text and ai_response_text:
+                final_answer_text = expand_image_urls_in_markdown(normalize_markdown_text(ai_response_text))
+                yield f"data: {json.dumps({'type': 'final', 'content': final_answer_text})}\n\n"
+
             # Signal end of stream
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             
-            # Persist the final AI response to DB in a dedicated short-lived session (<5ms)
+            # Persist the validated final answer (falls back to raw tokens if finalization did not run)
+            final_content = final_answer_text or expand_image_urls_in_markdown(normalize_markdown_text(ai_response_text))
             async with AsyncSessionLocal() as session:
                 ai_msg = ChatMessage(
                     session_id=session_id,
                     role="ASSISTANT",
-                    content=ai_response_text
+                    content=final_content
                 )
                 session.add(ai_msg)
                 stmt_upd = update(ChatSession).where(ChatSession.id == session_id).values(updated_at=datetime.now(timezone.utc))
@@ -1066,7 +1094,11 @@ async def stream_chat_message(
         raise HTTPException(status_code=403, detail=reason)
 
     # Build doctor-level knowledge filter (branch, dr_type, excluded categories)
-    doctor_filter = await _build_doctor_filter_metadata(db, current_user)
+    from app.models.user import UserType
+    if chat_session.branch_id is None or current_user.type == UserType.STAFF:
+        doctor_filter = None
+    else:
+        doctor_filter = await _build_doctor_filter_metadata(db, current_user)
 
     # Effective query enriched with attachment text
     effective_query = content
@@ -1100,8 +1132,11 @@ async def stream_chat_message(
     existing_summary = chat_session.summary
 
     async def sse_generator():
+        from app.services.storage import expand_image_urls_in_markdown
+        from app.rag.utils.text_hygiene import normalize_markdown_text
         try:
             ai_response_text = ""
+            final_answer_text = ""
             context_chunks = []
             
             # Immediately yield keep-alive comment so reverse proxy/client connection never times out
@@ -1122,7 +1157,7 @@ async def stream_chat_message(
                 try:
                     async for chunk in pipeline.generate_answer_stream(
                         query=effective_query,
-                        top_k=5,
+                        top_k=8,
                         rerank=True,
                         history=history,
                         filter_metadata=doctor_filter or None,
@@ -1158,6 +1193,10 @@ async def stream_chat_message(
                                 context_chunks = [c.get("content", "") for c in ctx_json.get("chunks", [])]
                             except Exception:
                                 pass
+                        elif chunk.startswith('{"type": "final"'):
+                            final_answer_text = json.loads(chunk).get("content") or ""
+                            final_answer_text = expand_image_urls_in_markdown(normalize_markdown_text(final_answer_text))
+                            yield f"data: {json.dumps({'type': 'final', 'content': final_answer_text})}\n\n"
                         else:
                             ai_response_text += chunk
                             payload = json.dumps({"type": "token", "content": chunk})
@@ -1171,15 +1210,22 @@ async def stream_chat_message(
                 producer_task.cancel()
                 pinger_task.cancel()
             
+            # Every stream ends with the answer to display: early-exit paths (guardrail rejection,
+            # greeting, closing, no evidence, restricted access) produce no validated 'final' of their own
+            if not final_answer_text and ai_response_text:
+                final_answer_text = expand_image_urls_in_markdown(normalize_markdown_text(ai_response_text))
+                yield f"data: {json.dumps({'type': 'final', 'content': final_answer_text})}\n\n"
+
             # Signal end of stream
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             
-            # Persist the final AI response to DB in a dedicated short-lived session (<5ms)
+            # Persist the validated final answer (falls back to raw tokens if finalization did not run)
+            final_content = final_answer_text or expand_image_urls_in_markdown(normalize_markdown_text(ai_response_text))
             async with AsyncSessionLocal() as session:
                 ai_msg = ChatMessage(
                     session_id=session_id,
                     role="ASSISTANT",
-                    content=ai_response_text
+                    content=final_content
                 )
                 session.add(ai_msg)
                 stmt_upd = update(ChatSession).where(ChatSession.id == session_id).values(updated_at=datetime.now(timezone.utc))

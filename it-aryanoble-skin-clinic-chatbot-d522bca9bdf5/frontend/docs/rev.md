@@ -38,3 +38,8 @@ This document tracks frontend adjustments and new features that require backend 
 - All doctors synced from CIS that are "Active" now automatically have AI access.
 - Removed the AI access warning banner and restriction logic from the Doctor Chat Interface (`/doctor`).
 - Backend `has_ai_access` column was dropped. API endpoints now allow all active doctors to use the AI chat and exclude soft-deleted (inactive) doctors.
+
+## 2026-10-25 - Knowledge Root List Scope & Markdown Table Cells
+
+- The main Knowledge Base table (`/dashboard/knowledge`) now lists only root-level documents (`GET /knowledge/?project_id=none`). Documents moved into a project appear only inside that project. Summary cards still count all documents (`project_id=all`).
+- Markdown table cells (chat, knowledge preview, chat history) now render inline markdown: product images in cells show as compact thumbnails and `**bold**` renders as bold instead of raw `![...](url)` / `**` text. No API change.

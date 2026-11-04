@@ -37,8 +37,22 @@ class IngestionPipeline:
         # 2. Custom Chunking (Section-Aware + Semantic)
         chunks = self.chunker.chunk_document(parse_result)
         if not chunks:
-            logger.error("Chunking failed or produced no chunks.")
-            return ""
+            logger.warning("CustomChunker produced no chunks, generating fallback chunks from parse_result...")
+            fallback_chunks = []
+            if hasattr(parse_result, "pages") and parse_result.pages:
+                for p in parse_result.pages:
+                    text = p.get("text", "") if isinstance(p, dict) else str(p)
+                    if text and len(text.strip()) > 10:
+                        fallback_chunks.append({
+                            "text": text.strip(),
+                            "page": p.get("page", 1) if isinstance(p, dict) else 1,
+                            "type": "fallback"
+                        })
+            if fallback_chunks:
+                chunks = fallback_chunks
+            else:
+                logger.error("Chunking failed or produced no chunks.")
+                return ""
             
         # 3. Metadata Extraction & Formatting
         language = self.metadata_enricher.detect_document_language(parse_result)
@@ -93,17 +107,17 @@ class IngestionPipeline:
         async def _worker(fp: str, idx: int) -> dict:
             fname = os.path.basename(fp)
             async with semaphore:
-                logger.info(f"⚡ [BATCH: {b_id}] [FILE {idx+1}/{len(file_paths)}: {fname}] Starting parallel ingestion...")
+                logger.info(f"[BATCH: {b_id}] [FILE {idx+1}/{len(file_paths)}: {fname}] Starting parallel ingestion...")
                 try:
                     out = await asyncio.to_thread(self.ingest_file, fp)
                     if out:
-                        logger.info(f"✅ [BATCH: {b_id}] [FILE: {fname}] Successfully ingested -> {out}")
+                        logger.info(f"[BATCH: {b_id}] [FILE: {fname}] Successfully ingested -> {out}")
                         return {"file_name": fname, "file_path": fp, "status": "SUCCESS", "output_file": out}
                     else:
-                        logger.warning(f"⚠️ [BATCH: {b_id}] [FILE: {fname}] Ingestion yielded empty output.")
+                        logger.warning(f"[BATCH: {b_id}] [FILE: {fname}] Ingestion yielded empty output.")
                         return {"file_name": fname, "file_path": fp, "status": "FAILED", "error": "Empty parse output"}
                 except Exception as e:
-                    logger.error(f"❌ [BATCH: {b_id}] [FILE: {fname}] Ingestion exception: {e}")
+                    logger.error(f"[BATCH: {b_id}] [FILE: {fname}] Ingestion exception: {e}")
                     return {"file_name": fname, "file_path": fp, "status": "FAILED", "error": str(e)}
 
         tasks = [_worker(fp, i) for i, fp in enumerate(file_paths)]

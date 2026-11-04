@@ -116,6 +116,17 @@ The mock service provides a reference implementation (`frontend/src/components/F
 3. **Internal Component Flow**:
    - **Session Creation**: Calls `POST /api/chats/` with `{ branch_code: "011" }`.
    - **SSE Streaming**: Calls `POST /api/chats/{session_id}/messages/stream` to receive real-time streaming answer tokens.
+     SSE events (`data: {json}`), in order:
+
+     | `type` | Payload | Client action |
+     | :--- | :--- | :--- |
+     | `context` | `results`: retrieved sources | Optional (citations) |
+     | `token` | `content`: text fragment of the **unverified** draft | Do not display; keep a progress indicator (e.g. "Memverifikasi jawaban…") |
+     | `final` | `content`: full verified answer (lines unsupported by the knowledge base removed, product images injected, image URLs resolved) | Display `content` as the assistant message |
+     | `done` | — | Stop reading. If no `final` arrived (backend error path), display the accumulated `token` text |
+
+     The `final` content is identical to what `GET /api/chats/{id}/messages` returns. Draft tokens can contain statements
+     that verification later removes, so they must not be shown to doctors.
    - **Attachments**: Supports multipart file uploads to `POST /api/chats/{session_id}/messages`.
 
 ---

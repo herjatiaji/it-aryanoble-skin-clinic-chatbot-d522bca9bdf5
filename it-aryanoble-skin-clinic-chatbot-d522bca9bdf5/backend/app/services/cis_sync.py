@@ -64,27 +64,61 @@ def parse_cis_int(raw_id: Any) -> Optional[int]:
             pass
         return None
 
+def is_status_inactive(raw_status: Any) -> bool:
+    """
+    Evaluates whether status indicates inactive or deleted based on CIS specification:
+    - 1: Active -> returns False (is_inactive = False)
+    - 0: Deleted -> returns True (is_inactive = True)
+    - 2: Inactive -> returns True (is_inactive = True)
+    Also handles booleans and descriptive strings:
+    - True, "1", "active" -> False
+    - False, "0", "2", "false", "inactive", "nonaktif", "deleted", "d" -> True
+    """
+    if raw_status is None:
+        return False
+    if isinstance(raw_status, bool):
+        return not raw_status
+    if isinstance(raw_status, (int, float)):
+        return int(raw_status) in (0, 2)
+    s = str(raw_status).strip().lower()
+    if s in ("0", "2", "false", "inactive", "nonaktif", "deleted", "d"):
+        return True
+    if s in ("1", "true", "active"):
+        return False
+    return False
+
 async def _upsert_single_branch(db: AsyncSession, data: Dict[str, Any]) -> Branch:
     """Upsert an individual branch record."""
     if not isinstance(data, dict):
         raise ValueError(f"Invalid branch data: expected dict, got {type(data).__name__}")
         
-    raw_id = data.get("id") or data.get("branch_id")
+    raw_id = data.get("id") or data.get("branch_id") or data.get("branchId")
     external_id = parse_cis_int(raw_id)
-    if external_id is None:
-        raise ValueError(f"Invalid or missing branch id in payload: '{raw_id}' must be an integer")
+    code = data.get("code") or data.get("branch_code") or data.get("branchCode")
+    if external_id is None and not code:
+        raise ValueError(f"Invalid or missing branch id/code in payload: '{raw_id}' must be an integer or code must be provided")
         
-    name = str(data.get("name") or "")
-    code = data.get("code")
+    name = str(data.get("name") or data.get("branch_name") or data.get("branchName") or "")
     ecosystem = data.get("ecosystem", "Erha")
     raw_status = data.get("status", 1)
-    is_inactive = str(raw_status).strip() == "0"
+    is_inactive = is_status_inactive(raw_status)
     
-    stmt = select(Branch).where(
-        func.lower(Branch.ecosystem) == ecosystem.lower(),
-        Branch.external_id == external_id
-    )
-    branch = (await db.execute(stmt)).scalar_one_or_none()
+    branch = None
+    if external_id is not None:
+        stmt = select(Branch).where(
+            func.lower(Branch.ecosystem) == ecosystem.lower(),
+            Branch.external_id == external_id
+        )
+        branch = (await db.execute(stmt)).scalar_one_or_none()
+        
+    if not branch and code:
+        code_stmt = select(Branch).where(
+            func.lower(Branch.ecosystem) == ecosystem.lower(),
+            Branch.code == code
+        )
+        branch = (await db.execute(code_stmt)).scalar_one_or_none()
+        if branch and external_id is not None:
+            branch.external_id = external_id
     
     if not branch:
         branch = Branch(
@@ -123,13 +157,28 @@ async def upsert_branch_payload(db: AsyncSession, data: Union[Dict[str, Any], Li
 
 async def delete_branch_payload(db: AsyncSession, branch_id: Any, ecosystem: Optional[str] = None):
     """Soft delete a branch record."""
-    external_id = parse_cis_int(branch_id)
-    if external_id is None:
-        return
-    stmt = select(Branch).where(Branch.external_id == external_id)
-    if ecosystem:
-        stmt = stmt.where(func.lower(Branch.ecosystem) == ecosystem.lower())
-    branch = (await db.execute(stmt)).scalar_one_or_none()
+    code = None
+    if isinstance(branch_id, dict):
+        raw_id = branch_id.get("id") or branch_id.get("branch_id") or branch_id.get("branchId")
+        code = branch_id.get("code") or branch_id.get("branch_code") or branch_id.get("branchCode")
+        ecosystem = ecosystem or branch_id.get("ecosystem")
+    else:
+        raw_id = branch_id
+    external_id = parse_cis_int(raw_id)
+    
+    branch = None
+    if external_id is not None:
+        stmt = select(Branch).where(Branch.external_id == external_id)
+        if ecosystem:
+            stmt = stmt.where(func.lower(Branch.ecosystem) == ecosystem.lower())
+        branch = (await db.execute(stmt)).scalar_one_or_none()
+        
+    if not branch and code:
+        code_stmt = select(Branch).where(Branch.code == code)
+        if ecosystem:
+            code_stmt = code_stmt.where(func.lower(Branch.ecosystem) == ecosystem.lower())
+        branch = (await db.execute(code_stmt)).scalar_one_or_none()
+        
     if branch:
         branch.deleted_at = datetime.now(timezone.utc)
         await db.flush()
@@ -139,7 +188,13 @@ async def _upsert_single_doctor(db: AsyncSession, data: Dict[str, Any]) -> User:
     if not isinstance(data, dict):
         raise ValueError(f"Invalid doctor data: expected dict, got {type(data).__name__}")
         
-    raw_id = data.get("id") or data.get("cis_id") or data.get("doctor_cis_id")
+    raw_id = (
+        data.get("id") 
+        or data.get("cis_id") 
+        or data.get("doctor_cis_id") 
+        or data.get("cisId") 
+        or data.get("doctorId")
+    )
     cis_id = parse_cis_int(raw_id)
     if cis_id is None:
         raise ValueError(f"Invalid or missing doctor id in payload: '{raw_id}' must be an integer")
@@ -158,12 +213,12 @@ async def _upsert_single_doctor(db: AsyncSession, data: Dict[str, Any]) -> User:
             logger.warning(f"Email '{email}' already assigned to user {existing_email_user.id}. Setting email to None for CIS doctor {cis_id}.")
             email = None
 
-    employee_id = data.get("nik") or data.get("employee_id")
-    dr_type = data.get("user_type_name") or data.get("dr_type")
-    user_type_code = str(data.get("user_type")) if data.get("user_type") is not None else None
+    employee_id = data.get("nik") or data.get("employee_id") or data.get("employeeId")
+    dr_type = data.get("userTypeName") or data.get("user_type_name") or data.get("dr_type") or data.get("drType")
+    user_type_code = str(data.get("userType") or data.get("user_type")) if (data.get("userType") is not None or data.get("user_type") is not None) else None
     ecosystem = data.get("ecosystem", "Erha")
     raw_status = data.get("status", 1)
-    is_inactive = str(raw_status).strip() == "0"
+    is_inactive = is_status_inactive(raw_status)
     
     stmt = select(User).where(User.cis_id == cis_id)
     user = (await db.execute(stmt)).scalar_one_or_none()
@@ -199,14 +254,19 @@ async def _upsert_single_doctor(db: AsyncSession, data: Dict[str, Any]) -> User:
     await db.flush()
 
     # Process nested branch associations if provided in doctor payload
-    branches_list = data.get("user_branchs") or data.get("user_branches") or data.get("branches")
+    branches_list = (
+        data.get("userBranches") 
+        or data.get("user_branchs") 
+        or data.get("user_branches") 
+        or data.get("branches")
+    )
     if branches_list and isinstance(branches_list, list):
         seen_branches = set()
         for item in branches_list:
             if not isinstance(item, dict):
                 continue
-            b_raw_id = item.get("branch_id") or item.get("id")
-            b_code = item.get("branch_code") or item.get("code")
+            b_raw_id = item.get("branchId") or item.get("branch_id") or item.get("id")
+            b_code = item.get("branchCode") or item.get("branch_code") or item.get("code")
             
             dedup_key = (str(b_raw_id) if b_raw_id is not None else None, str(b_code) if b_code else None)
             if dedup_key in seen_branches:
@@ -237,16 +297,18 @@ async def _upsert_single_doctor(db: AsyncSession, data: Dict[str, Any]) -> User:
             ub_stmt = select(UserBranch).where(UserBranch.user_id == user.id, UserBranch.branch_id == branch.id)
             ub = (await db.execute(ub_stmt)).scalar_one_or_none()
             
-            status_val = 0 if str(item.get("status", 1)).strip() == "0" else 1
+            raw_ub_status = item.get("status", 1)
+            ub_is_inactive = is_status_inactive(raw_ub_status)
+            status_val = 0 if ub_is_inactive else 1
 
             if not ub:
                 ub = UserBranch(user_id=user.id, branch_id=branch.id, status=status_val)
-                if status_val == 0:
+                if ub_is_inactive:
                     ub.deleted_at = datetime.now(timezone.utc)
                 db.add(ub)
             else:
                 ub.status = status_val
-                if status_val == 0:
+                if ub_is_inactive:
                     ub.deleted_at = datetime.now(timezone.utc)
                 else:
                     ub.deleted_at = None
@@ -279,9 +341,16 @@ async def upsert_user_branch_payload(db: AsyncSession, data_list: Union[Dict[str
     for item in data_list:
         if not isinstance(item, dict):
             continue
-        raw_user_id = item.get("user_id") or item.get("doctor_id") or item.get("cis_id")
-        raw_branch_id = item.get("branch_id")
-        branch_code = item.get("branch_code") or item.get("code")
+        raw_user_id = (
+            item.get("userId") 
+            or item.get("user_id") 
+            or item.get("doctor_id") 
+            or item.get("doctorId") 
+            or item.get("cis_id") 
+            or item.get("cisId")
+        )
+        raw_branch_id = item.get("branchId") or item.get("branch_id")
+        branch_code = item.get("branchCode") or item.get("branch_code") or item.get("code")
         
         if raw_user_id is None or (raw_branch_id is None and not branch_code):
             logger.warning(f"Skipping user_branch mapping, missing user_id or branch info: {item}")
@@ -328,16 +397,18 @@ async def upsert_user_branch_payload(db: AsyncSession, data_list: Union[Dict[str
         ub_stmt = select(UserBranch).where(UserBranch.user_id == user.id, UserBranch.branch_id == branch.id)
         ub = (await db.execute(ub_stmt)).scalar_one_or_none()
         
-        status_val = 0 if str(item.get("status", 1)).strip() == "0" else 1
+        raw_ub_status = item.get("status", 1)
+        ub_is_inactive = is_status_inactive(raw_ub_status)
+        status_val = 0 if ub_is_inactive else 1
             
         if not ub:
             ub = UserBranch(user_id=user.id, branch_id=branch.id, status=status_val)
-            if status_val == 0:
+            if ub_is_inactive:
                 ub.deleted_at = datetime.now(timezone.utc)
             db.add(ub)
         else:
             ub.status = status_val
-            if status_val == 0:
+            if ub_is_inactive:
                 ub.deleted_at = datetime.now(timezone.utc)
             else:
                 ub.deleted_at = None
@@ -346,7 +417,17 @@ async def upsert_user_branch_payload(db: AsyncSession, data_list: Union[Dict[str
 
 async def delete_doctor_payload(db: AsyncSession, cis_id: Any):
     """Soft delete a doctor record."""
-    doctor_cis_id = parse_cis_int(cis_id)
+    if isinstance(cis_id, dict):
+        raw_id = (
+            cis_id.get("id") 
+            or cis_id.get("cis_id") 
+            or cis_id.get("doctor_cis_id") 
+            or cis_id.get("cisId") 
+            or cis_id.get("doctorId")
+        )
+    else:
+        raw_id = cis_id
+    doctor_cis_id = parse_cis_int(raw_id)
     if doctor_cis_id is None:
         return
     stmt = select(User).where(User.cis_id == doctor_cis_id, User.type == UserType.DOCTOR)
@@ -375,7 +456,13 @@ async def bulk_sync_payload(db: AsyncSession, data: Dict[str, Any]) -> Dict[str,
     raw_doctors = data.get("users") or data.get("doctors") or data.get("doctor") or []
     doctors_data = raw_doctors if isinstance(raw_doctors, list) else [raw_doctors]
     
-    raw_user_branches = data.get("user_branches") or data.get("user_branchs") or data.get("doctor_branches") or []
+    raw_user_branches = (
+        data.get("userBranches") 
+        or data.get("user_branches") 
+        or data.get("user_branchs") 
+        or data.get("doctor_branches") 
+        or []
+    )
     user_branches_data = raw_user_branches if isinstance(raw_user_branches, list) else [raw_user_branches]
     
     prune_omitted = bool(data.get("prune_omitted", False))

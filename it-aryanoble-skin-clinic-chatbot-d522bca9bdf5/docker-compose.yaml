@@ -42,8 +42,8 @@ services:
       target: development
     container_name: skin_clinic_backend
     restart: always
-    cpus: 2.0
-    mem_limit: 6144m
+    cpus: 1.5
+    mem_limit: 2048m
     ports:
       - "8000:8000"
     command: ["/app/start.sh", "prod"]
@@ -85,14 +85,14 @@ services:
     container_name: skin_clinic_frontend
     restart: always
     ports:
-      - "3000:3000"
+      - "3005:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000/api}
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://127.0.0.1:8000/api}
       - CI=true
-      - NODE_OPTIONS=--max-old-space-size=1024
+      - NODE_OPTIONS=--max-old-space-size=768
       - WATCHPACK_POLLING=true
-    cpus: 2
-    mem_limit: 1536m
+    cpus: 1.5
+    mem_limit: 1024m
     depends_on:
       backend:
         condition: service_healthy

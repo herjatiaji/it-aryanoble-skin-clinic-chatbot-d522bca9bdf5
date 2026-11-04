@@ -12,6 +12,9 @@ import type {
 	KnowledgeTextIngestResponse,
 	KnowledgeEditRequest,
 	VisibilitySettings,
+	QualityGateResponse,
+	UpdateEvidencePayload,
+	RegenerateSummaryResponse,
 } from "../api/types";
 
 export const invalidateAllKnowledgeQueries = (
@@ -31,6 +34,7 @@ export const invalidateAllKnowledgeQueries = (
 
 	if (options?.knowledgeId) {
 		queryClient.invalidateQueries({ queryKey: knowledgeKeys.detail(options.knowledgeId), refetchType: "all" });
+		queryClient.invalidateQueries({ queryKey: knowledgeKeys.qualityGate(options.knowledgeId), refetchType: "all" });
 	}
 	if (Array.isArray(options?.knowledgeIds)) {
 		options.knowledgeIds.forEach((kid) => {
@@ -50,17 +54,23 @@ export const invalidateAllKnowledgeQueries = (
 	}
 };
 
-export const useKnowledgeBaseList = () => {
+/**
+ * @param projectId project UUID, "none" for root-level documents only (not assigned to any project),
+ *                  or undefined/"all" for every document across projects.
+ */
+export const useKnowledgeBaseList = (projectId?: string | null) => {
+	const effectiveProjectId = projectId || "all";
+	const queryKey = knowledgeKeys.list({ projectId: effectiveProjectId });
 	return useQuery({
-		queryKey: knowledgeKeys.all,
+		queryKey,
 		queryFn: async (): Promise<KnowledgeResponse[]> => {
-			const response = await api.get("/knowledge/");
+			const response = await api.get("/knowledge/", { params: { project_id: effectiveProjectId } });
 			return response.data;
 		},
 		refetchInterval: (query) => {
 			const data = query.state.data;
 			if (data?.some((item) => item.status === "PROCESSING")) {
-				return 3000;
+				return 4000;
 			}
 			return false;
 		},
@@ -75,10 +85,13 @@ export const useKnowledgeDetail = (id: string) => {
 			return response.data;
 		},
 		enabled: !!id,
+		// A deleted document answers 404: show it at once instead of retrying a request that cannot succeed
+		retry: (failureCount, error) =>
+			(error as { response?: { status?: number } })?.response?.status !== 404 && failureCount < 3,
 		refetchInterval: (query) => {
 			const data = query.state.data;
 			if (data?.status === "PROCESSING") {
-				return 1500;
+				return 3500;
 			}
 			// If newly PENDING but summary or accuracy is still settling from background task, continue polling
 			const meta = data?.metadata as Record<string, unknown> | undefined;
@@ -88,7 +101,7 @@ export const useKnowledgeDetail = (id: string) => {
 				meta?.ai_confidence !== undefined ||
 				meta?.confidence_score !== undefined;
 			if (data?.status === "PENDING" && (!data?.ai_summary || !hasAccuracy)) {
-				return 1500;
+				return 3500;
 			}
 			return false;
 		},
@@ -105,9 +118,9 @@ export const useKnowledgeBatch = (batchId: string) => {
 		enabled: !!batchId,
 		refetchInterval: (query) => {
 			const data = query.state.data;
-			// 1. If data is not yet loaded or empty, poll rapidly
+			// 1. If data is not yet loaded or empty, poll with reasonable interval
 			if (!data || data.length === 0) {
-				return 1500;
+				return 3500;
 			}
 
 			// 2. If any document is still PROCESSING or in PARSING state
@@ -115,13 +128,13 @@ export const useKnowledgeBatch = (batchId: string) => {
 				(item) => item.status === "PROCESSING" || (item.metadata as Record<string, unknown>)?.status === "PARSING",
 			);
 			if (isAnyProcessing) {
-				return 1500;
+				return 3500;
 			}
 
 			// 3. If batch only has 1 document so far, continue polling because
 			// subsequent documents in the multi-file batch might still be extracting in the background
 			if (data.length === 1) {
-				return 1500;
+				return 3500;
 			}
 
 			// 4. If multi-document batch (>= 2) and any non-rejected doc is missing batch_summary,
@@ -130,7 +143,7 @@ export const useKnowledgeBatch = (batchId: string) => {
 				(item) => item.status !== "REJECTED" && !(item.metadata as Record<string, unknown>)?.batch_summary,
 			);
 			if (data.length >= 2 && hasMissingSummary) {
-				return 1500;
+				return 3500;
 			}
 
 			return false;
@@ -149,6 +162,7 @@ async function uploadFilesWithAutoChunking(
 	const prompt = (data.get("prompt") as string) || "";
 	const replaceExisting = data.get("replace_existing") !== "false";
 	const projectId = (data.get("project_id") as string) || undefined;
+	const existingBatchId = (data.get("batch_id") as string) || undefined;
 
 	// Check if any file exceeds 4 MB threshold
 	const hasLargeFile = files.some(
@@ -169,8 +183,17 @@ async function uploadFilesWithAutoChunking(
 	}
 
 	// Multi-file or large file: process file-by-file with 800 KB chunk slicing (Layer 1 safe)
-	let lastResponseData: unknown = null;
 	const totalFiles = files.length;
+	const sharedBatchId =
+		existingBatchId ||
+		(totalFiles > 1
+			? typeof crypto !== "undefined" && crypto.randomUUID
+				? crypto.randomUUID()
+				: `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
+			: undefined);
+
+	const allDocumentResponses: unknown[] = [];
+	let lastResponseData: unknown = null;
 
 	for (let fIdx = 0; fIdx < totalFiles; fIdx++) {
 		const file = files[fIdx];
@@ -210,25 +233,50 @@ async function uploadFilesWithAutoChunking(
 			completeForm.append("total_chunks", totalChunks.toString());
 			if (prompt) completeForm.append("prompt", prompt);
 			if (projectId) completeForm.append("project_id", projectId);
+			if (sharedBatchId) completeForm.append("batch_id", sharedBatchId);
 			completeForm.append("replace_existing", replaceExisting ? "true" : "false");
 
 			const compRes = await api.post("/knowledge/upload/complete", completeForm);
 			lastResponseData = compRes.data;
+			const rData = compRes.data as { documents?: unknown[]; knowledge_id?: string } | undefined;
+			if (rData?.documents) {
+				allDocumentResponses.push(...rData.documents);
+			} else if (rData?.knowledge_id) {
+				allDocumentResponses.push(rData);
+			}
 		} else {
 			// Single small file slice <= 4 MB
 			const singleForm = new FormData();
 			singleForm.append("file", file);
 			if (prompt) singleForm.append("prompt", prompt);
 			if (projectId) singleForm.append("project_id", projectId);
+			if (sharedBatchId) singleForm.append("batch_id", sharedBatchId);
 			singleForm.append("replace_existing", replaceExisting ? "true" : "false");
 
 			const resp = await api.post("/knowledge/upload", singleForm);
 			lastResponseData = resp.data;
+			const rData = resp.data as { documents?: unknown[]; knowledge_id?: string } | undefined;
+			if (rData?.documents) {
+				allDocumentResponses.push(...rData.documents);
+			} else if (rData?.knowledge_id) {
+				allDocumentResponses.push(rData);
+			}
 		}
 
 		if (progressCb) {
 			progressCb(Math.round(((fIdx + 1) / totalFiles) * 100));
 		}
+	}
+
+	if (totalFiles > 1 && sharedBatchId) {
+		return {
+			status: "success",
+			batch_id: sharedBatchId,
+			upload_batch_id: sharedBatchId,
+			total_files: totalFiles,
+			documents: allDocumentResponses,
+			message: `Processed ${totalFiles} documents in batch.`,
+		};
 	}
 
 	return lastResponseData;
@@ -373,6 +421,16 @@ export const useUpdateKnowledgeStatus = () => {
 	});
 };
 
+// A save or approval whose connection is cut before the server answers (proxy timeout, network drop) may still
+// complete on the server: the browser then only sees a network/CORS error with no response.
+export const connectionLost = (error: unknown) => {
+	const err = error as { response?: unknown; code?: string; message?: string } | undefined;
+	return !!err && !err.response && (err.code === "ERR_NETWORK" || err.code === "ECONNABORTED" || err.message === "Network Error");
+};
+
+const CONNECTION_LOST_MESSAGE =
+	"The connection to the server was lost before saving finished. The changes may have been saved; the document has been reloaded to show its current state.";
+
 export const useApproveKnowledge = () => {
 	const queryClient = useQueryClient();
 
@@ -381,12 +439,43 @@ export const useApproveKnowledge = () => {
 			const response = await api.post(`/knowledge/${id}/approve`);
 			return response.data;
 		},
-		onSuccess: (_, id) => {
-			toast.success("Document approved and indexed into AI Knowledge Base!");
+		onSuccess: (data, id) => {
+			if (data?.status === "partial") {
+				// Approved, but the chatbot index still serves the previous version
+				toast.warning(data.message || "Document approved, but it could not be published to the AI Knowledge Base.");
+			} else {
+				toast.success("Document approved and indexed into AI Knowledge Base!");
+			}
+			invalidateAllKnowledgeQueries(queryClient, { knowledgeId: id });
+		},
+		onError: (error: unknown, id) => {
+			if (connectionLost(error)) {
+				toast.warning(CONNECTION_LOST_MESSAGE);
+				invalidateAllKnowledgeQueries(queryClient, { knowledgeId: id });
+				return;
+			}
+			toast.error(getErrorMessage(error, "Failed to approve and index document."));
+		},
+	});
+};
+
+export const useReparseVisionKnowledge = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: async ({ id, pageNumbers }: { id: string; pageNumbers?: number[] }) => {
+			const response = await api.post(`/knowledge/${id}/reparse_vision`, {
+				page_numbers: pageNumbers,
+				max_pages: 1000,
+			});
+			return response.data;
+		},
+		onSuccess: (_, { id }) => {
+			toast.success("Dokumen berhasil di-reparse dengan Vision LLM!");
 			invalidateAllKnowledgeQueries(queryClient, { knowledgeId: id });
 		},
 		onError: (error: unknown) => {
-			toast.error(getErrorMessage(error, "Failed to approve and index document."));
+			toast.error(getErrorMessage(error, "Gagal memproses ulang dokumen dengan Vision."));
 		},
 	});
 };
@@ -481,7 +570,12 @@ export const useEditKnowledge = () => {
 			}
 			invalidateAllKnowledgeQueries(queryClient, { knowledgeId: variables.id });
 		},
-		onError: (error: unknown) => {
+		onError: (error: unknown, variables) => {
+			if (connectionLost(error)) {
+				toast.warning(CONNECTION_LOST_MESSAGE);
+				invalidateAllKnowledgeQueries(queryClient, { knowledgeId: variables.id });
+				return;
+			}
 			toast.error(getErrorMessage(error, "Failed to update document."));
 		},
 	});
@@ -530,6 +624,35 @@ export const useUpdateKnowledgeProject = () => {
 			if (!result?.hideToast) {
 				toast.success("Knowledge project updated successfully!");
 			}
+			// Optimistically remove from root list if assigned to a project
+			const filterOutOrUpdate = (oldData?: KnowledgeResponse[]) => {
+				// knowledgeKeys.all also matches detail and paginated queries, whose data is not a list
+				if (!Array.isArray(oldData)) return oldData;
+				if (variables.projectId && variables.projectId !== "none") {
+					return oldData.filter((item) => item.id !== variables.knowledgeId);
+				}
+				return oldData.map((item) => {
+					if (item.id === variables.knowledgeId) {
+						return {
+							...item,
+							project_id: variables.projectId,
+							metadata: {
+								...(item.metadata || {}),
+								project_id: variables.projectId,
+							},
+						};
+					}
+					return item;
+				});
+			};
+			queryClient.setQueriesData<KnowledgeResponse[]>(
+				{ queryKey: knowledgeKeys.list({ projectId: "none" }) },
+				filterOutOrUpdate,
+			);
+			queryClient.setQueriesData<KnowledgeResponse[]>(
+				{ queryKey: knowledgeKeys.all },
+				filterOutOrUpdate,
+			);
 			invalidateAllKnowledgeQueries(queryClient, { knowledgeId: variables?.knowledgeId });
 		},
 		onError: (error: unknown) => {
@@ -750,3 +873,126 @@ export const useSendGeneralChatMessage = (sessionId?: string | null) => {
 		},
 	});
 };
+
+
+// =============================================================================
+// PHASE 1.5 QUALITY GATE & STAGING OBSERVABILITY HOOKS (D1-a & D9)
+// =============================================================================
+
+export const useQualityGate = (
+	knowledgeId?: string | null,
+	options?: { summaryOnly?: boolean; enabled?: boolean },
+) => {
+	const summaryOnly = options?.summaryOnly ?? false;
+	const isEnabled = options?.enabled !== undefined ? options.enabled && !!knowledgeId : !!knowledgeId;
+
+	return useQuery({
+		queryKey: knowledgeId
+			? [...knowledgeKeys.qualityGate(knowledgeId), { summaryOnly }]
+			: ["knowledge-quality-gate-disabled"],
+		queryFn: async (): Promise<QualityGateResponse> => {
+			const response = await api.get(`/knowledge/${knowledgeId}/quality-gate`, {
+				params: summaryOnly ? { summary_only: true } : undefined,
+			});
+			return response.data;
+		},
+		enabled: isEnabled,
+		refetchInterval: (query) => {
+			const data = query.state.data;
+			if (data?.job_status === "PENDING" || data?.job_status === "PROCESSING") {
+				return 3000;
+			}
+			return false;
+		},
+	});
+};
+
+export const useRunQualityCheck = (knowledgeId: string) => {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: async () => {
+			const response = await api.post(`/knowledge/${knowledgeId}/quality-check`);
+			return response.data;
+		},
+		onSuccess: () => {
+			toast.success("Pemeriksaan kualitas dijadwalkan. Hasil muncul dalam 1-2 menit.");
+			// The check runs in the background: refresh the gate when it is likely done
+			setTimeout(() => {
+				queryClient.invalidateQueries({ queryKey: knowledgeKeys.qualityGate(knowledgeId) });
+			}, 90000);
+		},
+		onError: (error: unknown) => {
+			toast.error(getErrorMessage(error, "Gagal menjadwalkan pemeriksaan kualitas."));
+		},
+	});
+};
+
+export const useUpdateEvidence = (knowledgeId?: string | null) => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: async ({
+			evidenceId,
+			data,
+		}: {
+			evidenceId: string;
+			data: UpdateEvidencePayload;
+		}) => {
+			const response = await api.put(`/knowledge/${knowledgeId}/evidence/${evidenceId}`, data);
+			return response.data;
+		},
+		onSuccess: () => {
+			toast.success("Evidence berhasil diperbarui (SSOT Derivation: ADMIN_EDIT)");
+			if (knowledgeId) {
+				queryClient.invalidateQueries({ queryKey: knowledgeKeys.qualityGate(knowledgeId), refetchType: "all" });
+				queryClient.invalidateQueries({ queryKey: knowledgeKeys.detail(knowledgeId), refetchType: "all" });
+			}
+		},
+		onError: (error: unknown) => {
+			toast.error(getErrorMessage(error, "Gagal memperbarui evidence"));
+		},
+	});
+};
+
+export const useResolveEvidence = (knowledgeId?: string | null) => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: async (evidenceId: string) => {
+			const response = await api.post(`/knowledge/${knowledgeId}/evidence/${evidenceId}/resolve`);
+			return response.data;
+		},
+		onSuccess: () => {
+			toast.success("Item visual berhasil disetujui (VISION_COMPLETE). Knowledge Readiness Gate diperbarui.");
+			if (knowledgeId) {
+				queryClient.invalidateQueries({ queryKey: knowledgeKeys.qualityGate(knowledgeId), refetchType: "all" });
+				queryClient.invalidateQueries({ queryKey: knowledgeKeys.detail(knowledgeId), refetchType: "all" });
+			}
+		},
+		onError: (error: unknown) => {
+			toast.error(getErrorMessage(error, "Gagal menyelesaikan review evidence"));
+		},
+	});
+};
+
+export const useRegenerateSummary = (knowledgeId?: string | null) => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: async (): Promise<RegenerateSummaryResponse> => {
+			const response = await api.post(`/knowledge/${knowledgeId}/regenerate-summary`);
+			return response.data;
+		},
+		onSuccess: () => {
+			toast.success("Ringkasan berhasil diregenerasi dari Canonical Evidence SSOT.");
+			if (knowledgeId) {
+				queryClient.invalidateQueries({ queryKey: knowledgeKeys.detail(knowledgeId), refetchType: "all" });
+				queryClient.invalidateQueries({ queryKey: knowledgeKeys.qualityGate(knowledgeId), refetchType: "all" });
+			}
+		},
+		onError: (error: unknown) => {
+			toast.error(getErrorMessage(error, "Gagal meregenerasi ringkasan dari evidence"));
+		},
+	});
+};
+

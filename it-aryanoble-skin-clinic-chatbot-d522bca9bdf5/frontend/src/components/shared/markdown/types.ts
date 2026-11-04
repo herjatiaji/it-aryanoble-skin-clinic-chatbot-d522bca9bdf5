@@ -4,6 +4,7 @@ export interface KeyValueItem {
 }
 
 export interface CardData {
+	title?: string;
 	imageUrl?: string;
 	rawImageUrl?: string;
 	imageAlt?: string;
@@ -80,9 +81,16 @@ export interface ActionConfirmationData {
 	confirmationPrompt?: string;
 }
 
+export interface DataTableData {
+	title?: string;
+	headers: string[];
+	rows: string[][];
+}
+
 export interface Segment {
 	type:
 		| "markdown"
+		| "data-table"
 		| "product-card"
 		| "treatment-card"
 		| "regimen-card"
@@ -101,4 +109,5 @@ export interface Segment {
 	diagnosisData?: DiagnosisCardData;
 	pricingData?: TieredPricingCardData;
 	actionData?: ActionConfirmationData;
+	tableData?: DataTableData;
 }

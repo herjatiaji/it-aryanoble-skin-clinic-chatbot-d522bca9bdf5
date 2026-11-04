@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useMemo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -15,8 +15,9 @@ import { RegimenCard } from "./cards/regimen-card";
 import { TieredPricingCard } from "./cards/pricing-card";
 import { TreatmentCard } from "./cards/treatment-card";
 import { defaultMarkdownComponents, createEditableMarkdownComponents } from "./elements";
+import { FastMarkdownTable } from "./fast-markdown-table";
 import { parseMarkdownSegments } from "./parser";
-import { stripInternalMetadata } from "./utils";
+import { repairMarkdownTables, stripInternalMetadata } from "./utils";
 
 export interface MarkdownContentProps {
 	content: string;
@@ -25,12 +26,22 @@ export interface MarkdownContentProps {
 }
 
 export function MarkdownContent({ content, components, onDeleteImage }: MarkdownContentProps) {
-	const sanitizedContent = stripInternalMetadata(content);
-	const baseComponents = onDeleteImage
-		? { ...createEditableMarkdownComponents(onDeleteImage), ...components }
-		: { ...defaultMarkdownComponents, ...components };
-	const mergedComponents = baseComponents;
-	const segments = parseMarkdownSegments(sanitizedContent);
+	const sanitizedContent = useMemo(
+		() => repairMarkdownTables(stripInternalMetadata(content)),
+		[content]
+	);
+
+	const mergedComponents = useMemo(() => {
+		const base = onDeleteImage
+			? createEditableMarkdownComponents(onDeleteImage)
+			: defaultMarkdownComponents;
+		return components ? { ...base, ...components } : base;
+	}, [onDeleteImage, components]);
+
+	const segments = useMemo(
+		() => parseMarkdownSegments(sanitizedContent),
+		[sanitizedContent]
+	);
 
 	if (segments.length === 1 && segments[0].type === "markdown") {
 		return (
@@ -72,6 +83,17 @@ export function MarkdownContent({ content, components, onDeleteImage }: Markdown
 				}
 				if (seg.type === "action-confirmation-card" && seg.actionData) {
 					return <ActionConfirmationCard key={idx} data={seg.actionData} />;
+				}
+				if (seg.type === "data-table" && seg.tableData) {
+					return (
+						<FastMarkdownTable
+							key={idx}
+							headers={seg.tableData.headers}
+							rows={seg.tableData.rows}
+							title={seg.tableData.title}
+							onDeleteImage={onDeleteImage}
+						/>
+					);
 				}
 				return (
 					<ReactMarkdown key={idx} remarkPlugins={[remarkGfm]} components={mergedComponents}>

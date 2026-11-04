@@ -1,14 +1,33 @@
 "use client";
 
 import { ChatPreview } from "@/app/dashboard/knowledge/components/preview/chat-preview";
+import { QualityGatePanel } from "@/app/dashboard/knowledge/components/preview/quality-gate-panel";
 import { IngestSuccessModal } from "@/app/dashboard/knowledge/components/preview/ingest-success-modal";
 import { ConfirmationModal } from "@/components/shared/confirmation-modal";
 import { Button } from "@/components/ui/button";
-import { RiArrowLeftLine, RiDeleteBin7Line, RiEdit2Line, RiCheckLine, RiStopCircleLine, RiAlertLine, RiLoader4Line } from "@remixicon/react";
+import {
+	RiArrowLeftLine,
+	RiDeleteBin7Line,
+	RiEdit2Line,
+	RiCheckLine,
+	RiStopCircleLine,
+	RiAlertLine,
+	RiLoader4Line,
+	RiFileList3Line,
+	RiShieldCheckLine,
+	RiDownload2Line,
+} from "@remixicon/react";
 
 import { use, useState, useEffect } from "react";
 import { useSearchParams } from "next/navigation";
-import { useDeleteKnowledge, useKnowledgeDetail, useEditKnowledge, useApproveKnowledge } from "../hooks/use-knowledge";
+import {
+	useDeleteKnowledge,
+	useKnowledgeDetail,
+	useEditKnowledge,
+	connectionLost,
+	useApproveKnowledge,
+	useQualityGate,
+} from "../hooks/use-knowledge";
 import { useSession } from "@/hooks/use-session";
 import { useSafeBack } from "@/hooks/use-safe-back";
 import { VisibilitySettings, KnowledgeChunkItem, extractKnowledgeCategories } from "../api/types";
@@ -20,6 +39,8 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 	const searchParams = useSearchParams();
 	const initialEdit = searchParams.get("edit") === "true";
 	const { data, isLoading, error } = useKnowledgeDetail(id);
+	const { data: qgData } = useQualityGate(id, { summaryOnly: true });
+	const [currentView, setCurrentView] = useState<"preview" | "quality-gate">("preview");
 	const deleteMutation = useDeleteKnowledge();
 	const { user } = useSession();
 	const docStatus = (data?.status || "").toUpperCase();
@@ -51,19 +72,16 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 
 	useEffect(() => {
 		if (!isEditMode && data) {
-			const timer = setTimeout(() => {
-				const cats = extractKnowledgeCategories(data);
-				const vis = (data.metadata?.visibility_settings as VisibilitySettings) || { clinics: ["all"], doctor_types: ["all"], doctors: ["all"] };
-				const chunks = (data.metadata?.chunks as KnowledgeChunkItem[]) || [];
-				setPendingCategories(cats);
-				setPendingVisibilitySettings(vis);
-				setPendingTitle(data.title || "");
-				setPendingSummary(data.ai_summary || "");
-				setPendingChunks(chunks);
-			}, 0);
-			return () => clearTimeout(timer);
+			const cats = extractKnowledgeCategories(data);
+			const vis = (data.metadata?.visibility_settings as VisibilitySettings) || { clinics: ["all"], doctor_types: ["all"], doctors: ["all"] };
+			const chunks = (data.metadata?.chunks as KnowledgeChunkItem[]) || [];
+			setPendingCategories(cats);
+			setPendingVisibilitySettings(vis);
+			if (data.title) setPendingTitle(data.title);
+			if (data.ai_summary) setPendingSummary(data.ai_summary);
+			if (chunks.length > 0) setPendingChunks(chunks);
 		}
-	}, [data, isEditMode]);
+	}, [data?.id, data?.title, data?.ai_summary, data?.metadata, isEditMode]);
 
 	const handleDelete = async () => {
 		await deleteMutation.mutateAsync(id);
@@ -79,40 +97,52 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 	};
 
 	const handleSave = async (newTitle?: string) => {
-		await editKnowledge.mutateAsync({
-			id,
-			data: {
-				summary: pendingSummary || data?.ai_summary || "",
-				categories: pendingCategories,
-				visibility_settings: pendingVisibilitySettings,
-				title: typeof newTitle === "string" ? newTitle : pendingTitle,
-				chunks: pendingChunks.length > 0 ? pendingChunks : undefined,
-			},
-		});
-		setIsEditMode(false);
-	};
-
-	const handleApprove = async () => {
-		if (
-			(pendingCategories && pendingCategories.length > 0) ||
-			pendingVisibilitySettings ||
-			pendingTitle ||
-			(pendingChunks && pendingChunks.length > 0) ||
-			(pendingSummary && pendingSummary !== data?.ai_summary)
-		) {
+		try {
 			await editKnowledge.mutateAsync({
 				id,
 				data: {
 					summary: pendingSummary || data?.ai_summary || "",
 					categories: pendingCategories,
 					visibility_settings: pendingVisibilitySettings,
-					title: pendingTitle,
+					title: typeof newTitle === "string" ? newTitle : pendingTitle,
 					chunks: pendingChunks.length > 0 ? pendingChunks : undefined,
 				},
-				hideToast: true,
 			});
+		} catch (error) {
+			// The hook already told the user. A lost connection may still have saved: show the reloaded document;
+			// any other failure keeps the edits open to correct and retry.
+			if (connectionLost(error)) setIsEditMode(false);
+			return;
 		}
-		await approveKnowledge.mutateAsync(id);
+		setIsEditMode(false);
+	};
+
+	const handleApprove = async () => {
+		try {
+			if (
+				(pendingCategories && pendingCategories.length > 0) ||
+				pendingVisibilitySettings ||
+				pendingTitle ||
+				(pendingChunks && pendingChunks.length > 0) ||
+				(pendingSummary && pendingSummary !== data?.ai_summary)
+			) {
+				await editKnowledge.mutateAsync({
+					id,
+					data: {
+						summary: pendingSummary || data?.ai_summary || "",
+						categories: pendingCategories,
+						visibility_settings: pendingVisibilitySettings,
+						title: pendingTitle,
+						chunks: pendingChunks.length > 0 ? pendingChunks : undefined,
+					},
+					hideToast: true,
+				});
+			}
+			await approveKnowledge.mutateAsync(id);
+		} catch {
+			// Reported by the mutation hooks (with a reload when the connection was lost)
+			return;
+		}
 		if (typeof window !== "undefined") {
 			localStorage.removeItem(`chat_preview_${id}`);
 		}
@@ -200,7 +230,55 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 					</div>
 				</div>
 
+				{/* Center: View Switcher (Preview vs Quality Gate) */}
+				<div className="flex items-center gap-1 bg-zinc-100 p-1 rounded-lg border border-zinc-200">
+					<button
+						type="button"
+						onClick={() => setCurrentView("preview")}
+						className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
+							currentView === "preview"
+								? "bg-white text-zinc-900 shadow-xs"
+								: "text-zinc-600 hover:text-zinc-900"
+						}`}
+					>
+						<RiFileList3Line className="size-3.5" />
+						Preview & Chat
+					</button>
+					<button
+						type="button"
+						onClick={() => setCurrentView("quality-gate")}
+						className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
+							currentView === "quality-gate"
+								? "bg-white text-zinc-900 shadow-xs"
+								: "text-zinc-600 hover:text-zinc-900"
+						}`}
+					>
+						<RiShieldCheckLine className="size-3.5 text-blue-600" />
+						Quality Gate & Observability (D9)
+						{qgData?.readiness && (
+							<span
+								className={`ml-1 text-[10px] font-bold px-1.5 py-0.2 rounded-full ${
+									qgData.readiness.is_ready
+										? "bg-emerald-100 text-emerald-800"
+										: "bg-amber-100 text-amber-800 animate-pulse"
+								}`}
+							>
+								{qgData.readiness.is_ready ? "Ready" : `${qgData.readiness.unresolved_items} Review`}
+							</span>
+						)}
+					</button>
+				</div>
+
 				<div className="flex items-center gap-2">
+					<Button
+						variant="outline"
+						onClick={() => window.open(`/api/knowledge/${id}/file`, "_blank")}
+						className="gap-2 border-gray-200 bg-white text-zinc-700 hover:bg-zinc-50 rounded-lg px-3.5 h-10 font-medium text-sm transition-colors cursor-pointer shadow-none"
+						title="View / Download original uploaded file"
+					>
+						<RiDownload2Line className="size-4 text-zinc-500" />
+						View Original File
+					</Button>
 					{docStatus === "PROCESSING" && (
 						<Button
 							onClick={() => setIsCancelModalOpen(true)}
@@ -225,14 +303,34 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 					)}
 					{hasWriteAccess && docStatus === "PENDING" && (
 						<Button
-							onClick={() => setIsApproveModalOpen(true)}
+							onClick={() => {
+								if (qgData?.readiness && !qgData.readiness.is_ready) {
+									setCurrentView("quality-gate");
+								} else {
+									setIsApproveModalOpen(true);
+								}
+							}}
 							disabled={isLoading || approveKnowledge.isPending || editKnowledge.isPending}
-							className="gap-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg shadow-none h-10 px-4 font-medium text-sm transition-colors cursor-pointer"
+							className={`gap-2 rounded-lg shadow-none h-10 px-4 font-medium text-sm transition-colors cursor-pointer text-white ${
+								qgData?.readiness && !qgData.readiness.is_ready
+									? "bg-amber-600 hover:bg-amber-700"
+									: "bg-blue-600 hover:bg-blue-700"
+							}`}
+							title={
+								qgData?.readiness && !qgData.readiness.is_ready
+									? "Knowledge Readiness Gate (D9): Ada item yang membutuhkan review Admin sebelum approve"
+									: undefined
+							}
 						>
 							{approveKnowledge.isPending || editKnowledge.isPending ? (
 								<>
 									<RiLoader4Line className="size-4 animate-spin" />
 									Indexing...
+								</>
+							) : qgData?.readiness && !qgData.readiness.is_ready ? (
+								<>
+									<RiAlertLine className="size-4" />
+									Review Required ({qgData.readiness.unresolved_items})
 								</>
 							) : (
 								<>
@@ -278,28 +376,40 @@ export default function KnowledgeDetailPage({ params }: { params: Promise<{ id: 
 
 			{/* Main Content Area */}
 			<div className="flex flex-1 overflow-hidden">
-				{/* Left Column (Chat / Preview) */}
-				<ChatPreview
-					knowledgeId={id}
-					knowledge={data}
-					knowledgeStatus={data?.status}
-					aiSummary={pendingSummary || data?.ai_summary}
-					summaryValue={pendingSummary}
-					onChangeSummary={setPendingSummary}
-					fileName={data?.file_name}
-					initialPrompt={(data?.metadata?.initial_prompt as string) || undefined}
-					files={(data?.metadata?.files as { file_name: string; summary: string }[]) || []}
-					isDetailLoading={isLoading}
-					isEditMode={isEditMode}
-					categories={pendingCategories}
-					onChangeCategories={setPendingCategories}
-					chunks={pendingChunks}
-					visibilitySettings={pendingVisibilitySettings}
-					onChangeVisibilitySettings={setPendingVisibilitySettings}
-					title={pendingTitle}
-					onChangeTitle={setPendingTitle}
-					onSave={() => setIsSaveModalOpen(true)}
-				/>
+				{currentView === "preview" ? (
+					<ChatPreview
+						knowledgeId={id}
+						knowledge={data}
+						knowledgeStatus={data?.status}
+						aiSummary={pendingSummary || data?.ai_summary}
+						summaryValue={pendingSummary}
+						onChangeSummary={setPendingSummary}
+						fileName={data?.file_name}
+						initialPrompt={(data?.metadata?.initial_prompt as string) || undefined}
+						files={(data?.metadata?.files as { file_name: string; summary: string }[]) || []}
+						isDetailLoading={isLoading}
+						isEditMode={isEditMode}
+						categories={pendingCategories}
+						onChangeCategories={setPendingCategories}
+						chunks={pendingChunks}
+						visibilitySettings={pendingVisibilitySettings}
+						onChangeVisibilitySettings={setPendingVisibilitySettings}
+						title={pendingTitle}
+						onChangeTitle={setPendingTitle}
+						onSave={() => setIsSaveModalOpen(true)}
+					/>
+				) : (
+					<div className="flex-1 overflow-y-auto bg-zinc-50/50">
+						<QualityGatePanel
+							knowledgeId={id}
+							isEditMode={isEditMode}
+							onSummaryRegenerated={(newSummary) => {
+								setPendingSummary(newSummary);
+								setCurrentView("preview");
+							}}
+						/>
+					</div>
+				)}
 			</div>
 
 			{/* Save Knowledge Confirmation Modal (For Approved Docs) */}

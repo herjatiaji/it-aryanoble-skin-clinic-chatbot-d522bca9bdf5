@@ -48,6 +48,7 @@ import {
 	RiMoneyDollarCircleLine,
 	RiMore2Line,
 	RiSearchLine,
+	RiDownload2Line,
 } from "@remixicon/react";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
@@ -88,7 +89,8 @@ export function KnowledgeTable({
 	const [categoryFilter, setCategoryFilter] = useState("ALL");
 	const [isCategoryPopoverOpen, setIsCategoryPopoverOpen] = useState(false);
 	const [categorySearchQuery, setCategorySearchQuery] = useState("");
-	const { data: knowledgeList, isLoading, isError } = useKnowledgeBaseList();
+	// Without a selected project this is the root knowledge list: documents moved into a project live in that project only
+	const { data: knowledgeList, isLoading, isError } = useKnowledgeBaseList(selectedProjectId || "none");
 	const { data: availableCategories = [] } = useCategories();
 	const deleteMutation = useDeleteKnowledge();
 
@@ -180,6 +182,15 @@ export function KnowledgeTable({
 			}
 		}
 
+		const getDocProjectId = (d: KnowledgeResponse): string | null => {
+			return (
+				d.project_id ||
+				(d as unknown as { projectId?: string }).projectId ||
+				((d.metadata as Record<string, unknown> | null)?.project_id as string) ||
+				null
+			);
+		};
+
 		const rows: DisplayRowItem[] = [];
 
 		// 1. Process Batch Groups
@@ -204,7 +215,7 @@ export function KnowledgeTable({
 					rawItem: doc,
 					allFileNames: [doc.file_name],
 					categories: combinedCategories,
-					projectId: doc.project_id,
+					projectId: getDocProjectId(doc),
 					allDocIds: [doc.id],
 				});
 			} else {
@@ -248,7 +259,9 @@ export function KnowledgeTable({
 				}, docs[0].approved_at);
 
 				// Determine batch projectId: if any doc in batch has projectId
-				const batchProjectId = docs.find((d) => Boolean(d.project_id))?.project_id || null;
+				const batchProjectId = docs.reduce<string | null>((found, d) => {
+					return found || getDocProjectId(d);
+				}, null);
 
 				rows.push({
 					id: docs[0].id,
@@ -285,7 +298,7 @@ export function KnowledgeTable({
 				rawItem: doc,
 				allFileNames: [doc.file_name],
 				categories: extractKnowledgeCategories(doc),
-				projectId: doc.project_id,
+				projectId: getDocProjectId(doc),
 				allDocIds: [doc.id],
 			});
 		}
@@ -300,7 +313,12 @@ export function KnowledgeTable({
 
 	const filteredList = useMemo(() => {
 		const result = (displayRows || [])
-			.filter((item) => (selectedProjectId ? item.projectId === selectedProjectId : true))
+			.filter((item) => {
+				if (selectedProjectId && selectedProjectId !== "all") {
+					return item.projectId === selectedProjectId;
+				}
+				return true;
+			})
 			.filter((item) => (statusFilter !== "ALL" ? item.status === statusFilter : true))
 			.filter((item) => isCategoryMatch(item.categories, categoryFilter))
 			.filter(
@@ -866,6 +884,16 @@ export function KnowledgeTable({
 													>
 														<RiEyeLine className="size-3.5 mr-2" />
 														<span>View Details</span>
+													</DropdownMenuItem>
+													<DropdownMenuItem
+														onClick={(e) => {
+															e.stopPropagation();
+															window.open(`/api/knowledge/${row.id}/file`, "_blank");
+														}}
+														className="text-xs text-gray-700 cursor-pointer"
+													>
+														<RiDownload2Line className="size-3.5 mr-2" />
+														<span>View Original File</span>
 													</DropdownMenuItem>
 													<DropdownMenuItem
 														onClick={() => {

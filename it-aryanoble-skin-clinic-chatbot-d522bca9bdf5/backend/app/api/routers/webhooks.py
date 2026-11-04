@@ -12,7 +12,9 @@ from app.core.broadcaster import broadcaster
 from app.services.cis_sync import (
     get_cis_public_key,
     upsert_branch_payload,
+    delete_branch_payload,
     upsert_doctor_payload,
+    delete_doctor_payload,
     upsert_user_branch_payload,
     bulk_sync_payload
 )
@@ -47,7 +49,7 @@ async def verify_rsa_signature(request: Request, x_signature: Optional[str] = He
     return True
 
 class WebhookEventPayload(BaseModel):
-    event: str # "branch.upsert", "user.upsert", "user_branch.upsert", "bulk.sync"
+    event: str # "branch.upsert", "branch.delete", "user.upsert", "user.delete", "user_branch.upsert", "bulk.sync"
     data: Any # Can be dict or list depending on event
 
 @router.post("/cis", status_code=status.HTTP_200_OK, dependencies=[Depends(verify_rsa_signature)])
@@ -60,19 +62,39 @@ async def handle_cis_webhook(
     """
     try:
         summary: Dict[str, Any] = {}
-        if payload.event == "branch.upsert":
+        event_name = (payload.event or "").strip().lower()
+
+        if event_name in ("branch.upsert", "branch.create", "branch.update"):
             res = await upsert_branch_payload(db, payload.data)
             count = len(res) if isinstance(res, list) else 1
             summary = {"branches_upserted": count}
-        elif payload.event == "user.upsert":
+        elif event_name in ("branch.delete", "branch.remove"):
+            data = payload.data
+            if isinstance(data, list):
+                for item in data:
+                    await delete_branch_payload(db, item)
+                summary = {"branches_deleted": len(data)}
+            else:
+                await delete_branch_payload(db, data)
+                summary = {"branches_deleted": 1}
+        elif event_name in ("user.upsert", "user.create", "user.update", "doctor.upsert", "doctor.create", "doctor.update"):
             res = await upsert_doctor_payload(db, payload.data)
             count = len(res) if isinstance(res, list) else 1
             summary = {"doctors_upserted": count}
-        elif payload.event == "user_branch.upsert":
+        elif event_name in ("user.delete", "user.remove", "doctor.delete", "doctor.remove"):
+            data = payload.data
+            if isinstance(data, list):
+                for item in data:
+                    await delete_doctor_payload(db, item)
+                summary = {"doctors_deleted": len(data)}
+            else:
+                await delete_doctor_payload(db, data)
+                summary = {"doctors_deleted": 1}
+        elif event_name in ("user_branch.upsert", "user_branch.create", "user_branch.update", "doctor_branch.upsert"):
             data_list = payload.data if isinstance(payload.data, list) else [payload.data]
             await upsert_user_branch_payload(db, data_list)
             summary = {"mappings_upserted": len(data_list)}
-        elif payload.event == "bulk.sync":
+        elif event_name == "bulk.sync":
             summary = await bulk_sync_payload(db, payload.data)
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported event type: {payload.event}")

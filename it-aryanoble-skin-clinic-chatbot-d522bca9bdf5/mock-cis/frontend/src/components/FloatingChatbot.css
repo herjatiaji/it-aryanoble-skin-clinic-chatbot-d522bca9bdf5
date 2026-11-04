@@ -236,6 +236,9 @@
 	font-size: 0.75rem; /* 12px for maximum information density */
 	word-break: break-word;
 	text-align: left;
+	overflow: hidden;
+	min-width: 0;
+	max-width: 100%;
 	animation: fadeIn 0.15s ease-out;
 }
 
@@ -347,36 +350,107 @@
 	padding: 0;
 }
 
-/* Tables matching Dashboard: prose-table:border-blue-200/60 prose-th:bg-blue-100/50 prose-th:text-blue-900 */
-.fc-markdown-content table {
+/* Tables matching Dashboard: clean borders, crisp header, smooth horizontal scrolling without squeezing */
+.fc-table-wrapper {
 	width: 100%;
-	border-collapse: collapse;
-	margin: 0.375rem 0;
-	font-size: 0.6875rem; /* 11px */
-	border: 1px solid rgba(191, 219, 254, 0.6);
-	border-radius: 0.375rem;
-	overflow: hidden;
-	display: block;
+	max-width: 100%;
 	overflow-x: auto;
+	margin: 0.5rem 0;
+	border-radius: 0.5rem;
+	border: 1px solid #cbd5e1;
 	background-color: #ffffff;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+	-webkit-overflow-scrolling: touch;
+	display: block;
 }
 
-.fc-markdown-content th {
-	background-color: rgba(219, 234, 254, 0.5); /* bg-blue-100/50 */
-	padding: 0.25rem 0.5rem;
+.fc-table-wrapper::-webkit-scrollbar {
+	height: 6px;
+}
+.fc-table-wrapper::-webkit-scrollbar-track {
+	background: #f1f5f9;
+	border-radius: 4px;
+}
+.fc-table-wrapper::-webkit-scrollbar-thumb {
+	background: #cbd5e1;
+	border-radius: 4px;
+}
+.fc-table-wrapper::-webkit-scrollbar-thumb:hover {
+	background: #94a3b8;
+}
+
+.fc-markdown-content table,
+.fc-table {
+	min-width: 100%;
+	width: max-content;
+	border-collapse: collapse;
+	font-size: 0.725rem;
+	line-height: 1.45;
+	background-color: #ffffff;
+	table-layout: auto;
+	text-align: left;
+}
+
+.fc-thead {
+	background-color: #f1f5f9;
+	border-bottom: 2px solid #cbd5e1;
+}
+
+.fc-markdown-content th,
+.fc-th {
+	background-color: #f1f5f9;
+	padding: 0.45rem 0.75rem;
 	font-weight: 600;
 	text-align: left;
-	border-bottom: 1px solid rgba(191, 219, 254, 0.6);
-	color: #1e3a8a; /* text-blue-900 */
+	border-bottom: 2px solid #cbd5e1;
+	border-right: 1px solid #e2e8f0;
+	color: #0f172a;
+	white-space: nowrap;
+	min-width: 90px;
 }
 
-.fc-markdown-content td {
-	padding: 0.25rem 0.5rem;
-	border-bottom: 1px solid rgba(219, 234, 254, 0.6);
-	color: #09090b;
+.fc-markdown-content th:last-child,
+.fc-th:last-child {
+	border-right: none;
 }
 
-.fc-markdown-content tr:last-child td {
+.fc-tbody .fc-tr,
+.fc-markdown-content tr {
+	border-bottom: 1px solid #f1f5f9;
+	transition: background-color 0.15s ease;
+}
+
+.fc-tbody .fc-tr:nth-child(even),
+.fc-markdown-content tr:nth-child(even) {
+	background-color: #f8fafc;
+}
+
+.fc-tbody .fc-tr:hover,
+.fc-markdown-content tr:hover {
+	background-color: #f1f5f9;
+}
+
+.fc-markdown-content td,
+.fc-td {
+	padding: 0.45rem 0.75rem;
+	border-bottom: 1px solid #f1f5f9;
+	border-right: 1px solid #f1f5f9;
+	color: #1e293b;
+	white-space: normal;
+	word-break: normal;
+	overflow-wrap: break-word;
+	vertical-align: top;
+	min-width: 110px;
+	max-width: 360px;
+}
+
+.fc-markdown-content td:last-child,
+.fc-td:last-child {
+	border-right: none;
+}
+
+.fc-markdown-content tr:last-child td,
+.fc-tr:last-child .fc-td {
 	border-bottom: none;
 }
 
@@ -445,6 +519,12 @@
 	gap: 4px;
 	align-items: center;
 	padding: 0.375rem 0.625rem;
+}
+
+.fc-loading-label {
+	margin-left: 6px;
+	font-size: 0.75rem;
+	color: #71717a;
 }
 
 .fc-dot {
@@ -819,8 +899,8 @@
 .fc-img-card {
 	display: inline-flex;
 	flex-direction: column;
-	max-width: 100%;
-	width: 100%;
+	max-width: 220px;
+	width: auto;
 	margin: 0.375rem 0;
 	border-radius: 0.375rem;
 	border: 1px solid #e4e4e7;
@@ -843,7 +923,7 @@
 	align-items: center;
 	justify-content: center;
 	width: 100%;
-	max-height: 220px;
+	max-height: 140px;
 	padding: 0.375rem;
 	background-color: #ffffff;
 	overflow: hidden;
@@ -851,13 +931,33 @@
 
 .fc-img-preview {
 	max-width: 100%;
-	max-height: 200px;
+	max-height: 130px;
 	width: auto;
 	height: auto;
 	object-fit: contain;
 	display: block;
 	border-radius: 0.25rem;
 	transition: transform 0.2s ease;
+}
+
+/* Compact sizing when images are rendered inside table cells */
+.fc-td .fc-img-card {
+	max-width: 110px;
+	width: 100%;
+	margin: 0.125rem auto;
+}
+
+.fc-td .fc-img-container {
+	max-height: 80px;
+	padding: 0.125rem;
+}
+
+.fc-td .fc-img-preview {
+	max-height: 75px;
+}
+
+.fc-td .fc-img-caption {
+	display: none;
 }
 
 .fc-img-card:hover .fc-img-preview {
@@ -1008,81 +1108,6 @@
 	}
 }
 
-/* ==========================================================================
-   Responsive Clinical Tables for Doctorpedia Widget (GFM Tables)
-   ========================================================================== */
-.fc-table-wrapper {
-	margin: 0.65rem 0;
-	width: 100%;
-	max-width: 100%;
-	overflow-x: auto;
-	border-radius: 6px;
-	border: 1px solid #e2e8f0;
-	background: #ffffff;
-	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
-	-webkit-overflow-scrolling: touch;
-}
 
-.fc-table {
-	width: 100%;
-	min-width: 260px;
-	border-collapse: collapse;
-	text-align: left;
-	font-size: 0.735rem;
-	line-height: 1.4;
-	color: #1e293b;
-}
-
-.fc-thead {
-	background-color: #f8fafc;
-	border-bottom: 2px solid #cbd5e1;
-}
-
-.fc-th {
-	padding: 0.45rem 0.6rem;
-	font-weight: 600;
-	color: #0f172a;
-	white-space: nowrap;
-	border-right: 1px solid #f1f5f9;
-}
-
-.fc-th:last-child {
-	border-right: none;
-}
-
-.fc-tbody .fc-tr {
-	border-bottom: 1px solid #f1f5f9;
-	transition: background-color 0.15s ease;
-}
-
-.fc-tbody .fc-tr:nth-child(even) {
-	background-color: #fafbfc;
-}
-
-.fc-tbody .fc-tr:hover {
-	background-color: #f1f5f9;
-}
-
-.fc-tbody .fc-tr:last-child {
-	border-bottom: none;
-}
-
-.fc-td {
-	padding: 0.4rem 0.6rem;
-	color: #334155;
-	vertical-align: top;
-	border-right: 1px solid #f8fafc;
-}
-
-.fc-td:last-child {
-	border-right: none;
-}
-
-.fc-td img {
-	max-width: 90px;
-	border-radius: 4px;
-	margin-bottom: 0.25rem;
-	display: block;
-}
 
 

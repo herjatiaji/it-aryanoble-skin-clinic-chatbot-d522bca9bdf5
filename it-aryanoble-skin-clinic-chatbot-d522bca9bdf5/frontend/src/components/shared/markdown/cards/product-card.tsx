@@ -94,7 +94,9 @@ export function ProductCard({
 		}
 	}
 
-	if (!productName && imageAlt && !/^(?:product|foto produk|image|document image|gambar)$/i.test(imageAlt.trim())) {
+	if (!productName && data.title) {
+		productName = data.title;
+	} else if (!productName && imageAlt && !/^(?:product|foto produk|image|document image|gambar)$/i.test(imageAlt.trim())) {
 		productName = imageAlt.trim();
 	}
 

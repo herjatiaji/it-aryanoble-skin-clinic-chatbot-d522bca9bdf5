@@ -15,8 +15,9 @@ export function TreatmentCard({
 	const [imageError, setImageError] = useState(false);
 	const { imageUrl, rawImageUrl, imageAlt, items } = data;
 
-	let treatmentName = "";
+	let treatmentName = data.title || "";
 	let category = "";
+	let caseName = "";
 	let duration = "";
 	let downtime = "";
 	let anesthesia = "";
@@ -27,15 +28,17 @@ export function TreatmentCard({
 	const otherItems: KeyValueItem[] = [];
 
 	for (const item of items) {
-		const k = item.key.toLowerCase();
+		const k = item.key.toLowerCase().trim();
 		if (
 			k.includes("treatment name") ||
 			k.includes("nama tindakan") ||
 			k.includes("nama treatment")
 		) {
 			treatmentName = item.value;
-		} else if (k.includes("category") || k.includes("kategori") || k.includes("tipe")) {
+		} else if (k === "category" || k === "kategori" || k.startsWith("kategori ") || k.startsWith("category ") || k.includes("kategori") || k.includes("category")) {
 			category = item.value;
+		} else if (k === "case" || k === "kasus" || k.startsWith("case ") || k.startsWith("kasus ") || k.includes("case") || k.includes("kasus")) {
+			caseName = item.value;
 		} else if (k.includes("duration") || k.includes("durasi") || k.includes("waktu")) {
 			duration = item.value;
 		} else if (k.includes("downtime") || k.includes("pemulihan")) {
@@ -120,12 +123,19 @@ export function TreatmentCard({
 						</h4>
 					)}
 
-					{/* Category Badge */}
-					{category && (
-						<div className="flex items-center gap-1.5 flex-wrap my-0.5">
-							<span className="text-xs font-medium text-zinc-800 bg-zinc-100 px-2 py-0.5 rounded border border-zinc-200">
-								{category}
-							</span>
+					{/* Category & Case Badges */}
+					{(category || caseName) && (
+						<div className="flex items-center gap-1.5 flex-wrap my-1">
+							{category && (
+								<span className="text-xs font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200/80">
+									Kategori: {category}
+								</span>
+							)}
+							{caseName && (
+								<span className="text-xs font-semibold text-purple-700 bg-purple-50 px-2 py-0.5 rounded border border-purple-200/80">
+									Case: {caseName}
+								</span>
+							)}
 						</div>
 					)}
 

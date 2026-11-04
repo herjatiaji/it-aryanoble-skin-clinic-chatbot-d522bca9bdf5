@@ -6,6 +6,7 @@ import { useState, useEffect, forwardRef, useImperativeHandle } from "react";
 import {
 	useKnowledgeDetail,
 	useEditKnowledge,
+	connectionLost,
 	useDeleteKnowledge,
 } from "../../hooks/use-knowledge";
 import { KnowledgeResponse, VisibilitySettings, KnowledgeChunkItem, extractKnowledgeCategories } from "../../api/types";
@@ -68,34 +69,38 @@ export const BatchKnowledgeTabContent = forwardRef<BatchTabHandle, BatchKnowledg
 
 		useEffect(() => {
 			if (doc && !isEditMode) {
-				const timer = setTimeout(() => {
-					setPendingCategories(extractKnowledgeCategories(doc));
-					setPendingVisibilitySettings(
-						(doc.metadata?.visibility_settings as VisibilitySettings) || {
-							clinics: ["all"],
-							doctor_types: ["all"],
-							doctors: ["all"],
-						},
-					);
-					setPendingTitle(doc.title || "");
-					setPendingSummary(doc.ai_summary || "");
-					setPendingChunks((doc.metadata?.chunks as KnowledgeChunkItem[]) || []);
-				}, 0);
-				return () => clearTimeout(timer);
+				setPendingCategories(extractKnowledgeCategories(doc));
+				setPendingVisibilitySettings(
+					(doc.metadata?.visibility_settings as VisibilitySettings) || {
+						clinics: ["all"],
+						doctor_types: ["all"],
+						doctors: ["all"],
+					},
+				);
+				setPendingTitle(doc.title || "");
+				setPendingSummary(doc.ai_summary || "");
+				setPendingChunks((doc.metadata?.chunks as KnowledgeChunkItem[]) || []);
 			}
 		}, [doc, isEditMode]);
 
 		const handleSave = async (newTitle?: string) => {
-			await editKnowledge.mutateAsync({
-				id: knowledgeId,
-				data: {
-					summary: pendingSummary || doc?.ai_summary || "",
-					categories: pendingCategories,
-					visibility_settings: pendingVisibilitySettings,
-					title: typeof newTitle === "string" ? newTitle : pendingTitle,
-					chunks: pendingChunks.length > 0 ? pendingChunks : undefined,
-				},
-			});
+			try {
+				await editKnowledge.mutateAsync({
+					id: knowledgeId,
+					data: {
+						summary: pendingSummary || doc?.ai_summary || "",
+						categories: pendingCategories,
+						visibility_settings: pendingVisibilitySettings,
+						title: typeof newTitle === "string" ? newTitle : pendingTitle,
+						chunks: pendingChunks.length > 0 ? pendingChunks : undefined,
+					},
+				});
+			} catch (error) {
+				// The hook already told the user. A lost connection may still have saved: show the reloaded document;
+				// any other failure keeps the edits open to correct and retry.
+				if (connectionLost(error)) setIsEditMode(false);
+				return;
+			}
 			setIsEditMode(false);
 		};
 

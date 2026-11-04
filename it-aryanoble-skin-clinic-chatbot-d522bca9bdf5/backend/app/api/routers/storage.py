@@ -55,7 +55,7 @@ async def diagnose_storage_key(key: str):
     return diagnose_s3_storage(key=key)
 
 
-@router.get("/{s3_key:path}", summary="Stream storage asset or proxy image")
+@router.api_route("/{s3_key:path}", methods=["GET", "HEAD"], summary="Stream storage asset or proxy image")
 async def get_storage_asset(s3_key: str):
     """
     Public storage proxy endpoint.

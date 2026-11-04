@@ -205,11 +205,11 @@ class AttachmentParser:
             model_name = None
 
             try:
-                from sqlalchemy import create_engine, text
+                from sqlalchemy import text
+                from app.core.database import get_sync_engine
                 from app.core.security import decrypt_api_key
 
-                sync_conn_str = settings.pg_conn_str.replace("+asyncpg", "")
-                engine = create_engine(sync_conn_str)
+                engine = get_sync_engine()
                 with engine.connect() as conn:
                     rows = conn.execute(
                         text("SELECT key, value FROM app_config WHERE key IN ('LLM_API_KEY', 'LLM_MODEL_NAME', 'LLM_BASE_URL')")
@@ -220,7 +220,6 @@ class AttachmentParser:
                         api_key = decrypt_api_key(raw_key)
                     model_name = config_map.get("LLM_MODEL_NAME")
                     base_url = config_map.get("LLM_BASE_URL")
-                engine.dispose()
             except Exception:
                 pass
 

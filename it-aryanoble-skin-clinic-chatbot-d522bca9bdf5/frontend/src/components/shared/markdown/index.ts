@@ -3,6 +3,7 @@ export * from "./utils";
 export * from "./parser";
 export * from "./elements";
 export * from "./renderer";
+export * from "./fast-markdown-table";
 export * from "./cards/product-card";
 export * from "./cards/treatment-card";
 export * from "./cards/regimen-card";

@@ -1,5 +1,6 @@
 from loguru import logger
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request, BackgroundTasks, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func, text, or_, case
 from app.models.category import Category, UserCategoryExclusion
@@ -23,7 +24,7 @@ from app.models.pending_operation import PendingOperation
 from app.models.project import Project
 from app.models.chat import ChatSession, ChatMessage as DBChatMessage, ChatRole, ChatStatus
 from app.schemas.knowledge import (
-    KnowledgeCreate, KnowledgeUpdate, KnowledgeUpdateStatus, KnowledgeResponse, KnowledgeProjectUpdate,
+    KnowledgeCreate, KnowledgeUpdateStatus, KnowledgeResponse, KnowledgeProjectUpdate,
     KnowledgeTextIngestRequest, KnowledgeTextIngestResponse,
     GeneralChatSessionResponse, GeneralChatMessageItem, GeneralChatMessageSendRequest,
     BatchVisibilityUpdateRequest
@@ -53,7 +54,17 @@ from app.rag.router import (
     chat_endpoint,
     query_general_endpoint,
     QueryGeneralRequest,
-    QueryGeneralResponse
+    QueryGeneralResponse,
+    get_staging_quality_gate,
+    update_staging_evidence,
+    resolve_staging_evidence,
+    regenerate_summary_from_evidence,
+    publish_staging_version,
+    resolve_media_asset_endpoint,
+    verify_invariants_endpoint,
+    reparse_pending_with_vision,
+    summary_text_changed,
+    chunk_texts
 )
 from app.rag.schemas import (
     EditApprovedDocumentRequest, 
@@ -62,7 +73,15 @@ from app.rag.schemas import (
     ChatRequest, 
     ChatResponse, 
     UserContext,
-    TextIngestRequest
+    TextIngestRequest,
+    QualityGateResponse,
+    UpdateEvidenceRequest,
+    RegenerateSummaryResponse,
+    PublishVersionRequest,
+    PublishVersionResponse,
+    MediaResolveResponse,
+    InvariantCheckResponse,
+    ReparseVisionRequest
 )
 
 router = APIRouter(tags=["Knowledge"])
@@ -130,6 +149,26 @@ def sanitize_history_turns(history_list: Optional[List[Any]], default_attachment
             turn["content"] = content
         clean_list.append(turn)
     return clean_list
+
+
+@router.get("/maintenance/pipeline-status")
+async def pipeline_status(current_user: User = Depends(RequireAccess("knowledge:write"))):
+    """Published documents the chatbot cannot retrieve, or processed by an older pipeline stage (and so due for reprocessing)."""
+    from app.rag.pipeline_versions import CHUNKER_VERSION, PARSER_VERSION
+    from app.rag.services.reprocess import outdated_documents, outdated_parser_documents, unindexed_documents
+    unindexed = await asyncio.to_thread(unindexed_documents)
+    outdated = await asyncio.to_thread(outdated_documents)
+    reparse = await asyncio.to_thread(outdated_parser_documents)
+    return {"unindexed": unindexed, "chunker_version": CHUNKER_VERSION, "outdated": outdated,
+            "parser_version": PARSER_VERSION, "reparse_recommended": reparse}
+
+
+@router.post("/maintenance/reprocess")
+async def reprocess_outdated(current_user: User = Depends(RequireAccess("knowledge:write"))):
+    """Re-chunks and republishes outdated documents in the background, one at a time."""
+    from app.rag.services.reprocess import rechunk_outdated
+    asyncio.create_task(rechunk_outdated())
+    return {"status": "scheduled"}
 
 
 @router.get("/quota")
@@ -592,9 +631,65 @@ from app.schemas.pagination import PaginatedResponse
 from typing import List, Optional, Union
 import math
 
+_LIST_HEAVY_METADATA_KEYS = {
+    "chunks", "history", "chat_history", "edit_history", "staging_history",
+    "summary", "initial_summary", "timing_metrics",
+}
+_LIST_SUMMARY_MAX_CHARS = 800
+
+
+def _slim_list_metadata(meta: dict) -> dict:
+    """Drop heavy fields from metadata for list views (full data is served by GET /{id})."""
+    slim = {k: v for k, v in meta.items() if k not in _LIST_HEAVY_METADATA_KEYS}
+    bs = slim.get("batch_summary")
+    if isinstance(bs, str) and len(bs) > 1500:
+        slim["batch_summary"] = bs[:1500]
+    return slim
+
+
+def _slim_list_summary(text: Optional[str]) -> Optional[str]:
+    if text and len(text) > _LIST_SUMMARY_MAX_CHARS:
+        return text[:_LIST_SUMMARY_MAX_CHARS]
+    return text
+
+
+_DEDUP_SUMMARY_MIN_CHARS = 50_000
+
+
+def _dedup_large_summary_metadata(meta: dict, ai_summary: Optional[str]) -> dict:
+    """
+    For very large documents the same summary text is stored several times in metadata
+    (summary, initial_summary, history/chat_history assistant turns). Send it only once
+    (as ai_summary). The frontend fills empty assistant turns from ai_summary.
+    Also strip the multi-megabyte raw chunks array, keeping only chunk_count.
+    """
+    if not isinstance(meta, dict):
+        return meta
+    out = dict(meta)
+    if "chunks" in out and isinstance(out["chunks"], list):
+        out["chunk_count"] = len(out["chunks"])
+        out.pop("chunks", None)
+    if not ai_summary or len(ai_summary) < _DEDUP_SUMMARY_MIN_CHARS:
+        return out
+    for key in ("summary", "initial_summary"):
+        if out.get(key) == ai_summary:
+            out.pop(key, None)
+    for key in ("history", "chat_history", "edit_history", "staging_history"):
+        turns = out.get(key)
+        if not isinstance(turns, list):
+            continue
+        new_turns = []
+        for t in turns:
+            if isinstance(t, dict) and t.get("role") == "assistant" and t.get("content") == ai_summary:
+                t = {**t, "content": ""}
+            new_turns.append(t)
+        out[key] = new_turns
+    return out
+
+
 @router.get("/", response_model=Union[PaginatedResponse[KnowledgeResponse], List[KnowledgeResponse]])
 async def list_knowledge(
-    project_id: Optional[uuid.UUID] = Query(None, description="Optional project filter"),
+    project_id: Optional[str] = Query(None, description="Optional project filter (UUID or 'none'/'unassigned')"),
     search: Optional[str] = Query(None, description="Optional text search query"),
     status: Optional[str] = Query(None, description="Optional status filter"),
     page: Optional[int] = Query(None, ge=1, description="Page number"),
@@ -602,10 +697,20 @@ async def list_knowledge(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(RequireAccess("knowledge:read"))
 ):
+    logger.info(f"[LIST_KNOWLEDGE_CALLED] project_id={project_id}, user={current_user.email}")
     # 1. Build Base Query with SQL Filters
     stmt = select(Knowledge).where(Knowledge.deleted_at.is_(None))
-    if isinstance(project_id, uuid.UUID):
-        stmt = stmt.where(Knowledge.project_id == project_id)
+    if project_id:
+        p_clean = str(project_id).strip().lower()
+        if p_clean in ("none", "null", "unassigned", "root"):
+            stmt = stmt.where(Knowledge.project_id.is_(None))
+        elif p_clean not in ("all", "*", ""):
+            try:
+                p_uuid = uuid.UUID(p_clean)
+                stmt = stmt.where(Knowledge.project_id == p_uuid)
+            except ValueError:
+                pass
+    # If project_id is None, "all", "*", or empty, return all knowledge documents across projects and root
     if isinstance(status, str) and status.upper() != "ALL":
         try:
             k_status = KnowledgeStatus[status.upper()]
@@ -648,7 +753,7 @@ async def list_knowledge(
 
         items_page = []
         for item in db_items:
-            item_metadata = dict(item.metadata_) if isinstance(item.metadata_, dict) else {}
+            item_metadata = _slim_list_metadata(item.metadata_) if isinstance(item.metadata_, dict) else {}
             if "categories" in item_metadata and isinstance(item_metadata["categories"], list):
                 item_metadata["categories"] = [
                     active_cat_set[str(c.get("name") if isinstance(c, dict) else c).strip().lower()]
@@ -672,7 +777,7 @@ async def list_knowledge(
                 file_size=item.file_size,
                 type=item.type,
                 status=item.status,
-                ai_summary=item.ai_summary,
+                ai_summary=_slim_list_summary(item.ai_summary),
                 ai_confidence=float(item.ai_confidence) * 100.0 if (item.ai_confidence is not None and 0 < float(item.ai_confidence) <= 1.0) else (float(item.ai_confidence) if item.ai_confidence is not None else None),
                 uploaded_by=item.uploaded_by,
                 uploaded_by_name=user_name_map.get(item.uploaded_by) or "Admin",
@@ -708,7 +813,7 @@ async def list_knowledge(
 
     responses = []
     for item in db_items:
-        item_metadata = dict(item.metadata_) if isinstance(item.metadata_, dict) else {}
+        item_metadata = _slim_list_metadata(item.metadata_) if isinstance(item.metadata_, dict) else {}
         if "categories" in item_metadata and isinstance(item_metadata["categories"], list):
             item_metadata["categories"] = [
                 active_cat_set[str(c.get("name") if isinstance(c, dict) else c).strip().lower()]
@@ -725,7 +830,7 @@ async def list_knowledge(
             file_size=item.file_size,
             type=item.type,
             status=item.status,
-            ai_summary=item.ai_summary,
+            ai_summary=_slim_list_summary(item.ai_summary),
             ai_confidence=float(item.ai_confidence) * 100.0 if (item.ai_confidence is not None and 0 < float(item.ai_confidence) <= 1.0) else (float(item.ai_confidence) if item.ai_confidence is not None else None),
             uploaded_by=item.uploaded_by,
             uploaded_by_name=user_name_map.get(item.uploaded_by) or "Admin",
@@ -738,6 +843,134 @@ async def list_knowledge(
         ))
 
     return responses
+
+
+@router.get("/{knowledge_id}/file")
+async def get_knowledge_original_file(
+    knowledge_id: uuid.UUID,
+    download: bool = Query(False, description="Set to true to force attachment download"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(RequireAccess("knowledge:read"))
+):
+    """
+    Stream or download the original uploaded document (PDF, Excel, Word, etc.)
+    for versioning and administrative audit purposes.
+    """
+    stmt = (
+        select(Knowledge)
+        .where(Knowledge.id == knowledge_id)
+    )
+    result = await db.execute(stmt)
+    knowledge = result.scalar_one_or_none()
+
+    kid_str = str(knowledge_id)
+    file_name = None
+    media_type = None
+    s3_key = None
+
+    if knowledge and knowledge.deleted_at is None:
+        file_name = knowledge.file_name or "original_document"
+        media_type = knowledge.mime_type
+        if isinstance(knowledge.metadata_, dict):
+            s3_key = knowledge.metadata_.get("original_s3_key") or knowledge.metadata_.get("s3_key")
+    else:
+        # Fallback to pending or approved staging JSON
+        target_file = resolve_pending_file(kid_str) or resolve_approved_file(kid_str)
+        if target_file and os.path.exists(target_file):
+            try:
+                with open(target_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                file_name = data.get("file_name") or "original_document"
+                s3_key = data.get("original_s3_key") or data.get("s3_key")
+            except Exception:
+                pass
+
+    if not file_name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge document not found.")
+
+    ext = os.path.splitext(file_name)[1].lower()
+
+    media_type = knowledge.mime_type
+    if not media_type or media_type == "application/octet-stream":
+        guessed_type, _ = mimetypes.guess_type(file_name)
+        media_type = guessed_type or "application/octet-stream"
+
+    kid_str = str(knowledge_id)
+    s3_key = None
+    if isinstance(knowledge.metadata_, dict):
+        s3_key = knowledge.metadata_.get("original_s3_key") or knowledge.metadata_.get("s3_key")
+
+    from app.services.storage import _get_client, _docs_bucket, get_s3_object_stream
+    s3 = _get_client()
+    docs_bucket = _docs_bucket()
+
+    # 1. MinIO S3 Lookup
+    if not s3_key and s3:
+        try:
+            paginator = s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=docs_bucket, Prefix="originals/"):
+                for obj in page.get('Contents', []):
+                    key = obj.get('Key', '')
+                    if f"/{kid_str}/" in key or f"_{kid_str}_" in key:
+                        s3_key = key
+                        # Cache into metadata for instantaneous future lookups
+                        if isinstance(knowledge.metadata_, dict):
+                            knowledge.metadata_["original_s3_key"] = key
+                            from sqlalchemy.orm.attributes import flag_modified
+                            flag_modified(knowledge, "metadata_")
+                            await db.commit()
+                        break
+                if s3_key:
+                    break
+        except Exception as scan_err:
+            logger.warning(f"Error scanning MinIO originals for '{kid_str}': {scan_err}")
+
+    if s3_key:
+        try:
+            stream_gen, ctype, content_length = get_s3_object_stream(s3_key)
+            if stream_gen:
+                disposition = "attachment" if download else "inline"
+                safe_fname = file_name.replace('"', '\\"')
+                headers = {
+                    "Content-Disposition": f'{disposition}; filename="{safe_fname}"',
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "public, max-age=3600",
+                }
+                if content_length is not None:
+                    headers["Content-Length"] = str(content_length)
+                return StreamingResponse(
+                    stream_gen,
+                    media_type=media_type or ctype,
+                    headers=headers
+                )
+        except Exception as s3_err:
+            logger.warning(f"Error streaming MinIO original '{s3_key}': {s3_err}")
+
+    # 2. Local Disk Fallback
+    search_paths = []
+    if knowledge.original_path:
+        search_paths.append(knowledge.original_path)
+        clean_p = knowledge.original_path.replace("s3://docs/", "").replace("s3://", "")
+        search_paths.append(clean_p)
+        search_paths.append(os.path.join("data/temp", os.path.basename(clean_p)))
+
+    search_folders = ["data/temp", "data/uploads", "data/documents", "data/storage", "data/output"]
+    for fld in search_folders:
+        search_paths.append(os.path.join(fld, file_name))
+        search_paths.append(os.path.join(fld, f"{kid_str}{ext}"))
+
+    for p in search_paths:
+        if p and os.path.isfile(p):
+            disposition = "attachment" if download else "inline"
+            return FileResponse(
+                path=p,
+                filename=file_name,
+                media_type=media_type,
+                content_disposition_type=disposition
+            )
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Original uploaded file for '{file_name}' not found in storage.")
+
 
 @router.get("/{knowledge_id}", response_model=KnowledgeResponse)
 async def get_knowledge(
@@ -766,8 +999,10 @@ async def get_knowledge(
         try:
             target_file = resolve_pending_file(str(knowledge_id)) or resolve_approved_file(str(knowledge_id))
             if target_file and os.path.exists(target_file):
-                with open(target_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                def _read_json(p):
+                    with open(p, "r", encoding="utf-8") as _f:
+                        return json.load(_f)
+                data = await asyncio.to_thread(_read_json, target_file)
                 latest_summary = data.get("summary", "")
                 latest_title = data.get("title", "")
                 
@@ -827,6 +1062,7 @@ async def get_knowledge(
             if not approved_at_dt and isinstance(knowledge.metadata_, dict):
                 raw_app = knowledge.metadata_.get("approved_at")
                 if raw_app:
+                    from app.rag.services.rag_retriever import parse_date_safely
                     approved_at_dt = parse_date_safely(raw_app)
 
         return KnowledgeResponse(
@@ -846,7 +1082,7 @@ async def get_knowledge(
             approved_by=knowledge.approved_by,
             approved_at=approved_at_dt,
             project_id=knowledge.project_id,
-            metadata_=knowledge.metadata_ if isinstance(knowledge.metadata_, dict) else {},
+            metadata_=_dedup_large_summary_metadata(knowledge.metadata_, knowledge.ai_summary) if isinstance(knowledge.metadata_, dict) else {},
             created_at=created_at_dt,
             updated_at=updated_at_dt
         )
@@ -863,8 +1099,10 @@ async def get_knowledge(
     
     if target_file and os.path.exists(target_file):
         try:
-            with open(target_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            def _read_json_fb(p):
+                with open(p, "r", encoding="utf-8") as _f:
+                    return json.load(_f)
+            data = await asyncio.to_thread(_read_json_fb, target_file)
             doc_status = KnowledgeStatus.APPROVED if "output" in target_file else KnowledgeStatus.PENDING
             if isinstance(data, dict):
                 if "categories" in data:
@@ -1008,11 +1246,21 @@ async def get_knowledge_batch(
                     merged_meta["chat_history"] = merged_meta["history"]
                 if "edit_history" in merged_meta:
                     merged_meta["edit_history"] = sanitize_history_turns(merged_meta["edit_history"])
+                # Strip raw chunk arrays and deduplicate large summaries from batch polling responses
+                merged_meta.pop("chunks", None)
+                merged_meta = _dedup_large_summary_metadata(merged_meta, latest_summary or knowledge.ai_summary)
                 knowledge_dict["metadata_"] = merged_meta
                 # Sync status from pending/output files
-                new_status = KnowledgeStatus.APPROVED if "output" in target_file else KnowledgeStatus.PENDING
+                if "output" in target_file:
+                    new_status = KnowledgeStatus.APPROVED
+                elif data.get("status") == "PARSING" or (knowledge.status == KnowledgeStatus.PROCESSING and data.get("status") != "On review"):
+                    new_status = KnowledgeStatus.PROCESSING
+                else:
+                    new_status = KnowledgeStatus.PENDING
                 if knowledge_dict.get("status") != new_status and knowledge_dict.get("status") != KnowledgeStatus.APPROVED:
                     knowledge_dict["status"] = new_status
+                if latest_summary:
+                    knowledge_dict["ai_summary"] = latest_summary
                 enriched_docs.append(knowledge_dict)
             else:
                 setattr(knowledge, "uploaded_by_name", uploader_name)
@@ -1023,79 +1271,80 @@ async def get_knowledge_batch(
             setattr(knowledge, "approved_at", appr_at)
             enriched_docs.append(knowledge)
             
-    # Also scan data/pending and data/output for any staged JSON files matching this batch
+    # Also scan data/pending and data/output for any staged JSON files matching this batch ONLY if docs is empty
     now = datetime.now(timezone.utc)
-    for folder in ["data/pending", "data/output"]:
-        if os.path.exists(folder):
-            for f in os.listdir(folder):
-                if f.endswith(".json") and f != "bm25_index.pkl":
-                    file_path = os.path.join(folder, f)
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as fp:
-                            data = json.load(fp)
-                        if isinstance(data, dict):
-                            doc_batch = data.get("batch_id") or data.get("upload_batch_id")
-                            if not doc_batch and data.get("chunks"):
-                                doc_batch = data["chunks"][0].get("metadata", {}).get("batch_id") or data["chunks"][0].get("metadata", {}).get("upload_batch_id")
+    if not docs:
+        for folder in ["data/pending", "data/output"]:
+            if os.path.exists(folder):
+                for f in os.listdir(folder):
+                    if f.endswith(".json") and f != "bm25_index.pkl":
+                        file_path = os.path.join(folder, f)
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as fp:
+                                data = json.load(fp)
+                            if isinstance(data, dict):
+                                doc_batch = data.get("batch_id") or data.get("upload_batch_id")
+                                if not doc_batch and data.get("chunks"):
+                                    doc_batch = data["chunks"][0].get("metadata", {}).get("batch_id") or data["chunks"][0].get("metadata", {}).get("upload_batch_id")
 
-                            if doc_batch == batch_id:
-                                raw_id = data.get("knowledge_id") or f.replace("_parsed.json", "").replace(".json", "")
-                                if str(raw_id).lower() in {d.lower() for d in deleted_ids}:
-                                    try:
-                                        os.remove(file_path)
-                                    except Exception:
-                                        pass
-                                    continue
-                                if str(raw_id) not in seen_ids:
-                                    seen_ids.add(str(raw_id))
-                                    try:
-                                        k_uuid = uuid.UUID(str(raw_id))
-                                    except ValueError:
-                                        k_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, str(raw_id))
-
-                                    file_name = data.get("file_name", f)
-                                    title = data.get("title", file_name)
-                                    summary = data.get("summary", "")
-                                    k_type = KnowledgeType.GENERAL
-
-                                    doc_status = KnowledgeStatus.APPROVED if "output" in folder else KnowledgeStatus.PENDING
-
-                                    if "history" in data:
-                                        data["history"] = sanitize_history_turns(data["history"])
-                                        data["chat_history"] = data["history"]
-                                    if "edit_history" in data:
-                                        data["edit_history"] = sanitize_history_turns(data["edit_history"])
-
-                                    staged_uploader_id = UUID(int=0)
-                                    if data.get("uploaded_by"):
+                                if doc_batch == batch_id:
+                                    raw_id = data.get("knowledge_id") or f.replace("_parsed.json", "").replace(".json", "")
+                                    if str(raw_id).lower() in {d.lower() for d in deleted_ids}:
                                         try:
-                                            staged_uploader_id = UUID(str(data.get("uploaded_by")))
+                                            os.remove(file_path)
                                         except Exception:
                                             pass
-                                    staged_uploader_name = data.get("uploaded_by_name") or data.get("uploader_name") or "Admin"
+                                        continue
+                                    if str(raw_id) not in seen_ids:
+                                        seen_ids.add(str(raw_id))
+                                        try:
+                                            k_uuid = uuid.UUID(str(raw_id))
+                                        except ValueError:
+                                            k_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, str(raw_id))
 
-                                    enriched_docs.append(KnowledgeResponse(
-                                        id=k_uuid,
-                                        title=title,
-                                        content=summary,
-                                        file_name=file_name,
-                                        original_path=f"data/temp/{file_name}",
-                                        mime_type="application/pdf",
-                                        file_size=None,
-                                        type=k_type,
-                                        status=doc_status,
-                                        ai_summary=summary,
-                                        ai_confidence=95.0,
-                                        uploaded_by=staged_uploader_id,
-                                        uploaded_by_name=staged_uploader_name,
-                                        approved_by=None,
-                                        approved_at=now if doc_status == KnowledgeStatus.APPROVED else None,
-                                        metadata_=data,
-                                        created_at=now,
-                                        updated_at=now
-                                    ))
-                    except Exception:
-                        pass
+                                        file_name = data.get("file_name", f)
+                                        title = data.get("title", file_name)
+                                        summary = data.get("summary", "")
+                                        k_type = KnowledgeType.GENERAL
+
+                                        doc_status = KnowledgeStatus.APPROVED if "output" in folder else KnowledgeStatus.PENDING
+
+                                        if "history" in data:
+                                            data["history"] = sanitize_history_turns(data["history"])
+                                            data["chat_history"] = data["history"]
+                                        if "edit_history" in data:
+                                            data["edit_history"] = sanitize_history_turns(data["edit_history"])
+
+                                        staged_uploader_id = UUID(int=0)
+                                        if data.get("uploaded_by"):
+                                            try:
+                                                staged_uploader_id = UUID(str(data.get("uploaded_by")))
+                                            except Exception:
+                                                pass
+                                        staged_uploader_name = data.get("uploaded_by_name") or data.get("uploader_name") or "Admin"
+
+                                        enriched_docs.append(KnowledgeResponse(
+                                            id=k_uuid,
+                                            title=title,
+                                            content=summary,
+                                            file_name=file_name,
+                                            original_path=f"data/temp/{file_name}",
+                                            mime_type="application/pdf",
+                                            file_size=None,
+                                            type=k_type,
+                                            status=doc_status,
+                                            ai_summary=summary,
+                                            ai_confidence=95.0,
+                                            uploaded_by=staged_uploader_id,
+                                            uploaded_by_name=staged_uploader_name,
+                                            approved_by=None,
+                                            approved_at=now if doc_status == KnowledgeStatus.APPROVED else None,
+                                            metadata_=_dedup_large_summary_metadata({k: v for k, v in data.items() if k != "chunks"}, summary),
+                                            created_at=now,
+                                            updated_at=now
+                                        ))
+                        except Exception:
+                            pass
 
     # Check if ANY document in batch is still actively PROCESSING
     is_any_processing = any(
@@ -1462,6 +1711,40 @@ async def update_batch_visibility(
     except Exception as pg_chunk_err:
         logger.warning(f"Could not bulk-update PGVector document_chunks: {pg_chunk_err}")
 
+    # 5.1 Synchronize Canonical Knowledge Version & Materialized Chunks (Phase 5 SSOT)
+    try:
+        from sqlalchemy import text
+        import uuid as _uuid
+        uuid_targets = []
+        for tid in target_ids:
+            try:
+                uuid_targets.append(_uuid.UUID(str(tid)))
+            except Exception:
+                pass
+        if uuid_targets:
+            await db.execute(text("""
+                UPDATE knowledge_version
+                SET visibility = :vis_json::jsonb, updated_at = NOW()
+                WHERE knowledge_id = ANY(:target_ids);
+            """), {"vis_json": json.dumps(vis_dict), "target_ids": uuid_targets})
+
+            await db.execute(text("""
+                UPDATE kb_chunk
+                SET acl_clinics = :clinics_arr,
+                    acl_doctor_types = :dtypes_arr,
+                    acl_doctors = :docs_arr
+                WHERE version_id IN (SELECT id FROM knowledge_version WHERE knowledge_id = ANY(:target_ids));
+            """), {
+                "clinics_arr": [str(c).upper() for c in vis_dict.get("clinics", ["ALL"])],
+                "dtypes_arr": [str(d).upper() for d in vis_dict.get("doctor_types", ["ALL"])],
+                "docs_arr": [str(dc) for dc in vis_dict.get("doctors", ["ALL"])],
+                "target_ids": uuid_targets
+            })
+            await db.commit()
+            logger.info(f"✅ Synced Canonical Knowledge Version & kb_chunk ACL for {len(uuid_targets)} document(s)")
+    except Exception as can_err:
+        logger.warning(f"Canonical ACL sync note: {can_err}")
+
     # 6. Synchronize BM25Index in memory and on disk
     try:
         from app.rag.services.rag_retriever import BM25Index
@@ -1609,6 +1892,7 @@ async def upload_knowledge_file(
     project_id: Optional[uuid.UUID] = Form(None),
     prompt: Optional[str] = Form(None),
     replace_existing: bool = Form(True),
+    batch_id: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(RequireAccess("knowledge:write")),
     llm: BaseLLMAdapter = Depends(get_llm)
@@ -1669,7 +1953,8 @@ async def upload_knowledge_file(
         prompt=prompt,
         replace_existing=replace_existing,
         pipeline=pipeline,
-        llm=llm
+        llm=llm,
+        batch_id=batch_id
     )
 
     if isinstance(ingest_res, dict):
@@ -1779,6 +2064,7 @@ async def complete_knowledge_chunk_upload(
     project_id: Optional[uuid.UUID] = Form(None),
     prompt: Optional[str] = Form(None),
     replace_existing: bool = Form(True),
+    batch_id: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(RequireAccess("knowledge:write")),
     llm: BaseLLMAdapter = Depends(get_llm)
@@ -1867,7 +2153,8 @@ async def complete_knowledge_chunk_upload(
             prompt=prompt,
             replace_existing=replace_existing,
             pipeline=pipeline,
-            llm=llm
+            llm=llm,
+            batch_id=batch_id
         )
 
         # Update metadata for uploaded documents
@@ -2032,11 +2319,13 @@ async def replace_knowledge_file_endpoint(
     Replace the file attachment of a specific Knowledge Document (e.g. after a parsing failure or rejected draft)
     and re-trigger the background parsing and AI generation pipeline in-place.
     """
-    stmt = select(Knowledge).where(Knowledge.id == knowledge_id, Knowledge.deleted_at.is_(None))
+    stmt = select(Knowledge).where(Knowledge.id == knowledge_id)
     res = await db.execute(stmt)
     k_entry = res.scalar_one_or_none()
     if not k_entry:
         raise HTTPException(status_code=404, detail="Knowledge document not found.")
+    if k_entry.deleted_at is not None:
+        k_entry.deleted_at = None
 
     raw_ctype = (file.content_type or "").lower().strip()
     if not is_allowed_file_type(raw_ctype, file.filename or ""):
@@ -2082,7 +2371,8 @@ async def replace_knowledge_file_endpoint(
         prompt=effective_prompt,
         replace_existing=True,
         pipeline=pipeline,
-        llm=llm
+        llm=llm,
+        replace_knowledge_id=str(knowledge_id)
     )
 
     return {
@@ -2106,11 +2396,13 @@ async def complete_replace_knowledge_file_chunk(
     current_user: User = Depends(RequireAccess("knowledge:write")),
     llm: BaseLLMAdapter = Depends(get_llm)
 ):
-    stmt = select(Knowledge).where(Knowledge.id == knowledge_id, Knowledge.deleted_at.is_(None))
+    stmt = select(Knowledge).where(Knowledge.id == knowledge_id)
     res = await db.execute(stmt)
     k_entry = res.scalar_one_or_none()
     if not k_entry:
         raise HTTPException(status_code=404, detail="Knowledge document not found.")
+    if k_entry.deleted_at is not None:
+        k_entry.deleted_at = None
 
     clean_upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', upload_id)
     clean_filename = os.path.basename(filename)
@@ -2180,7 +2472,8 @@ async def complete_replace_knowledge_file_chunk(
             prompt=effective_prompt,
             replace_existing=True,
             pipeline=pipeline,
-            llm=llm
+            llm=llm,
+            replace_knowledge_id=str(knowledge_id)
         )
 
         return {
@@ -2254,6 +2547,104 @@ async def update_knowledge_status(
     await db.refresh(knowledge)
     return knowledge
 
+
+# =============================================================================
+# PHASE 1.5 QUALITY GATE & STAGING OBSERVABILITY ROUTES (D1-a & D9)
+# =============================================================================
+
+@router.get("/staging/{knowledge_id}/quality-gate", response_model=QualityGateResponse)
+@router.get("/{knowledge_id}/quality-gate", response_model=QualityGateResponse)
+async def knowledge_quality_gate(
+    knowledge_id: uuid.UUID,
+    summary_only: bool = Query(False, description="If true, return readiness and metrics only without evidences list")
+):
+    """
+    Returns Quality Gate audit, readiness gate, disposition breakdown, evidences and assets.
+    """
+    return await get_staging_quality_gate(str(knowledge_id), summary_only=summary_only)
+
+
+@router.post("/{knowledge_id}/quality-check")
+async def run_knowledge_quality_check(
+    knowledge_id: uuid.UUID,
+    probes: bool = Query(True, description="Also ask generated questions through the doctors' chat pipeline"),
+    current_user: User = Depends(RequireAccess("knowledge:write"))
+):
+    """Measures the document again (coverage of its own text, structure, generated questions); runs in the background."""
+    from app.rag.services.ingest_quality import schedule_quality_check
+    schedule_quality_check(str(knowledge_id), probes=probes)
+    return {"status": "scheduled", "knowledge_id": str(knowledge_id)}
+
+
+@router.put("/staging/{knowledge_id}/evidence/{evidence_id}")
+@router.put("/{knowledge_id}/evidence/{evidence_id}")
+async def knowledge_update_evidence(
+    knowledge_id: uuid.UUID,
+    evidence_id: uuid.UUID,
+    request: UpdateEvidenceRequest
+):
+    """
+    D1-a Implementation: Admin directly updates Canonical Evidence in Staging.
+    """
+    return await update_staging_evidence(str(knowledge_id), str(evidence_id), request)
+
+
+@router.post("/staging/{knowledge_id}/evidence/{evidence_id}/resolve")
+@router.post("/{knowledge_id}/evidence/{evidence_id}/resolve")
+async def knowledge_resolve_evidence(
+    knowledge_id: uuid.UUID,
+    evidence_id: uuid.UUID
+):
+    """
+    D9 Knowledge Readiness Gate: Mark REVIEW_REQUIRED evidence as VISION_COMPLETE.
+    """
+    return await resolve_staging_evidence(str(knowledge_id), str(evidence_id))
+
+
+@router.post("/staging/{knowledge_id}/regenerate-summary", response_model=RegenerateSummaryResponse)
+@router.post("/{knowledge_id}/regenerate-summary", response_model=RegenerateSummaryResponse)
+async def knowledge_regenerate_summary(knowledge_id: uuid.UUID):
+    """
+    D1-a Implementation: Reconstruct summary from Canonical Evidence SSOT.
+    """
+    return await regenerate_summary_from_evidence(str(knowledge_id))
+
+
+@router.post("/staging/{knowledge_id}/publish", response_model=PublishVersionResponse)
+@router.post("/{knowledge_id}/publish", response_model=PublishVersionResponse)
+async def knowledge_publish_version(
+    knowledge_id: uuid.UUID,
+    request: Optional[PublishVersionRequest] = None,
+    current_user: User = Depends(RequireAccess("knowledge:write"))
+):
+    """
+    Phase 2: Atomically publishes knowledge version to ACTIVE.
+    """
+    req = request or PublishVersionRequest()
+    if not req.approved_by and current_user:
+        req.approved_by = str(current_user.id)
+    return await publish_staging_version(str(knowledge_id), req)
+
+
+@router.get("/media/resolve/{asset_id}", response_model=MediaResolveResponse)
+async def knowledge_media_resolve(
+    asset_id: str,
+    preview: bool = Query(False)
+):
+    """
+    Phase 2 Media Serving: Resolves presigned/valid media URL from kb_asset.
+    """
+    return await resolve_media_asset_endpoint(asset_id=asset_id, preview=preview)
+
+
+@router.get("/invariants/verify", response_model=InvariantCheckResponse)
+async def knowledge_invariants_verify():
+    """
+    Phase 2: Verifies no orphan active projections.
+    """
+    return await verify_invariants_endpoint()
+
+
 @router.post("/{knowledge_id}/approve")
 async def approve_knowledge(
     request: Request,
@@ -2323,6 +2714,21 @@ async def approve_knowledge(
 
     return res
 
+
+@router.post("/{knowledge_id}/reparse_vision")
+async def reparse_knowledge_vision(
+    request: Request,
+    knowledge_id: uuid.UUID,
+    reparse_req: Optional[ReparseVisionRequest] = None,
+    current_user: User = Depends(RequireAccess("knowledge:write"))
+):
+    """
+    On-demand endpoint allowing administrators to re-parse a pending staged document
+    using vision-native VLM layout analysis.
+    """
+    return await reparse_pending_with_vision(str(knowledge_id), request=reparse_req)
+
+
 @router.put("/{knowledge_id}")
 async def edit_knowledge(
     request: Request,
@@ -2345,63 +2751,6 @@ async def edit_knowledge(
     
     p_file = resolve_pending_file(str(knowledge_id))
     a_file = resolve_approved_file(str(knowledge_id))
-
-    # DB fallback if JSON file is missing from disk but exists in PostgreSQL
-    if not p_file and not a_file and k_entry:
-        m_dict = dict(k_entry.metadata_) if isinstance(k_entry.metadata_, dict) else {}
-        if k_entry.status == KnowledgeStatus.APPROVED:
-            a_file = os.path.join("data/output", f"{knowledge_id}.json")
-            os.makedirs("data/output", exist_ok=True)
-            doc_data = {
-                "knowledge_id": str(knowledge_id),
-                "batch_id": m_dict.get("batch_id"),
-                "file_name": k_entry.file_name or str(knowledge_id),
-                "title": k_entry.title or k_entry.file_name or "Knowledge Document",
-                "status": "Approved",
-                "summary": k_entry.ai_summary or "",
-                "initial_prompt": m_dict.get("initial_prompt"),
-                "staging_history": m_dict.get("staging_history", []),
-                "edit_history": m_dict.get("edit_history", []),
-                "timing_metrics": m_dict.get("timing_metrics"),
-                "batch_summary": m_dict.get("batch_summary"),
-                "image_urls": m_dict.get("image_urls", []),
-                "categories": m_dict.get("categories", []),
-                "visibility_settings": m_dict.get("visibility_settings", {"clinics": ["all"], "doctor_types": ["all"], "doctors": ["all"]}),
-                "chunks": m_dict.get("chunks", [{"text": k_entry.ai_summary or k_entry.title or "", "metadata": {"knowledge_id": str(knowledge_id)}}])
-            }
-            with open(a_file, "w", encoding="utf-8") as f:
-                json.dump(doc_data, f, indent=4, ensure_ascii=False)
-            try:
-                from app.services.storage import upload_approved_json
-                upload_approved_json(str(knowledge_id), doc_data)
-            except Exception:
-                pass
-        else:
-            p_file = os.path.join("data/pending", f"{knowledge_id}.json")
-            os.makedirs("data/pending", exist_ok=True)
-            doc_data = {
-                "knowledge_id": str(knowledge_id),
-                "batch_id": m_dict.get("batch_id"),
-                "file_name": k_entry.file_name or str(knowledge_id),
-                "title": k_entry.title or k_entry.file_name or "Knowledge Document",
-                "status": "On review",
-                "summary": k_entry.ai_summary or "",
-                "initial_prompt": m_dict.get("initial_prompt"),
-                "history": m_dict.get("history", []),
-                "staging_history": m_dict.get("staging_history", []),
-                "timing_metrics": m_dict.get("timing_metrics"),
-                "batch_summary": m_dict.get("batch_summary"),
-                "image_urls": m_dict.get("image_urls", []),
-                "suggested_categories": m_dict.get("suggested_categories", []),
-                "chunks": m_dict.get("chunks", [{"text": k_entry.ai_summary or k_entry.title or "", "metadata": {"knowledge_id": str(knowledge_id)}}])
-            }
-            with open(p_file, "w", encoding="utf-8") as f:
-                json.dump(doc_data, f, indent=4, ensure_ascii=False)
-            try:
-                from app.services.storage import upload_staging_json
-                upload_staging_json(str(knowledge_id), doc_data)
-            except Exception:
-                pass
 
     # 1. Update or create staging draft in data/pending/{knowledge_id}.json with latest payload & refined draft content
     staged_data = {}
@@ -2429,7 +2778,22 @@ async def edit_knowledge(
     final_title = (payload.title.strip() if (payload.title and payload.title.strip()) else None) or staged_data.get("title") or (k_entry.title if k_entry else "Knowledge Document")
     final_categories = payload.categories if (payload.categories is not None and len(payload.categories) > 0) else staged_data.get("categories", staged_data.get("suggested_categories", []))
     final_vis = payload.visibility_settings.model_dump() if payload.visibility_settings else staged_data.get("visibility_settings", {"clinics": ["all"], "doctor_types": ["all"], "doctors": ["all"]})
-    final_chunks = payload.chunks if (payload.chunks is not None and len(payload.chunks) > 0) else staged_data.get("chunks")
+    # The dashboard sends back the chunks it loaded with the document; only chunks whose text differs from the
+    # stored ones (e.g. produced by an AI refine) are an edit. An echo of possibly outdated chunks is not.
+    stored_meta = k_entry.metadata_ if (k_entry and isinstance(k_entry.metadata_, dict)) else {}
+    payload_chunks = payload.chunks or None
+    if payload_chunks and chunk_texts(payload_chunks) == chunk_texts(stored_meta.get("chunks")):
+        payload_chunks = None
+    final_chunks = payload_chunks or staged_data.get("chunks")
+
+    # The chatbot's index is built from the chunks, not from the summary. When the admin changed the summary
+    # text, the stored chunks still hold the old content, so drop them and let approval re-chunk the edited summary.
+    stored_summary = staged_data.get("summary") or (k_entry.ai_summary if k_entry else "") or ""
+    # Chunks sent together with the new summary (an AI refine returns both in sync) already hold the edit.
+    if summary_text_changed(stored_summary, final_summary) and not payload_chunks:
+        logger.info(f"Edit: summary of {knowledge_id} changed by hand; re-chunking it for the index.")
+        final_chunks = None
+        staged_data.pop("chunks", None)
 
     # Update staged_data dictionary
     staged_data["knowledge_id"] = str(knowledge_id)
@@ -2496,8 +2860,21 @@ async def edit_knowledge(
         if isinstance(res, dict):
             if res.get("batch_id") and "batch_id" not in k_entry.metadata_:
                 k_entry.metadata_["batch_id"] = res["batch_id"]
-            if payload.chunks:
-                k_entry.metadata_["chunks"] = payload.chunks
+            # Keep the chunks that were actually published, so the dashboard loads (and sends back) current ones.
+            published_chunks = None
+            approved_path = resolve_approved_file(str(knowledge_id))
+            if approved_path and os.path.exists(approved_path):
+                try:
+                    with open(approved_path, "r", encoding="utf-8") as af:
+                        published = json.load(af)
+                    published_chunks = published.get("chunks")
+                    if published.get("summary") and k_entry.ai_summary:
+                        k_entry.ai_summary = published["summary"]
+                        k_entry.content = published["summary"]
+                except Exception as read_err:
+                    logger.warning(f"Edit: could not read published chunks of {knowledge_id}: {read_err}")
+            if published_chunks:
+                k_entry.metadata_["chunks"] = published_chunks
             elif res.get("chunks"):
                 k_entry.metadata_["chunks"] = res["chunks"]
 
@@ -2559,9 +2936,13 @@ async def refine_knowledge(
 
     logger.info(f"Incoming refine request for knowledge_id='{knowledge_id}', Content-Type='{content_type}'")
 
+    current_summary = None
     if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
         form = await request.form()
         prompt = str(form.get("prompt", "") or "")
+        current_summary = form.get("current_summary")
+        if current_summary:
+            current_summary = str(current_summary)
         history_raw = form.get("history", "[]")
         if isinstance(history_raw, str):
             try:
@@ -2600,6 +2981,9 @@ async def refine_knowledge(
         try:
             body = await request.json()
             prompt = str(body.get("prompt", "") or "")
+            current_summary = body.get("current_summary")
+            if current_summary:
+                current_summary = str(current_summary)
             history_raw = body.get("history", [])
             history = [
                 ChatMessage(role=m.get("role", "user"), content=m.get("content", ""))
@@ -2610,7 +2994,7 @@ async def refine_knowledge(
             prompt = ""
             history = []
 
-    payload = RefineRequest(prompt=prompt, history=history)
+    payload = RefineRequest(prompt=prompt, history=history, current_summary=current_summary)
 
     # Process attached file if provided
     if file_attachment:
@@ -2718,67 +3102,6 @@ async def refine_knowledge(
     p_file = resolve_pending_file(str(knowledge_id))
     a_file = resolve_approved_file(str(knowledge_id))
     
-    # DB fallback if JSON file is missing from disk
-    if not p_file and not a_file:
-        stmt = select(Knowledge).where(Knowledge.id == knowledge_id, Knowledge.deleted_at.is_(None))
-        db_res = await db.execute(stmt)
-        k_entry = db_res.scalar_one_or_none()
-        if k_entry:
-            m_dict = dict(k_entry.metadata_) if isinstance(k_entry.metadata_, dict) else {}
-            if k_entry.status == KnowledgeStatus.APPROVED:
-                a_file = os.path.join("data/output", f"{knowledge_id}.json")
-                os.makedirs("data/output", exist_ok=True)
-                doc_data = {
-                    "knowledge_id": str(knowledge_id),
-                    "batch_id": m_dict.get("batch_id"),
-                    "file_name": k_entry.file_name or str(knowledge_id),
-                    "title": k_entry.title or k_entry.file_name or "Knowledge Document",
-                    "status": "Approved",
-                    "summary": k_entry.ai_summary or "",
-                    "initial_prompt": m_dict.get("initial_prompt"),
-                    "staging_history": m_dict.get("staging_history", []),
-                    "edit_history": m_dict.get("edit_history", []),
-                    "timing_metrics": m_dict.get("timing_metrics"),
-                    "batch_summary": m_dict.get("batch_summary"),
-                    "image_urls": m_dict.get("image_urls", []),
-                    "categories": m_dict.get("categories", []),
-                    "visibility_settings": m_dict.get("visibility_settings", {"clinics": ["all"], "doctor_types": ["all"], "doctors": ["all"]}),
-                    "chunks": m_dict.get("chunks", [{"text": k_entry.ai_summary or k_entry.title or "", "metadata": {"knowledge_id": str(knowledge_id)}}])
-                }
-                with open(a_file, "w", encoding="utf-8") as f:
-                    json.dump(doc_data, f, indent=4, ensure_ascii=False)
-                try:
-                    from app.services.storage import upload_approved_json
-                    upload_approved_json(str(knowledge_id), doc_data)
-                except Exception:
-                    pass
-            else:
-                p_file = os.path.join("data/pending", f"{knowledge_id}.json")
-                os.makedirs("data/pending", exist_ok=True)
-                doc_data = {
-                    "knowledge_id": str(knowledge_id),
-                    "batch_id": m_dict.get("batch_id"),
-                    "file_name": k_entry.file_name or str(knowledge_id),
-                    "title": k_entry.title or k_entry.file_name or "Knowledge Document",
-                    "status": "On review",
-                    "summary": k_entry.ai_summary or "",
-                    "initial_prompt": m_dict.get("initial_prompt"),
-                    "history": m_dict.get("history", []),
-                    "staging_history": m_dict.get("staging_history", []),
-                    "timing_metrics": m_dict.get("timing_metrics"),
-                    "batch_summary": m_dict.get("batch_summary"),
-                    "image_urls": m_dict.get("image_urls", []),
-                    "suggested_categories": m_dict.get("suggested_categories", []),
-                    "chunks": m_dict.get("chunks", [{"text": k_entry.ai_summary or k_entry.title or "", "metadata": {"knowledge_id": str(knowledge_id)}}])
-                }
-                with open(p_file, "w", encoding="utf-8") as f:
-                    json.dump(doc_data, f, indent=4, ensure_ascii=False)
-                try:
-                    from app.services.storage import upload_staging_json
-                    upload_staging_json(str(knowledge_id), doc_data)
-                except Exception:
-                    pass
-
     stmt_check = select(Knowledge).where(Knowledge.id == knowledge_id, Knowledge.deleted_at.is_(None))
     res_check = await db.execute(stmt_check)
     k_check = res_check.scalar_one_or_none()
@@ -2787,7 +3110,24 @@ async def refine_knowledge(
         pipeline = get_ingestion_pipeline(request)
         bm25 = get_bm25_index(request)
         vector_store = get_vector_store(request)
+        summary_before = k_check.ai_summary if k_check else ""
         res = await refine_approved_document(str(knowledge_id), payload, pipeline, bm25, vector_store, llm, file_attachment=file_attachment)
+        # A change asked for in the chat of a published document takes effect right away, as a manual edit
+        # does: publish it so the chatbot answers with it (a question answered from the document changes nothing).
+        if (isinstance(res, dict) and not res.get("is_retrieval") and res.get("summary")
+                and summary_text_changed(summary_before, res["summary"])):
+            pub = await approve_document(knowledge_id=str(knowledge_id), pipeline=pipeline, bm25=bm25)
+            if isinstance(pub, dict) and pub.get("publish_failures"):
+                res["publish_failures"] = pub["publish_failures"]
+            approved_path = resolve_approved_file(str(knowledge_id))
+            if approved_path and os.path.exists(approved_path):
+                try:
+                    with open(approved_path, "r", encoding="utf-8") as af:
+                        published = json.load(af)
+                    res["summary"] = published.get("summary") or res["summary"]
+                    res["chunks"] = published.get("chunks") or res.get("chunks")
+                except Exception as read_err:
+                    logger.warning(f"Refine: could not read published document {knowledge_id}: {read_err}")
     elif p_file:
         res = await refine_pending_document(str(knowledge_id), payload, llm, file_attachment=file_attachment)
     else:
@@ -2997,7 +3337,8 @@ async def update_knowledge_project(
     current_user: User = Depends(RequireAccess("knowledge:write"))
 ):
     """Attach or detach a knowledge document to/from a project workspace."""
-    stmt = select(Knowledge).where(Knowledge.id == knowledge_id, Knowledge.deleted_at.is_(None))
+    # Check if record exists (including checking without soft-delete filter to prevent pkey collisions)
+    stmt = select(Knowledge).where(Knowledge.id == knowledge_id)
     result = await db.execute(stmt)
     knowledge = result.scalar_one_or_none()
     
@@ -3025,6 +3366,7 @@ async def update_knowledge_project(
                 pass
 
         doc_status = KnowledgeStatus.APPROVED if (target_file and "output" in target_file) else KnowledgeStatus.PENDING
+        data["project_id"] = str(payload.project_id) if payload.project_id else None
         knowledge = Knowledge(
             id=knowledge_id,
             title=file_name,
@@ -3042,8 +3384,13 @@ async def update_knowledge_project(
         db.add(knowledge)
     else:
         knowledge.project_id = payload.project_id
+        knowledge.deleted_at = None
+        if knowledge.metadata_ is not None:
+            knowledge.metadata_["project_id"] = str(payload.project_id) if payload.project_id else None
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(knowledge, "metadata_")
 
-    # Keep staging JSON file project_id in sync if exists
+    # Keep staging and approved JSON files in sync on disk & MinIO
     if target_file and os.path.exists(target_file):
         try:
             with open(target_file, "r", encoding="utf-8") as f:
@@ -3052,6 +3399,11 @@ async def update_knowledge_project(
                 j_data["project_id"] = str(payload.project_id) if payload.project_id else None
                 with open(target_file, "w", encoding="utf-8") as f:
                     json.dump(j_data, f, indent=4, ensure_ascii=False)
+                from app.services.storage import upload_staging_json, upload_approved_json
+                if "output" in target_file:
+                    upload_approved_json(str(knowledge_id), j_data)
+                else:
+                    upload_staging_json(str(knowledge_id), j_data)
         except Exception:
             pass
 
@@ -3164,31 +3516,6 @@ async def _async_purge_knowledge_assets(
         logger.warning(f"Error in background asset purge for {kid_str}: {exc}")
 
 
-@router.put("/{knowledge_id}", response_model=KnowledgeResponse)
-@router.patch("/{knowledge_id}", response_model=KnowledgeResponse)
-async def update_knowledge(
-    knowledge_id: uuid.UUID,
-    update_in: KnowledgeUpdate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(RequireAccess("knowledge:write"))
-):
-    stmt = select(Knowledge).where(Knowledge.id == knowledge_id, Knowledge.deleted_at.is_(None))
-    result = await db.execute(stmt)
-    knowledge = result.scalar_one_or_none()
-
-    if not knowledge:
-        raise HTTPException(status_code=404, detail="Knowledge entry not found")
-
-    update_data = update_in.model_dump(exclude_unset=True)
-    for field, val in update_data.items():
-        if hasattr(knowledge, field):
-            setattr(knowledge, field, val)
-
-    await db.commit()
-    await db.refresh(knowledge)
-    return knowledge
-
-
 @router.delete("/{knowledge_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_knowledge(
     knowledge_id: uuid.UUID,
@@ -3218,8 +3545,14 @@ async def delete_knowledge(
     ai_summary = knowledge.ai_summary or ""
     batch_id = str(d_meta.get("batch_id") or "").strip()
 
-    # 2. Mark soft-deleted and commit immediately (< 50ms total response time)
+    # 2. Mark soft-deleted and deactivate chunks atomically (< 50ms total response time)
     knowledge.deleted_at = datetime.now(timezone.utc)
+    await db.execute(text("""
+        UPDATE kb_chunk SET is_active = false
+        WHERE version_id IN (
+            SELECT id FROM knowledge_version WHERE knowledge_id = :kid
+        )
+    """), {"kid": knowledge_id})
     await db.commit()
 
     # 3. Offload heavy cleanup (MinIO, Vector store, BM25, and disk files) to background task
@@ -3234,3 +3567,22 @@ async def delete_knowledge(
     )
                 
     return None
+
+
+@router.get("/health/audit", summary="Get Knowledge Base Health Audit")
+async def get_kb_health_audit(
+    stuck_minutes: int = 30,
+    current_admin: User = Depends(RequireAccess("knowledge:read"))
+):
+    from app.rag.services.kb_health import run_kb_health_audit
+    return run_kb_health_audit(stuck_minutes=stuck_minutes)
+
+
+@router.post("/health/fix", summary="Apply KB Health Remediation Fixes")
+async def apply_kb_health_fix(
+    stuck_minutes: int = 30,
+    current_admin: User = Depends(RequireAccess("knowledge:write"))
+):
+    from app.rag.services.kb_health import apply_all_health_fixes
+    return apply_all_health_fixes(stuck_minutes=stuck_minutes)
+

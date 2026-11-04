@@ -173,3 +173,124 @@ export function extractKnowledgeCategories(doc?: KnowledgeResponse | null): stri
 
 	return Array.from(catSet);
 }
+
+
+// =============================================================================
+// PHASE 1.5 QUALITY GATE & STAGING OBSERVABILITY INTERFACES
+// =============================================================================
+
+export interface EvidenceItem {
+	id: string;
+	evidence_type: string;
+	knowledge_type?: string | null;
+	section_path: string[];
+	title?: string | null;
+	body: string;
+	attributes: Record<string, unknown>;
+	visual_analysis_status?: string | null;
+	confidence?: number | null;
+	derivation: string;
+	ordinal: number;
+}
+
+export interface AssetItem {
+	id: string;
+	storage_key: string;
+	asset_class: string;
+	classification_score: number;
+	classification_breakdown: Record<string, unknown>;
+	label?: string | null;
+	width?: number | null;
+	height?: number | null;
+	status: string;
+}
+
+export interface QualityGateReadiness {
+	is_ready: boolean;
+	can_publish: boolean;
+	current_status: string;
+	job_status: string;
+	unresolved_items: number;
+	reasons: string[];
+}
+
+export interface DispositionSummary {
+	evidence_count: number;
+	context_rows: number;
+	excluded_rows: number;
+}
+
+export interface IngestQualityProbeFailure {
+	question: string;
+	answer_quote: string;
+	answer: string;
+	grade: "partial" | "wrong" | "missing" | string;
+	retrieved: boolean;
+}
+
+export interface IngestQualityReport {
+	status: "PASS" | "NEEDS_REVIEW" | string;
+	weak_points: string[];
+	coverage: number | null;
+	missing_examples?: string[];
+	chunk_count: number;
+	source?: { file: string | null; sections: number; words: number };
+	structure: Record<string, { count: number; examples: string[] }>;
+	probes?: {
+		source?: string;
+		total?: number;
+		correct?: number;
+		retrieved?: number;
+		score?: number | null;
+		failures?: IngestQualityProbeFailure[];
+		error?: string;
+	};
+	checked_at?: string;
+}
+
+export interface ParseReportData {
+	source_file?: string;
+	total_physical_rows?: number;
+	disposition_summary?: DispositionSummary;
+	exclusions?: Array<{ source_range: string; disposition: string; reason: string }>;
+	quality?: IngestQualityReport;
+	[key: string]: unknown;
+}
+
+export interface VisualSummaryData {
+	total: number;
+	completed: number;
+	review_required: number;
+	failed: number;
+	[key: string]: unknown;
+}
+
+export interface QualityGateResponse {
+	knowledge_id: string;
+	version_id?: string | null;
+	version_no: number;
+	status: string;
+	job_status: string;
+	readiness: QualityGateReadiness;
+	parse_report: ParseReportData;
+	visual_summary: VisualSummaryData;
+	total_evidence_count: number;
+	total_asset_count: number;
+	evidences: EvidenceItem[];
+	assets: AssetItem[];
+}
+
+export interface UpdateEvidencePayload {
+	title?: string;
+	body?: string;
+	attributes?: Record<string, unknown>;
+	visual_analysis_status?: string;
+}
+
+export interface RegenerateSummaryResponse {
+	knowledge_id: string;
+	version_id: string;
+	summary_md: string;
+	message: string;
+}
+

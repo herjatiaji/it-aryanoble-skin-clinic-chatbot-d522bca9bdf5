@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Optional
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,12 +35,25 @@ class AdapterFactory:
         
         return os.getenv("OPENAI_BASE_URL")
 
-    @staticmethod
-    async def get_dynamic_llm(session: Optional[AsyncSession] = None) -> BaseLLMAdapter:
+    _DYNAMIC_LLM_CACHE = None
+    _DYNAMIC_LLM_CACHE_TS: float = 0.0
+    _CACHE_TTL_SECONDS: float = 60.0
+
+    @classmethod
+    def invalidate_dynamic_llm_cache(cls):
+        cls._DYNAMIC_LLM_CACHE = None
+        cls._DYNAMIC_LLM_CACHE_TS = 0.0
+
+    @classmethod
+    async def get_dynamic_llm(cls, session: Optional[AsyncSession] = None) -> BaseLLMAdapter:
         """
         Dynamically fetches LLM provider, model name, base_url, and API key from DB AppConfig (with .env fallback).
-        All providers use OpenAI-compatible ChatOpenAI adapter.
+        Cached in-memory for 60 seconds to eliminate DB query and decryption overhead on high-frequency chat streams.
         """
+        now = time.time()
+        if cls._DYNAMIC_LLM_CACHE is not None and (now - cls._DYNAMIC_LLM_CACHE_TS) < cls._CACHE_TTL_SECONDS:
+            return cls._DYNAMIC_LLM_CACHE
+
         from app.rag.services.rag_generator import OpenAIAdapter
         
         provider = settings.llm_provider.lower()
@@ -74,10 +88,13 @@ class AdapterFactory:
                 logger.warning(f"Failed to load dynamic LLM config from DB: {e}")
 
         # Resolve provider base URL mapping
-        base_url = AdapterFactory._resolve_provider_base_url(provider, base_url)
+        base_url = cls._resolve_provider_base_url(provider, base_url)
         api_key = api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY") or "dummy-key"
 
-        return OpenAIAdapter(api_key=api_key, model_name=model_name, base_url=base_url)
+        adapter = OpenAIAdapter(api_key=api_key, model_name=model_name, base_url=base_url)
+        cls._DYNAMIC_LLM_CACHE = adapter
+        cls._DYNAMIC_LLM_CACHE_TS = now
+        return adapter
 
     @staticmethod
     def get_llm() -> BaseLLMAdapter:

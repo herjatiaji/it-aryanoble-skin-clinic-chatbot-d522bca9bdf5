@@ -20,6 +20,41 @@ from app.rag.utils.parser import ParseResult
 
 from app.rag.services.embeddings import EmbeddingFactory
 
+def _with_context(meta: dict, context_heading: str) -> dict:
+    """
+    Records the heading a chunk was prefixed with for standalone retrieval context, so the document's display
+    text, assembled from its chunks, can leave out a heading it already shows instead of repeating it.
+    """
+    if context_heading:
+        meta["context_prefix"] = context_heading
+    return meta
+
+
+def join_chunk_texts_for_display(chunks: list) -> str:
+    """
+    The document text shown to reviewers, rebuilt from chunk dicts: a context heading the chunker prefixed to a
+    chunk ('### Indikasi', '## ALOPESIA AREATA') is dropped when that heading is already shown above it.
+    """
+    out = []
+    shown = set()
+    for c in chunks:
+        if not isinstance(c, dict):
+            continue
+        t = (c.get("text") or "").strip()
+        if not t:
+            continue
+        ctx = ((c.get("metadata") or {}).get("context_prefix") or "").strip()
+        if ctx and t.startswith(ctx) and ctx.lstrip("# ").strip().lower() in shown:
+            t = t[len(ctx):].lstrip()
+        for line in t.splitlines():
+            if line.startswith("#"):
+                # Compared by heading text: the same title may be shown at another level
+                shown.add(line.lstrip("# ").strip().lower())
+        if t:
+            out.append(t)
+    return "\n\n".join(out)
+
+
 class CustomChunker:
     def __init__(self, embedding_model_name: str = None):
         logger.info("Initializing Custom Chunker (Structural + Semantic)...")
@@ -111,7 +146,17 @@ class CustomChunker:
             headings = self._extract_docling_headings(sc)
             page = self._extract_docling_page(sc)
             
-            if not headings and text_strip.lower() in self.KNOWN_SECTIONS:
+            is_generic_section = (
+                text_strip.lower() in self.KNOWN_SECTIONS
+                or (
+                    len(text_strip) <= 60
+                    and not text_strip.endswith('.')
+                    and not any(ch in text_strip for ch in ':,;')
+                    and not text_strip.isdigit()
+                    and (text_strip.isupper() or text_strip.istitle())
+                )
+            )
+            if not headings and is_generic_section:
                 current_section = text_strip.upper()
                 continue
                 
@@ -382,25 +427,44 @@ class CustomChunker:
     # =========================================================================
     # FAST PATH: Document -> Section -> Entity/Treatment -> Semantic Chunking
     # =========================================================================
-    def _split_large_table(self, table_lines: List[str], max_rows_per_chunk: int = 8) -> List[str]:
+    def _split_large_table(self, table_lines: List[str], max_rows_per_chunk: int = 25) -> List[str]:
         """
         Splits a large markdown table into smaller valid sub-tables,
         ensuring each chunk has the complete table header and delimiter.
+        Dynamically adapts chunk row count to table width to prevent oversized chunks.
         """
-        if len(table_lines) <= 3:
-            return ["\n".join(table_lines)]
+        actual_lines = [l.strip() for l in table_lines if l.strip().startswith("|")]
+        if len(actual_lines) <= 2:
+            return ["\n".join(actual_lines)]
 
-        header = table_lines[0]
-        delimiter = table_lines[1]
-        data_rows = table_lines[2:]
+        header = actual_lines[0]
+        if not header.endswith("|"):
+            header = header + " |"
+
+        # Check if line 1 is a valid delimiter
+        if len(actual_lines) > 1 and re.match(r'^\|(?:\s*:?-{3,}:?\s*\|)+$', actual_lines[1]):
+            delimiter = actual_lines[1]
+            data_rows = actual_lines[2:]
+        else:
+            col_count = max(len(header.split('|')) - 2, 2)
+            delimiter = "| " + " | ".join(["---"] * col_count) + " |"
+            data_rows = actual_lines[1:]
+
+        # Dynamically scale max_rows_per_chunk based on row character length
+        avg_row_len = sum(len(r) for r in data_rows) / max(len(data_rows), 1)
+        if avg_row_len > 0:
+            target_rows = max(5, int(2200 / max(avg_row_len, 40)))
+            eff_max_rows = min(max_rows_per_chunk, target_rows)
+        else:
+            eff_max_rows = max_rows_per_chunk
 
         sub_tables = []
-        for i in range(0, len(data_rows), max_rows_per_chunk):
-            chunk_rows = data_rows[i:i + max_rows_per_chunk]
+        for i in range(0, len(data_rows), eff_max_rows):
+            chunk_rows = data_rows[i:i + eff_max_rows]
             sub_table = "\n".join([header, delimiter] + chunk_rows)
             sub_tables.append(sub_table)
 
-        return sub_tables
+        return sub_tables or ["\n".join(actual_lines)]
 
     def _chunk_fast_pages(self, pages: List[Dict], max_length_for_semantic: int = 600) -> List[Dict]:
         """
@@ -415,7 +479,7 @@ class CustomChunker:
         current_entity = ""
 
         # Regex patterns for hierarchical boundaries
-        section_h1_h2_pattern = re.compile(r"^(?:#{1,2}\s+|(?:Bab|Section|Bagian|Kategori)\s+\d+)", re.IGNORECASE)
+        section_h1_h2_pattern = re.compile(r"^(?:#{1,2}\s+|(?:Bab|Section|Bagian|Kategori)\s+\d+|Bagan\s+Alur|Alur\s+Diagnosis|Daftar\s+Singkatan)", re.IGNORECASE)
         # Match H3/H4 headers, but NOT bold key-value pairs or numbered list items
         entity_h3_h4_pattern = re.compile(r"^(?:#{3,4}\s+)", re.IGNORECASE)
         bold_entity_pattern = re.compile(r"^\*\*([A-Z0-9][A-Za-z0-9\s\.\-]+)\*\*\s*$", re.IGNORECASE)
@@ -436,9 +500,18 @@ class CustomChunker:
                 current_section = f"Sheet: {curr_sheet}"
                 last_sheet_name = curr_sheet
 
+            # Reset bibliography/reference section when crossing pages
+            if current_section and current_section.lower() in ["daftar pustaka", "references", "bibliography", "pustaka acuan"]:
+                current_section = "General"
+                current_entity = ""
+
             lines = page_text.split("\n")
             current_entity_lines = []
             current_table_lines = []
+            table_lead = []  # short held-back lines that open the next table
+            # Page-level H1 (e.g. the product a catalog page is about); H2 sections below it keep it in
+            # their section path so a split-out 'Cara Pakai' chunk still names its product.
+            page_h1 = ""
 
             sheet_name_val = curr_sheet or (current_section.split(":", 1)[1].strip() if current_section and current_section.lower().startswith("sheet:") else None)
 
@@ -447,7 +520,8 @@ class CustomChunker:
                     "section": current_section,
                     "entity": current_entity,
                     "page": page_num,
-                    "sheet_name": sheet_name_val
+                    "sheet_name": sheet_name_val,
+                    "is_flattened": page_data.get("is_flattened", False)
                 }
 
                 extracted_urls = []
@@ -523,6 +597,27 @@ class CustomChunker:
                     if ind_match:
                         meta["indication"] = ind_match.group(1).strip()
 
+                    # Extract Category / Kategori
+                    cat_match = re.search(r'(?:-\s*\*\*(?:Kategori|Category)\*\*|\b(?:Kategori|Category)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not cat_match:
+                        cat_match = re.search(r'\|\s*(?:Kategori|Category)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if cat_match:
+                        meta["category"] = cat_match.group(1).strip()
+
+                    # Extract Case / Kasus
+                    case_match = re.search(r'(?:-\s*\*\*(?:Case|Kasus)\*\*|\b(?:Case|Kasus)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not case_match:
+                        case_match = re.search(r'\|\s*(?:Case|Kasus)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if case_match:
+                        meta["case"] = case_match.group(1).strip()
+
+                    # Extract Grade / Tingkat
+                    grade_match = re.search(r'(?:-\s*\*\*(?:Grade|Derajat|Tingkat)\*\*|\b(?:Grade|Derajat)\b)\s*[:=]\s*([^\n\r]+)', chunk_text, re.IGNORECASE)
+                    if not grade_match:
+                        grade_match = re.search(r'\|\s*(?:Grade|Derajat|Tingkat)\s*\|\s*([^|\n\r]+)\s*\|', chunk_text, re.IGNORECASE)
+                    if grade_match:
+                        meta["grade"] = grade_match.group(1).strip()
+
                     # Extract promo validity period (YYYY-MM-DD) per product chunk if present
                     date_matches = re.findall(r'\b(20\d{2}-\d{2}-\d{2})\b', chunk_text)
                     if len(date_matches) >= 2:
@@ -547,6 +642,35 @@ class CustomChunker:
                     meta["image_url"] = page_image_url
                 if all_urls:
                     meta["image_urls"] = all_urls
+
+                # Propagate page-level scoped metadata (context isolation per slide)
+                if page_data.get("clinical_domain") or page_data.get("domain"):
+                    domain_val = page_data.get("clinical_domain") or page_data.get("domain")
+                    meta["clinical_domain"] = domain_val
+                    meta["domain"] = domain_val
+
+                if page_data.get("is_discontinued") is not None:
+                    # A page-level flag must not leak onto every product chunk of that page (e.g. a
+                    # 4-step routine slide where one step is discontinued): the chunk itself must carry the notice.
+                    from app.rag.utils.text_hygiene import has_status_notice
+                    meta["is_discontinued"] = bool(page_data.get("is_discontinued")) and (
+                        not chunk_text or has_status_notice(chunk_text)
+                    )
+
+                if page_data.get("target_indications"):
+                    meta["target_indications"] = page_data.get("target_indications")
+                    if not meta.get("indication"):
+                        meta["indication"] = ", ".join(page_data.get("target_indications"))
+
+                if page_data.get("routine_steps"):
+                    meta["routine_steps"] = page_data.get("routine_steps")
+
+                if page_data.get("product_entities"):
+                    meta["product_entities"] = page_data.get("product_entities")
+
+                if page_data.get("slide_title"):
+                    meta["slide_title"] = page_data.get("slide_title")
+
                 return meta
 
             def flush_entity_block():
@@ -579,20 +703,24 @@ class CustomChunker:
                             sub_text = "\n\n".join(running_sub)
                             if len(sub_text) >= 500:
                                 # Prepend entity header if not already in sub-text
+                                ctx = ""
                                 if current_entity and not sub_text.startswith("#"):
-                                    sub_text = f"### {current_entity}\n\n{sub_text}"
+                                    ctx = f"### {current_entity}"
+                                    sub_text = f"{ctx}\n\n{sub_text}"
                                 processed_chunks.append({
                                     "text": sub_text,
-                                    "metadata": _build_meta(sub_text)
+                                    "metadata": _with_context(_build_meta(sub_text), ctx)
                                 })
                                 running_sub = []
                         if running_sub:
                             sub_text = "\n\n".join(running_sub)
+                            ctx = ""
                             if current_entity and not sub_text.startswith("#"):
-                                sub_text = f"### {current_entity}\n\n{sub_text}"
+                                ctx = f"### {current_entity}"
+                                sub_text = f"{ctx}\n\n{sub_text}"
                             processed_chunks.append({
                                 "text": sub_text,
-                                "metadata": _build_meta(sub_text)
+                                "metadata": _with_context(_build_meta(sub_text), ctx)
                             })
                     else:
                         processed_chunks.append({
@@ -607,22 +735,33 @@ class CustomChunker:
                 if not current_table_lines:
                     return
 
-                prefix = f"## {current_section}\n\n" if (current_section and current_section.lower() != "general") else ""
+                is_banned_sec = current_section and current_section.lower() in ["general", "daftar pustaka", "references", "bibliography", "pustaka acuan"]
+                prefix = f"## {current_section}\n\n" if (current_section and not is_banned_sec) else ""
+                lead = "\n\n".join(table_lead).strip()
+                table_lead[:] = []
 
                 if len(current_table_lines) > 10:
-                    sub_tables = self._split_large_table(current_table_lines, max_rows_per_chunk=6)
-                    for tbl in sub_tables:
-                        full_tbl = f"{prefix}{tbl}" if prefix and not tbl.startswith("#") else tbl
+                    sub_tables = self._split_large_table(current_table_lines, max_rows_per_chunk=25)
+                    for si, tbl in enumerate(sub_tables):
+                        if si == 0 and lead:
+                            tbl = f"{lead}\n\n{tbl}"
+                        added = bool(prefix and not tbl.startswith("#"))
+                        full_tbl = f"{prefix}{tbl}" if added else tbl
+                        clean_tbl = f"\n\n{full_tbl.strip()}\n\n"
                         processed_chunks.append({
-                            "text": full_tbl,
-                            "metadata": _build_meta(full_tbl)
+                            "text": clean_tbl.strip(),
+                            "metadata": _with_context(_build_meta(clean_tbl.strip()), prefix.strip() if added else "")
                         })
                 else:
                     table_txt = "\n".join(current_table_lines)
-                    full_tbl = f"{prefix}{table_txt}" if prefix and not table_txt.startswith("#") else table_txt
+                    if lead:
+                        table_txt = f"{lead}\n\n{table_txt}"
+                    added = bool(prefix and not table_txt.startswith("#"))
+                    full_tbl = f"{prefix}{table_txt}" if added else table_txt
+                    clean_tbl = f"\n\n{full_tbl.strip()}\n\n"
                     processed_chunks.append({
-                        "text": full_tbl,
-                        "metadata": _build_meta(full_tbl)
+                        "text": clean_tbl.strip(),
+                        "metadata": _with_context(_build_meta(clean_tbl.strip()), prefix.strip() if added else "")
                     })
                 current_table_lines = []
 
@@ -631,18 +770,22 @@ class CustomChunker:
                 if not line_strip:
                     if current_table_lines:
                         flush_table_block()
+                    elif current_entity_lines and current_entity_lines[-1] != "":
+                        # Keep the paragraph boundary: without it the paragraphs and stacked short lines of
+                        # a block run together into one paragraph when the chunk text is normalized again.
+                        current_entity_lines.append("")
                     continue
 
                 # 1. Detect Markdown Table Row
                 is_table_row = line_strip.startswith("|") and line_strip.endswith("|")
                 if is_table_row:
                     if current_entity_lines:
-                        hdr_text = "\n".join(current_entity_lines).strip()
-                        if len(hdr_text) <= 250:
-                            current_table_lines.extend(current_entity_lines)
-                            current_entity_lines = []
-                        else:
-                            flush_entity_block()
+                        flush_entity_block()
+                    if current_entity_lines and not current_table_lines:
+                        # A short block held back to join the next one (a lone heading such as the disease
+                        # title) opens the table that follows; held back further it would surface after it.
+                        table_lead[:] = [l for l in current_entity_lines if l]
+                        current_entity_lines = []
                     current_table_lines.append(line_strip)
                     continue
                 else:
@@ -654,7 +797,13 @@ class CustomChunker:
                     flush_entity_block()
                     clean_sec = line_strip.lstrip("#: ").strip()
                     if clean_sec:
-                        current_section = clean_sec
+                        if re.match(r"^#\s", line_strip):
+                            page_h1 = clean_sec
+                            current_section = clean_sec
+                        elif re.match(r"^##\s", line_strip) and page_h1 and clean_sec != page_h1:
+                            current_section = f"{page_h1} / {clean_sec}"
+                        else:
+                            current_section = clean_sec
                         current_entity = ""
                     current_entity_lines.append(line_strip)
                     continue
@@ -742,13 +891,13 @@ def chunk_summary_markdown(
         "clinics": ["all"], "doctor_types": ["all"], "doctors": ["all"]
     }
 
-    # Split summary into sections by ## headings
-    raw_sections = re.split(r'(?=\n##\s+)', summary)
-    sections = [s.strip() for s in raw_sections if s.strip() and len(s.strip()) >= 30]
+    # Split summary into sections hierarchically by ## and ### headings (Tahap C)
+    raw_sections = re.split(r'(?=\n#{2,3}\s+)', summary)
+    sections = [s.strip() for s in raw_sections if s.strip()]
     if not sections:
         sections = [summary.strip()]
 
-    logger.info(f"Structure-aware chunking: split summary into {len(sections)} sections by ## headings.")
+    logger.info(f"Structure-aware chunking: split summary into {len(sections)} sections by ## and ### headings.")
 
     # Lightweight meta builder (no class instance needed)
     def _build_meta(chunk_text, entity_name, chunk_index):
@@ -801,12 +950,57 @@ def chunk_summary_markdown(
             meta["categories"] = categories
         return meta
 
+    # Helper: split a large Markdown table cleanly while repeating the header row on each sub-table
+    def _split_markdown_table(table_text: str, max_chars: int) -> list:
+        lines = [l.strip() for l in table_text.splitlines() if l.strip()]
+        if len(lines) < 2 or not lines[0].startswith("|"):
+            return [table_text]
+        header = lines[0]
+        if not header.endswith("|"):
+            header = header + " |"
+
+        if len(lines) > 1 and re.match(r'^\|(?:\s*:?-{3,}:?\s*\|)+$', lines[1]):
+            separator = lines[1]
+            body = lines[2:]
+        else:
+            col_count = max(len(header.split('|')) - 2, 2)
+            separator = "| " + " | ".join(["---"] * col_count) + " |"
+            body = lines[1:]
+
+        sub_tables = []
+        curr_rows = []
+        curr_len = len(header) + len(separator) + 2
+        for r in body:
+            if curr_len + len(r) + 1 > max_chars and curr_rows:
+                sub_tables.append("\n\n" + "\n".join([header, separator] + curr_rows) + "\n\n")
+                curr_rows = []
+                curr_len = len(header) + len(separator) + 2
+            curr_rows.append(r)
+            curr_len += len(r) + 1
+        if curr_rows:
+            sub_tables.append("\n\n" + "\n".join([header, separator] + curr_rows) + "\n\n")
+        return sub_tables or [table_text]
+
     chunks = []
     chunk_idx = 0
+    current_parent_h2 = ""
 
     for section_text in sections:
-        h2_match = re.match(r'^##\s+(?:\d+[\.\)]\s*)?(.+)', section_text)
-        entity_name = h2_match.group(1).strip() if h2_match else title
+        # Detect heading level and title
+        h_match = re.match(r'^(#{2,4})\s+(?:\d+[\.\)]\s*)?(.+)', section_text)
+        if h_match:
+            h_level, h_title = h_match.group(1), h_match.group(2).strip()
+            if h_level == "##":
+                current_parent_h2 = h_title
+                # If section only has the ## heading line with no body text, record parent and don't emit tiny orphan chunk
+                if len(section_text.splitlines()) <= 1:
+                    continue
+                entity_name = h_title
+            else:
+                # Sub-heading (### or ####): include parent breadcrumb for standalone semantic clarity
+                entity_name = f"{current_parent_h2} > {h_title}" if current_parent_h2 and current_parent_h2 != h_title else h_title
+        else:
+            entity_name = current_parent_h2 or title
 
         if len(section_text) <= max_section_chars:
             chunk_idx += 1
@@ -815,32 +1009,120 @@ def chunk_summary_markdown(
                 "metadata": _build_meta(section_text, entity_name, chunk_idx)
             })
         else:
-            paragraphs = [p.strip() for p in section_text.split("\n\n") if p.strip()]
-            running_parts = []
-            running_len = 0
-            for para in paragraphs:
-                if running_len + len(para) > max_section_chars and running_parts:
+            # Check if this oversized section is primarily a Markdown table
+            first_non_h = [l.strip() for l in section_text.splitlines() if l.strip() and not l.strip().startswith("#")]
+            is_table_section = len(first_non_h) >= 2 and first_non_h[0].startswith("|") and first_non_h[1].startswith("|")
+
+            if is_table_section:
+                # Extract any heading before table
+                leading_h = [l for l in section_text.splitlines() if l.strip().startswith("#")]
+                h_prefix = "\n".join(leading_h) + "\n\n" if leading_h else ""
+                table_body = "\n".join([l for l in section_text.splitlines() if not l.strip().startswith("#")]).strip()
+
+                table_sub_chunks = _split_markdown_table(table_body, max_section_chars - len(h_prefix))
+                for st in table_sub_chunks:
+                    chunk_idx += 1
+                    full_chunk_text = f"{h_prefix}{st}".strip()
+                    chunks.append({
+                        "text": full_chunk_text,
+                        "metadata": _build_meta(full_chunk_text, entity_name, chunk_idx)
+                    })
+            else:
+                # Standard paragraph / card splitting
+                paragraphs = [p.strip() for p in section_text.split("\n\n") if p.strip()]
+                running_parts = []
+                running_len = 0
+                for para in paragraphs:
+                    # If single paragraph is still huge (> max_section_chars), split by line
+                    if len(para) > max_section_chars:
+                        if running_parts:
+                            chunk_idx += 1
+                            sub_text = "\n\n".join(running_parts)
+                            chunks.append({
+                                "text": sub_text,
+                                "metadata": _build_meta(sub_text, entity_name, chunk_idx)
+                            })
+                            running_parts = []
+                            running_len = 0
+                        # Line-based slicing for huge paragraph
+                        sub_lines = [l.strip() for l in para.splitlines() if l.strip()]
+                        line_parts = []
+                        line_len = 0
+                        for l in sub_lines:
+                            if line_len + len(l) > max_section_chars and line_parts:
+                                chunk_idx += 1
+                                sub_text = "\n".join(line_parts)
+                                chunks.append({
+                                    "text": sub_text,
+                                    "metadata": _build_meta(sub_text, entity_name, chunk_idx)
+                                })
+                                line_parts = []
+                                line_len = 0
+                            line_parts.append(l)
+                            line_len += len(l) + 1
+                        if line_parts:
+                            chunk_idx += 1
+                            sub_text = "\n".join(line_parts)
+                            chunks.append({
+                                "text": sub_text,
+                                "metadata": _build_meta(sub_text, entity_name, chunk_idx)
+                            })
+                        continue
+
+                    if running_len + len(para) > max_section_chars and running_parts:
+                        chunk_idx += 1
+                        sub_text = "\n\n".join(running_parts)
+                        if entity_name and not sub_text.startswith("#"):
+                            sub_text = f"### {entity_name}\n\n{sub_text}"
+                        chunks.append({
+                            "text": sub_text,
+                            "metadata": _build_meta(sub_text, entity_name, chunk_idx)
+                        })
+                        running_parts = []
+                        running_len = 0
+                    running_parts.append(para)
+                    running_len += len(para) + 2
+
+                if running_parts:
                     chunk_idx += 1
                     sub_text = "\n\n".join(running_parts)
-                    if entity_name and not sub_text.startswith("##"):
-                        sub_text = f"## {entity_name}\n\n{sub_text}"
+                    if entity_name and not sub_text.startswith("#"):
+                        sub_text = f"### {entity_name}\n\n{sub_text}"
                     chunks.append({
                         "text": sub_text,
                         "metadata": _build_meta(sub_text, entity_name, chunk_idx)
                     })
-                    running_parts = []
-                    running_len = 0
-                running_parts.append(para)
-                running_len += len(para)
-            if running_parts:
+
+    # Hard upper bound guard: ensure NO chunk exceeds 2000 chars
+    final_chunks = []
+    for c in chunks:
+        t = c.get("text", "")
+        if len(t) <= 2000:
+            final_chunks.append(c)
+        else:
+            # Force slice at 1800 chars
+            lines = t.splitlines()
+            curr_lines = []
+            curr_l = 0
+            for l in lines:
+                if curr_l + len(l) + 1 > 1800 and curr_lines:
+                    chunk_idx += 1
+                    sliced_text = "\n".join(curr_lines)
+                    final_chunks.append({
+                        "text": sliced_text,
+                        "metadata": c.get("metadata", {})
+                    })
+                    curr_lines = []
+                    curr_l = 0
+                curr_lines.append(l)
+                curr_l += len(l) + 1
+            if curr_lines:
                 chunk_idx += 1
-                sub_text = "\n\n".join(running_parts)
-                if entity_name and not sub_text.startswith("##"):
-                    sub_text = f"## {entity_name}\n\n{sub_text}"
-                chunks.append({
-                    "text": sub_text,
-                    "metadata": _build_meta(sub_text, entity_name, chunk_idx)
+                sliced_text = "\n".join(curr_lines)
+                final_chunks.append({
+                    "text": sliced_text,
+                    "metadata": c.get("metadata", {})
                 })
 
-    logger.info(f"Structure-aware chunking complete: {len(chunks)} chunks from {len(sections)} sections.")
-    return chunks
+    logger.info(f"Structure-aware chunking complete: {len(final_chunks)} chunks from {len(sections)} sections (max chunk size: {max(len(c['text']) for c in final_chunks) if final_chunks else 0} chars).")
+    return final_chunks

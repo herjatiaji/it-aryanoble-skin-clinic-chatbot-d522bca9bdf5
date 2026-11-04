@@ -57,6 +57,7 @@ import {
 	RiMore2Line,
 	RiRobot2Line,
 	RiSearchLine,
+	RiDownload2Line,
 } from "@remixicon/react";
 import { useRouter } from "next/navigation";
 import { use, useMemo, useState } from "react";
@@ -786,6 +787,16 @@ export default function ProjectDetailPage({ params }: { params: Promise<{ id: st
 															>
 																<RiEyeLine className="size-3.5 mr-2" />
 																<span>View Details</span>
+															</DropdownMenuItem>
+															<DropdownMenuItem
+																onClick={(e) => {
+																	e.stopPropagation();
+																	window.open(`/api/knowledge/${row.id}/file`, "_blank");
+																}}
+																className="text-xs text-gray-700 cursor-pointer"
+															>
+																<RiDownload2Line className="size-3.5 mr-2" />
+																<span>View Original File</span>
 															</DropdownMenuItem>
 															<DropdownMenuItem
 																onClick={() => {

@@ -3,6 +3,7 @@ import re
 import time
 import json
 import asyncio
+import contextvars
 from typing import List, Optional, Dict, Any, Union
 from app.core.logger import logger, ApprovalTrace
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks, Path, Body, Request
@@ -22,7 +23,15 @@ from app.rag.schemas import (
     ApprovedDocumentResponse,
     RAGEvaluationItem,
     RAGEvaluationRequest,
-    RAGEvaluationResponse
+    RAGEvaluationResponse,
+    QualityGateResponse,
+    UpdateEvidenceRequest,
+    RegenerateSummaryResponse,
+    PublishVersionRequest,
+    PublishVersionResponse,
+    MediaResolveResponse,
+    InvariantCheckResponse,
+    ReparseVisionRequest
 )
 from app.rag.services.rag_pipeline import IngestionPipeline
 from app.rag.services.rag_retriever import HybridRetriever, BM25Index
@@ -42,6 +51,7 @@ from app.rag.deps import (
 )
 from app.rag.services.interfaces import BaseLLMAdapter, BaseVectorStoreAdapter
 from app.rag.services.general_knowledge_service import GeneralKnowledgeService
+from app.rag.pipeline_versions import chunker_version_of
 from app.services.storage import expand_image_urls_in_markdown
 
 
@@ -375,7 +385,7 @@ def auto_embed_images_in_summary(
                 updated = updated[:pos] + img_md + updated[pos:].lstrip("\n")
                 placed = True
             else:
-                words = [w for w in re.split(r'[\s\-_/]+', prod_name) if len(w) > 3 and w.lower() not in ["erha", "produk", "product"]]
+                words = [w for w in re.split(r'[\s\-_/]+', prod_name) if len(w) > 3 and w.lower() not in ["produk", "product"]]
                 if len(words) >= 2:
                     fuzzy_prod_regex = re.compile(
                         r'(?mi)^(#{2,6}\s*.*?' + r'.*?'.join(re.escape(w) for w in words[:3]) + r'.*?)$'
@@ -385,6 +395,20 @@ def auto_embed_images_in_summary(
                         pos = fuzzy_match.end()
                         updated = updated[:pos] + img_md + updated[pos:].lstrip("\n")
                         placed = True
+
+        # --- HEURISTIC 3.5: Match by Page/Slide Number in image filename to Slide Heading ---
+        if not placed:
+            p_match = re.search(r'[_\/]p(?:age)?_?(\d+)[_\.]', clean_u, re.IGNORECASE)
+            if p_match:
+                p_num = int(p_match.group(1))
+                page_head_regex = re.compile(
+                    rf'(?mi)^(#{{1,4}}\s*.*?(?:slide|halaman|page)\s*{p_num}\b.*?)$'
+                )
+                head_match = page_head_regex.search(updated)
+                if head_match:
+                    pos = head_match.end()
+                    updated = updated[:pos] + img_md + updated[pos:].lstrip("\n")
+                    placed = True
 
         # --- HEURISTIC 4: Match by Product Information / Packaging Section ---
         if not placed and role == "PRODUCT_PACKAGING":
@@ -397,24 +421,18 @@ def auto_embed_images_in_summary(
                 updated = updated[:pos] + img_md + updated[pos:].lstrip("\n")
                 placed = True
 
-        # --- HEURISTIC 5: Match First Major Subsection (## Heading, excluding Ringkasan & Profil) ---
-        if not placed:
-            for m in re.finditer(r'(?m)^(##\s*([^\n]+))', updated):
-                h_title = m.group(2).strip().lower()
-                if not any(k in h_title for k in ["ringkasan", "overview", "profil", "catatan", "penutup"]):
-                    pos = m.end()
-                    updated = updated[:pos] + img_md + updated[pos:].lstrip("\n")
-                    placed = True
-                    break
-
-        # --- FALLBACK: If document has only single header # Title ---
-        if not placed:
+        # --- FALLBACK: Only for SINGLE-IMAGE documents (e.g. single product flyer/hero photo) ---
+        # Never dump a gallery of unplaced orphan images under # Title or arbitrary ## Headings.
+        # If the document has exactly 1 image and NO images are currently placed anywhere in the document:
+        if not placed and len(normalized_assets) == 1 and not re.search(r'!\[.*?\]\([^\)]+\)', updated):
             header_match = re.search(r'^(#+\s*[^\n]+)', updated, flags=re.MULTILINE)
             if header_match:
                 pos = header_match.end()
                 updated = updated[:pos] + img_md + updated[pos:].lstrip("\n")
+                placed = True
             else:
                 updated = img_md.strip() + "\n\n" + updated
+                placed = True
 
     # Post-processing: Remove any images mistakenly placed under ## Ringkasan / ## Ringkasan Dokumen
     # (Ringkasan should contain executive bullet points, not duplicate photo dumps)
@@ -708,7 +726,7 @@ def extract_product_cards_from_summary(summary: str, target_product_names: Optio
 
         has_name = re.search(r'-\s*\*\*Nama(?:\s+Produk)?\*\*\s*:\s*([^\n]+)', sec_str, re.IGNORECASE)
         has_prod_attr = bool(re.search(r'-\s*\*\*(?:Brand|Kategori|Harga|Ukuran|Kandungan|Manfaat|Deskripsi|Metode Aplikasi|Indikasi|Cara Pakai)\*\*\s*:', sec_str, re.IGNORECASE))
-        is_prod_heading = bool(re.match(r'^#{1,4}\s+(?:Detail\s+Produk|Informasi\s+Produk|[A-Za-z0-9\s\-\+\%]+Serum|[A-Za-z0-9\s\-\+\%]+Cream|[A-Za-z0-9\s\-\+\%]+Gel|[A-Za-z0-9\s\-\+\%]+Lotion|[A-Za-z0-9\s\-\+\%]+Toner|[A-Za-z0-9\s\-\+\%]+Cleanser|[A-Za-z0-9\s\-\+\%]+Sunscreen|[A-Za-z0-9\s\-\+\%]+Moisturizer|[A-Za-z0-9\s\-\+\%]+Facial|[A-Za-z0-9\s\-\+\%]+Acne|[A-Za-z0-9\s\-\+\%]+Truwhite|[A-Za-z0-9\s\-\+\%]+GlowLift)', sec_str, re.IGNORECASE))
+        is_prod_heading = bool(re.match(r'^#{1,4}\s+(?:Detail\s+Produk|Informasi\s+Produk|[A-Za-z0-9\s\-\+\%]+(?:Serum|Cream|Gel|Lotion|Toner|Cleanser|Sunscreen|Moisturizer|Facial|Wash|Mask|Shampoo|Ampoule|Solution))', sec_str, re.IGNORECASE))
 
         if not (has_prod_attr and (has_name or is_prod_heading or re.match(r'^#{1,4}\s+', sec_str))):
             continue
@@ -784,15 +802,20 @@ def format_chat_response_with_cards(
 
     if not summary or not summary.strip():
         return confirmation
+
     cards_md = extract_product_cards_from_summary(summary, target_product_names=target_product_names)
     if not cards_md.strip() and not target_product_names:
         cards_md = extract_product_cards_from_summary(summary)
+
+    if cards_md.strip():
+        label = intro_label or "Berikut adalah detail produk yang diperbarui:"
+        return f"{confirmation}\n\n{label}\n\n{cards_md}".strip()
     
-    if not cards_md.strip():
-        return confirmation
-    
-    label = intro_label or "Berikut adalah detail yang diperbarui:"
-    return f"{confirmation}\n\n{label}\n\n{cards_md}".strip()
+    # Fallback for general/clinical/table/SOP documents without product cards:
+    # Ensure the updated knowledge content is displayed in full
+    clean_summary = summary.strip()
+    label = "Berikut adalah isi knowledge yang telah diperbarui:"
+    return f"{confirmation}\n\n### {label}\n\n{clean_summary}".strip()
 
 
 def apply_refinements_to_content(
@@ -828,7 +851,7 @@ def apply_refinements_to_content(
             is_sku_target = True
             if sku_target:
                 sku_target_clean = sku_target.lower()
-                target_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', sku_target_clean) if w not in ('erha', 'acneact', 'the', 'and', 'for', 'product', 'overview')]
+                target_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', sku_target_clean) if w not in ('erha', 'the', 'and', 'for', 'product', 'overview', 'produk')]
                 if target_words:
                     is_sku_target = any(tw in sec_lower for tw in target_words)
 
@@ -836,7 +859,7 @@ def apply_refinements_to_content(
             is_price_target = True
             if price_target:
                 price_target_clean = price_target.lower()
-                target_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', price_target_clean) if w not in ('erha', 'acneact', 'the', 'and', 'for', 'product', 'overview')]
+                target_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', price_target_clean) if w not in ('erha', 'the', 'and', 'for', 'product', 'overview', 'produk')]
                 if target_words:
                     is_price_target = any(tw in sec_lower for tw in target_words)
 
@@ -910,7 +933,7 @@ def apply_refinements_to_content(
             
             should_update_sku = True
             if extracted_sku and sku_target:
-                target_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', sku_target.lower()) if w not in ('erha', 'acneact', 'the', 'and', 'for', 'product', 'overview')]
+                target_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', sku_target.lower()) if w not in ('erha', 'the', 'and', 'for', 'product', 'overview', 'produk')]
                 if target_words:
                     should_update_sku = any(tw in chunk_combined for tw in target_words)
 
@@ -933,72 +956,31 @@ def apply_refinements_to_content(
         sections = re.split(r'(?=\n#{1,4}\s+)', "\n" + clean_base_summary)
         new_secs = []
 
-        is_truwhite_hyaluronic = (
-            "hyaluronic" in extracted_replace_old.lower() and 
-            any(w in clean_base_summary.lower() for w in ("truwhite", "brightening"))
-        )
-
-        truwhite_targets = [
-            "ERHA Truwhite Brightening Serum with 10% Stable Ethyl Vitamin C & Brightening Peptides",
-            "ERHA Truwhite Brightening Day Cream SPF30 PA+++",
-            "ERHA Truwhite Brightening Pore Toner 100 ml",
-            "ERHA Truwhite Peptovitae® Bright, Yuzu Extract & Niacinamide Moisture Gel Cream"
-        ]
-
         for sec in sections:
             if not sec.strip():
                 continue
             name_m = re.search(r'-\s*\*\*Nama(?:\s+Produk)?\*\*\s*:\s*([^\n]+)', sec)
             p_name = name_m.group(1).strip() if name_m else ""
-            
-            matched_truwhite_target = None
-            if is_truwhite_hyaluronic:
-                for target_p in truwhite_targets:
-                    p_clean = re.sub(r'[^a-zA-Z0-9]', '', target_p.lower())
-                    sec_clean = re.sub(r'[^a-zA-Z0-9]', '', (p_name or sec).lower())
-                    if "serum" in target_p.lower() and "serum" in sec_clean and "eye" not in sec_clean:
-                        matched_truwhite_target = target_p
-                        break
-                    elif "daycream" in p_clean and ("daycream" in sec_clean or "krimsiang" in sec_clean):
-                        matched_truwhite_target = target_p
-                        break
-                    elif "poretoner" in p_clean and "toner" in sec_clean:
-                        matched_truwhite_target = target_p
-                        break
-                    elif "peptovitae" in p_clean and "peptovitae" in sec_clean:
-                        matched_truwhite_target = target_p
-                        break
+            if not p_name:
+                head_m = re.search(r'^#{1,4}\s+([^\n]+)', sec.strip())
+                if head_m:
+                    p_name = head_m.group(1).strip()
 
-            # 1. Direct match with old_pattern
+            # Direct match with old_pattern
             if old_pattern.search(sec):
                 sec = old_pattern.sub(extracted_replace_new, sec)
-                display_name = matched_truwhite_target or p_name
-                if display_name and display_name not in affected_products:
-                    affected_products.append(display_name)
-            # 2. Domain / Test 11 scenario for Truwhite products containing Hyaluronic Acid
-            elif matched_truwhite_target:
-                if "kandungan utama" in sec.lower():
-                    if old_pattern.search(sec):
-                        sec = old_pattern.sub(extracted_replace_new, sec)
-                    elif extracted_replace_new.lower() not in sec.lower():
-                        sec = re.sub(r'(-\s*\*\*Kandungan Utama\*\*\s*:\s*)([^\n]+)', r'\1\2, ' + extracted_replace_new, sec, count=1)
-                elif "deskripsi" in sec.lower():
-                    if old_pattern.search(sec):
-                        sec = old_pattern.sub(extracted_replace_new, sec)
-                    elif extracted_replace_new.lower() not in sec.lower():
-                        sec = re.sub(r'(-\s*\*\*Deskripsi\*\*\s*:\s*)([^\n]+)', r'\1\2 (Diformulasikan dengan ' + extracted_replace_new + ')', sec, count=1)
-                
-                if matched_truwhite_target not in affected_products:
-                    affected_products.append(matched_truwhite_target)
+                if p_name and p_name not in affected_products:
+                    affected_products.append(p_name)
 
             new_secs.append(sec)
 
         updated_summary = "".join(new_secs).strip()
 
-        if is_truwhite_hyaluronic:
-            for t_p in truwhite_targets:
-                if t_p not in affected_products:
-                    affected_products.append(t_p)
+        # Synchronize chunks with text replacements
+        for chunk in chunks:
+            if isinstance(chunk, dict) and "text" in chunk:
+                if old_pattern.search(chunk["text"]):
+                    chunk["text"] = old_pattern.sub(extracted_replace_new, chunk["text"])
 
         if affected_products:
             rep_msg = f"Berhasil mengubah \"{extracted_replace_old}\" menjadi \"{extracted_replace_new}\" pada seluruh produk terkait ({', '.join(affected_products)})."
@@ -1319,10 +1301,13 @@ def apply_targeted_image_swap(
     for np in re.findall(r'-\s*\*\*Nama(?:\s+Produk)?\*\*\s*:\s*([^\n]+)', summary):
         known_products.append(np.strip())
 
+    # Words most product names share (a brand, a product line) do not tell products apart
+    from app.rag.utils.summary_chunker import common_words
+    shared_name_words = common_words(known_products)
     best_score = 0
     best_product = None
     for kp in known_products:
-        kp_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', kp) if w.lower() not in ("erha", "produk")]
+        kp_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', kp) if w.lower() not in shared_name_words and w.lower() != "produk"]
         if not kp_words:
             continue
         score = 0
@@ -1345,7 +1330,10 @@ def apply_targeted_image_swap(
     target_idx = -1
 
     if target_name and len(sections) > 1:
-        target_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', target_name) if w.lower() not in ("erha", "produk", "gambar", "foto", "dengan", "ini", "jadi")]
+        from app.rag.utils.summary_chunker import common_words
+        shared_name_words = common_words([h.strip() for h in re.findall(r'#{1,4}\s+([^\n]+)', summary)])
+        target_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', target_name)
+                        if w.lower() not in shared_name_words and w.lower() not in ("produk", "gambar", "foto", "dengan", "ini", "jadi")]
         best_match_idx = -1
         best_match_score = 0
 
@@ -1429,7 +1417,10 @@ def preserve_existing_product_images(old_summary: str, new_summary: str, user_pr
     del_target = delete_match.group(1).lower().strip() if (delete_match and delete_match.group(1)) else ""
 
     old_sections = re.split(r'(?=\n#{1,4}\s+)', "\n" + old_summary)
-    
+    # Words most item names share (a brand, a product line) do not tell items apart
+    from app.rag.utils.summary_chunker import common_words
+    shared_name_words = common_words([h.strip() for h in re.findall(r'#{1,4}\s+([^\n]+)', old_summary)])
+
     for o_sec in old_sections:
         name_match = re.search(r'-\s*\*\*Nama(?:\s+Produk)?\*\*\s*:\s*([^\n]+)', o_sec)
         if not name_match:
@@ -1448,14 +1439,14 @@ def preserve_existing_product_images(old_summary: str, new_summary: str, user_pr
         old_alt = img_match.group(1)
         old_url = img_match.group(2).strip()
 
-        if del_target and any(w in del_target for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', p_name.lower()) if w not in ("erha", "produk")):
+        if del_target and any(w in del_target for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', p_name.lower()) if w not in shared_name_words and w != "produk"):
             continue
 
         if old_url in new_summary:
             continue
 
         new_sections = re.split(r'(?=\n#{1,4}\s+)', "\n" + new_summary)
-        p_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', p_name.lower()) if w not in ("erha", "produk")]
+        p_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', p_name.lower()) if w not in shared_name_words and w != "produk"]
         
         target_new_idx = -1
         for idx, n_sec in enumerate(new_sections):
@@ -1603,36 +1594,24 @@ def align_chunks_with_multitreatment(
     return chunks
 
 
+def _looks_like_uuid(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", (value or "").strip().lower()))
+
+
 def resolve_pending_file(knowledge_id: str) -> Optional[str]:
+    clean_k_id = str(knowledge_id).strip().lower()
     candidate_dirs = ["data/pending", "backend/data/pending"]
+    
+    # 1. Direct O(1) file path check
     for pending_dir in candidate_dirs:
         if not os.path.exists(pending_dir):
             continue
-        clean_p = os.path.join(pending_dir, f"{knowledge_id}.json")
-        if os.path.exists(clean_p):
-            return clean_p
-        parsed_p = os.path.join(pending_dir, f"{knowledge_id}_parsed.json")
-        if os.path.exists(parsed_p):
-            return parsed_p
-        for f in os.listdir(pending_dir):
-            if f.endswith(".json"):
-                full_p = os.path.join(pending_dir, f)
-                name_no_ext = f[:-5]
-                if f.startswith(knowledge_id) or name_no_ext == knowledge_id or name_no_ext.replace("_parsed", "") == knowledge_id:
-                    return full_p
-                try:
-                    with open(full_p, "r", encoding="utf-8") as fp:
-                        data = json.load(fp)
-                    if isinstance(data, dict) and (data.get("knowledge_id") == knowledge_id or data.get("file_name") == knowledge_id):
-                        return full_p
-                    elif isinstance(data, list) and data and isinstance(data[0], dict):
-                        meta = data[0].get("metadata", {})
-                        if meta.get("knowledge_id") == knowledge_id or meta.get("source_file") == knowledge_id:
-                            return full_p
-                except Exception:
-                    pass
+        for candidate_name in [f"{knowledge_id}.json", f"{knowledge_id}_parsed.json", f"{clean_k_id}.json", f"{clean_k_id}_parsed.json"]:
+            clean_p = os.path.join(pending_dir, candidate_name)
+            if os.path.exists(clean_p):
+                return clean_p
 
-    # MinIO Source of Truth Hydration fallback
+    # 2. MinIO Source of Truth Hydration fallback
     try:
         from app.services.storage import get_staging_json
         staged_data = get_staging_json(knowledge_id)
@@ -1646,55 +1625,79 @@ def resolve_pending_file(knowledge_id: str) -> Optional[str]:
     except Exception as e:
         logger.debug(f"MinIO staging hydration note: {e}")
 
+    # 3. PostgreSQL Database Hydration fallback
+    try:
+        from sqlalchemy import text
+        from app.core.database import get_sync_engine
+        sync_eng = get_sync_engine()
+        with sync_eng.connect() as conn:
+            row = conn.execute(
+                # A published document has no draft: building one from its row would invent an "On review"
+                # copy that later reads and approvals mistake for a real pending edit.
+                text("SELECT id, title, file_name, ai_summary, metadata, status FROM knowledge WHERE id::text = :k_id AND deleted_at IS NULL AND status <> 'APPROVED' LIMIT 1"),
+                {"k_id": knowledge_id}
+            ).fetchone()
+            if not row and not clean_k_id.replace("-", "").isalnum():
+                row = conn.execute(
+                    text("SELECT id, title, file_name, ai_summary, metadata, status FROM knowledge WHERE (LOWER(title) = LOWER(:k_id) OR LOWER(file_name) = LOWER(:k_id)) AND deleted_at IS NULL AND status <> 'APPROVED' LIMIT 1"),
+                    {"k_id": knowledge_id}
+                ).fetchone()
+
+            if row:
+                row_id, title, fname, summary, meta_val, k_status = row[0], row[1], row[2], row[3], row[4], row[5]
+                m_dict = meta_val if isinstance(meta_val, dict) else (json.loads(meta_val) if isinstance(meta_val, str) else {})
+                doc = {
+                    "knowledge_id": str(row_id),
+                    "batch_id": m_dict.get("batch_id"),
+                    "file_name": fname or str(row_id),
+                    "title": title or fname or str(row_id),
+                    "status": "Pending",
+                    "summary": summary or "",
+                    "chunks": m_dict.get("chunks", []),
+                    "images": m_dict.get("images", []),
+                    "image_urls": m_dict.get("image_urls", []),
+                    "categories": m_dict.get("categories", []),
+                    "visibility_settings": m_dict.get("visibility_settings", {}),
+                    "history": m_dict.get("history", []),
+                    "chat_history": m_dict.get("chat_history", []),
+                    "initial_prompt": m_dict.get("initial_prompt")
+                }
+                target_dir = "data/pending" if os.path.exists("data") else "backend/data/pending"
+                os.makedirs(target_dir, exist_ok=True)
+                clean_p = os.path.join(target_dir, f"{knowledge_id}.json")
+                with open(clean_p, "w", encoding="utf-8") as fp:
+                    json.dump(doc, fp, indent=4, ensure_ascii=False)
+                return clean_p
+    except Exception as db_e:
+        logger.debug(f"DB pending hydration note: {db_e}")
+
+    # 4. Fast filename-only fallback for legacy name queries (O(1) string check, NO json.load() loop).
+    # An id names exactly one document: a fragment match would hand back another document's file.
+    if _looks_like_uuid(clean_k_id):
+        return None
+    for pending_dir in candidate_dirs:
+        if not os.path.exists(pending_dir):
+            continue
+        for f in os.listdir(pending_dir):
+            if f.endswith(".json") and (f.lower().startswith(clean_k_id) or clean_k_id in f.lower()):
+                return os.path.join(pending_dir, f)
+
     return None
 
 def resolve_approved_file(knowledge_id: str) -> Optional[str]:
     candidate_dirs = ["data/output", "backend/data/output"]
-    clean_k_id = knowledge_id.strip().lower()
-    fallback_match = None
+    clean_k_id = str(knowledge_id).strip().lower()
 
+    # 1. Direct O(1) file path check
     for approved_dir in candidate_dirs:
         if not os.path.exists(approved_dir):
             continue
-        clean_p = os.path.join(approved_dir, f"{knowledge_id}.json")
-        if os.path.exists(clean_p):
-            return clean_p
-        parsed_p = os.path.join(approved_dir, f"{knowledge_id}_parsed.json")
-        if os.path.exists(parsed_p):
-            return parsed_p
-        
-        for f in os.listdir(approved_dir):
-            if f.endswith(".json") and f != "bm25_index.pkl":
-                full_p = os.path.join(approved_dir, f)
-                name_no_ext = f[:-5]
-                if f.startswith(knowledge_id) or name_no_ext == knowledge_id or name_no_ext.replace("_parsed", "") == knowledge_id:
-                    return full_p
-                try:
-                    with open(full_p, "r", encoding="utf-8") as fp:
-                        data = json.load(fp)
-                    if isinstance(data, dict):
-                        doc_kid = str(data.get("knowledge_id", "")).strip().lower()
-                        doc_fname = str(data.get("file_name", "")).strip().lower()
-                        doc_title = str(data.get("title", "")).strip().lower()
-                        
-                        if clean_k_id in (doc_kid, doc_fname, doc_title):
-                            return full_p
-                        if doc_title and (clean_k_id in doc_title or doc_title in clean_k_id):
-                            fallback_match = full_p
-                    elif isinstance(data, list) and data:
-                        meta = data[0].get("metadata", {})
-                        doc_kid = str(meta.get("knowledge_id", "")).strip().lower()
-                        doc_source = str(meta.get("source_file", "")).strip().lower()
-                        doc_title = str(meta.get("title", "")).strip().lower()
-                        if clean_k_id in (doc_kid, doc_source, doc_title):
-                            return full_p
-                except Exception:
-                    pass
+        for candidate_name in [f"{knowledge_id}.json", f"{knowledge_id}_parsed.json", f"{clean_k_id}.json", f"{clean_k_id}_parsed.json"]:
+            clean_p = os.path.join(approved_dir, candidate_name)
+            if os.path.exists(clean_p):
+                return clean_p
 
-    if fallback_match:
-        return fallback_match
-
-    # MinIO Source of Truth Hydration fallback
+    # 2. MinIO Source of Truth Hydration fallback
     try:
         from app.services.storage import get_approved_json
         approved_data = get_approved_json(knowledge_id)
@@ -1708,11 +1711,11 @@ def resolve_approved_file(knowledge_id: str) -> Optional[str]:
     except Exception as e:
         logger.debug(f"MinIO approved hydration note: {e}")
 
-    # PostgreSQL Database Hydration fallback
+    # 3. PostgreSQL Database Hydration fallback
     try:
-        from app.rag.config import settings as rag_settings
-        from sqlalchemy import create_engine, text
-        sync_eng = create_engine(rag_settings.pg_conn_str, pool_pre_ping=True)
+        from sqlalchemy import text
+        from app.core.database import get_sync_engine
+        sync_eng = get_sync_engine()
         with sync_eng.connect() as conn:
             row = conn.execute(
                 text("SELECT id, title, file_name, ai_summary, metadata FROM knowledge WHERE id::text = :k_id AND status = 'APPROVED' AND deleted_at IS NULL LIMIT 1"),
@@ -1738,7 +1741,9 @@ def resolve_approved_file(knowledge_id: str) -> Optional[str]:
                     "images": m_dict.get("images", []),
                     "image_urls": m_dict.get("image_urls", []),
                     "categories": m_dict.get("categories", []),
-                    "visibility_settings": m_dict.get("visibility_settings", {})
+                    "visibility_settings": m_dict.get("visibility_settings", {}),
+                    "edit_history": m_dict.get("edit_history", []),
+                    "history": m_dict.get("history", [])
                 }
                 target_dir = "data/output" if os.path.exists("data") else "backend/data/output"
                 os.makedirs(target_dir, exist_ok=True)
@@ -1749,57 +1754,129 @@ def resolve_approved_file(knowledge_id: str) -> Optional[str]:
     except Exception as db_e:
         logger.debug(f"DB approved hydration note: {db_e}")
 
+    # 4. Fast filename-only fallback for legacy name queries (O(1) string check, NO json.load() loop)
+    if _looks_like_uuid(clean_k_id):
+        return None
+    for approved_dir in candidate_dirs:
+        if not os.path.exists(approved_dir):
+            continue
+        for f in os.listdir(approved_dir):
+            if f.endswith(".json") and f != "bm25_index.pkl" and (f.lower().startswith(clean_k_id) or clean_k_id in f.lower()):
+                return os.path.join(approved_dir, f)
+
     return None
 
 
 
 def is_knowledge_record_active(k_id: Optional[str], file_name: Optional[str]) -> bool:
-    """Helper to check whether a document is still actively published/pending in DB (deleted_at IS NULL)."""
+    """Helper to check whether a document is still actively published/pending in DB (deleted_at IS NULL and not REJECTED)."""
     try:
-        from app.core.database import engine
+        from app.core.database import get_sync_engine
         from sqlalchemy import text
         import uuid as _uuid
-        with engine.connect() as conn:
+        sync_engine = get_sync_engine()
+        with sync_engine.connect() as conn:
             if k_id:
                 try:
                     kuuid = str(_uuid.UUID(k_id))
                     row = conn.execute(
-                        text("SELECT id FROM knowledge WHERE id = :kid AND deleted_at IS NULL"),
+                        text("SELECT id, status, ai_summary FROM knowledge WHERE id = :kid AND deleted_at IS NULL"),
                         {"kid": kuuid}
                     ).first()
                     if row:
+                        status_str = str(row.status or "").upper()
+                        summary_str = str(row.ai_summary or "")
+                        if status_str == "REJECTED" or summary_str.startswith("[Gagal Diproses]"):
+                            return False
                         return True
-                    # If we checked specific valid UUID and found it deleted/missing:
-                    # check if any other active record with this filename exists
                     if file_name:
                         row_f = conn.execute(
-                            text("SELECT id FROM knowledge WHERE file_name = :fname AND deleted_at IS NULL"),
+                            text("SELECT id, status, ai_summary FROM knowledge WHERE file_name = :fname AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1"),
                             {"fname": file_name}
                         ).first()
-                        return bool(row_f)
+                        if row_f:
+                            st_f = str(row_f.status or "").upper()
+                            sum_f = str(row_f.ai_summary or "")
+                            if st_f == "REJECTED" or sum_f.startswith("[Gagal Diproses]"):
+                                return False
+                            return True
+                        return False
                     return False
                 except ValueError:
                     pass
             if file_name:
                 row = conn.execute(
-                    text("SELECT id FROM knowledge WHERE file_name = :fname AND deleted_at IS NULL"),
+                    text("SELECT id, status, ai_summary FROM knowledge WHERE file_name = :fname AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1"),
                     {"fname": file_name}
                 ).first()
-                return bool(row)
-    except Exception:
-        # If DB check fails or table is unavailable, fallback to True for safety
-        return True
+                if row:
+                    st_r = str(row.status or "").upper()
+                    sum_r = str(row.ai_summary or "")
+                    if st_r == "REJECTED" or sum_r.startswith("[Gagal Diproses]"):
+                        return False
+                    return True
+                return False
+    except Exception as e:
+        logger.debug(f"DB check in is_knowledge_record_active: {e}")
+        return False
     return False
 
 
-def detect_duplicate_lifecycle(file_hash: str, file_name: str) -> Dict[str, Any]:
+ACTIVE_PROCESSING_HASHES: Dict[str, Dict[str, Any]] = {}
+
+
+def detect_duplicate_lifecycle(file_hash: str, file_name: str, exclude_knowledge_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Evaluates the duplicate status of an uploaded file across the entire Knowledge Base:
+    - State 0: PROCESSING (currently being processed in background pipeline) -> ALREADY IN QUEUE
     - State 1: PUBLISHED (in data/output or KnowledgeStatus.APPROVED) -> BLOCK
     - State 2: PENDING (in data/pending or KnowledgeStatus.PENDING/ON_REVIEW) -> ASK ADMIN (Keep/Replace)
     - State 3: NEW -> Ingest
     """
+    import time as _time
+    now = _time.time()
     clean_name = file_name.strip().lower()
+
+    # 0. Check IN-FLIGHT PROCESSING (in active background pipeline with stale task eviction > 20m)
+    if file_hash and file_hash in ACTIVE_PROCESSING_HASHES:
+        active_info = ACTIVE_PROCESSING_HASHES[file_hash]
+        started_at = active_info.get("started_at", 0)
+        if now - started_at > 1200:
+            ACTIVE_PROCESSING_HASHES.pop(file_hash, None)
+        else:
+            return {
+                "status": "PROCESSING",
+                "existing_file": active_info.get("file_name", file_name),
+                "knowledge_id": active_info.get("knowledge_id"),
+                "match_reason": "Active In-Flight Ingestion Task"
+            }
+
+    # 0b. The knowledge table is the record of what exists. Approved/staged JSON may live only in object
+    # storage (no local file), so a check of the local folders alone lets the same file in twice.
+    try:
+        from app.core.database import get_sync_engine
+        from sqlalchemy import text as _sql
+        with get_sync_engine().connect() as conn:
+            row = conn.execute(
+                _sql(
+                    "SELECT id, file_name, status, metadata->>'file_hash' AS fh FROM knowledge "
+                    "WHERE deleted_at IS NULL AND status IN ('APPROVED', 'PENDING') "
+                    "AND coalesce(ai_summary, '') NOT LIKE '[Gagal Diproses]%' "
+                    "AND ((:h <> '' AND metadata->>'file_hash' = :h) OR lower(trim(file_name)) = :n) "
+                    "AND id::text <> :ex "
+                    "ORDER BY (status = 'APPROVED') DESC, created_at DESC LIMIT 1"
+                ),
+                {"h": file_hash or "", "n": clean_name, "ex": str(exclude_knowledge_id or "")},
+            ).first()
+        if row:
+            return {
+                "status": "PUBLISHED" if str(row.status).upper() == "APPROVED" else "PENDING",
+                "existing_file": row.file_name or file_name,
+                "knowledge_id": str(row.id),
+                "match_reason": "SHA-256 Checksum Match" if (file_hash and row.fh == file_hash) else "Filename Match",
+            }
+    except Exception as db_err:
+        logger.warning(f"Duplicate check against knowledge table skipped: {db_err}")
 
     # 1. Check PUBLISHED / APPROVED (data/output)
     approved_dir = "data/output"
@@ -1831,6 +1908,8 @@ def detect_duplicate_lifecycle(file_hash: str, file_name: str) -> Dict[str, Any]
                     if is_hash_match or is_name_match:
                         # Verify that this published record is still active in the database
                         doc_kid = k_id or f[:-5]
+                        if exclude_knowledge_id and str(doc_kid) == str(exclude_knowledge_id):
+                            continue  # the document being replaced is not its own duplicate
                         if not is_knowledge_record_active(doc_kid, ex_name or file_name):
                             # Orphaned file from a soft-deleted knowledge document; remove and ignore
                             try:
@@ -1878,6 +1957,8 @@ def detect_duplicate_lifecycle(file_hash: str, file_name: str) -> Dict[str, Any]
 
                     if is_hash_match or is_name_match:
                         doc_kid = k_id or f[:-5]
+                        if exclude_knowledge_id and str(doc_kid) == str(exclude_knowledge_id):
+                            continue  # the document being replaced is not its own duplicate
                         if not is_knowledge_record_active(doc_kid, ex_name or file_name):
                             # Orphaned staging file from a soft-deleted knowledge document; remove and ignore
                             try:
@@ -1907,11 +1988,21 @@ def check_sha256_duplicate(file_hash: str, file_name: str) -> Optional[str]:
 
 CANCELLED_INGESTION_IDS: set[str] = set()
 
+# The document the current ingestion task is parsing, so long parsing loops can stop when it is cancelled
+CURRENT_INGESTION_ID: contextvars.ContextVar[str] = contextvars.ContextVar("current_ingestion_id", default="")
+
+
 def cancel_ingestion_job(knowledge_id: Union[str, uuid.UUID]):
     """Register a knowledge_id as cancelled so active background workers abort immediately."""
     if knowledge_id:
         k_str = str(knowledge_id).lower()
         CANCELLED_INGESTION_IDS.add(k_str)
+        try:
+            os.makedirs("data/temp/cancellations", exist_ok=True)
+            with open(os.path.join("data/temp/cancellations", k_str), "w") as f:
+                f.write("cancelled")
+        except Exception:
+            pass
         logger.info(f"🛑 [INGESTION CANCELLED] Registered cancellation for knowledge_id: {k_str}")
 
 def uncancel_ingestion_job(knowledge_id: Union[str, uuid.UUID]):
@@ -1919,6 +2010,12 @@ def uncancel_ingestion_job(knowledge_id: Union[str, uuid.UUID]):
     if knowledge_id:
         k_str = str(knowledge_id).lower()
         CANCELLED_INGESTION_IDS.discard(k_str)
+        try:
+            cancel_marker = os.path.join("data/temp/cancellations", k_str)
+            if os.path.exists(cancel_marker):
+                os.remove(cancel_marker)
+        except Exception:
+            pass
 
 clear_cancellation_job = uncancel_ingestion_job
 
@@ -1926,7 +2023,236 @@ def is_ingestion_cancelled(knowledge_id: Union[str, uuid.UUID]) -> bool:
     """Check whether a knowledge ingestion job was cancelled by user."""
     if not knowledge_id:
         return False
-    return str(knowledge_id).lower() in CANCELLED_INGESTION_IDS
+    k_str = str(knowledge_id).lower()
+    if k_str in CANCELLED_INGESTION_IDS:
+        return True
+    try:
+        return os.path.exists(os.path.join("data/temp/cancellations", k_str))
+    except Exception:
+        return False
+
+def _process_extracted_chunks_sync(output_file: str, knowledge_id: str, batch_id: Optional[str], file_hash: Optional[str], file_name: str):
+    """Offload CPU-bound JSON load, table repair, and text normalizations from the event loop."""
+    with open(output_file, 'r', encoding='utf-8') as f:
+        enriched_chunks = json.load(f)
+
+    from app.rag.services.rag_generator import repair_markdown_tables
+    from app.rag.utils.normalizer import normalize_document_text
+
+    init_image_url = None
+    all_doc_image_urls = []
+    doc_s3_key = None
+
+    for chunk in enriched_chunks:
+        if isinstance(chunk, dict):
+            if "metadata" not in chunk:
+                chunk["metadata"] = {}
+            chunk["metadata"]["knowledge_id"] = knowledge_id
+            chunk["metadata"]["batch_id"] = batch_id
+            chunk["metadata"]["file_hash"] = file_hash
+            chunk["metadata"]["source_file"] = file_name
+            chunk.pop("suggested_categories", None)
+            chunk["metadata"].pop("document_type", None)
+            if chunk.get("text"):
+                chunk["text"] = normalize_document_text(repair_markdown_tables(chunk["text"]))
+
+            m = chunk["metadata"]
+            if m.get("image_url") and m["image_url"] not in all_doc_image_urls:
+                all_doc_image_urls.append(m["image_url"])
+            if m.get("s3_key") and not doc_s3_key:
+                doc_s3_key = m["s3_key"]
+            elif m.get("storage_key") and not doc_s3_key:
+                doc_s3_key = m["storage_key"]
+
+    if all_doc_image_urls:
+        init_image_url = all_doc_image_urls[0]
+
+    from app.rag.utils.chunker import join_chunk_texts_for_display
+    full_extracted_text = normalize_document_text(
+        repair_markdown_tables(join_chunk_texts_for_display(enriched_chunks))
+    )
+    return enriched_chunks, full_extracted_text, init_image_url, all_doc_image_urls, doc_s3_key
+
+def _write_json_sync(file_path: str, data: dict):
+    """Offload blocking file writes of large JSON documents from the event loop."""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def _finalize_summary_sync(canonical_text: str, recommended_title: str) -> str:
+    """Offload CPU-bound summary text normalization and markdown table repair."""
+    import re
+    from app.rag.utils.normalizer import normalize_document_text
+    from app.rag.services.rag_generator import repair_markdown_tables
+    clean_body = normalize_document_text(canonical_text.strip())
+    if not clean_body.startswith(f"# {recommended_title}"):
+        clean_body = re.sub(r'^#\s+[^\n]+\n*', '', clean_body)
+        res_summary = f"# {recommended_title}\n\n{clean_body}"
+    else:
+        res_summary = clean_body
+    if res_summary:
+        res_summary = re.sub(r'!\[([^\]]*)\]\s*\n+\s*\(([^)]+)\)', r'![\1](\2)', res_summary)
+        res_summary = repair_markdown_tables(res_summary)
+    return res_summary
+
+def summary_text_changed(old: Optional[str], new: Optional[str]) -> bool:
+    """Whether two summaries differ in content, ignoring table repair and whitespace differences."""
+    from app.rag.services.rag_generator import repair_markdown_tables
+
+    def norm(s: Optional[str]) -> str:
+        return re.sub(r"\s+", " ", repair_markdown_tables(s or "")).strip()
+
+    return norm(old) != norm(new)
+
+
+def chunk_texts(chunks: Any) -> List[str]:
+    """The text of each chunk, for telling whether two chunk lists hold the same content."""
+    if not isinstance(chunks, list):
+        return []
+    return [str(c.get("text") or "").strip() if isinstance(c, dict) else str(c).strip() for c in chunks]
+
+
+def _run_canonical_shadow_ingest_sync(
+    knowledge_id: str,
+    file_name: str,
+    file_hash: Optional[str],
+    extracted_doc_type: str,
+    visibility_settings: dict,
+    recommended_title: str,
+    enriched_chunks: list,
+    summary: str
+):
+    """Run synchronous canonical clinical evidence ingestion and embeddings in background thread pool."""
+    import uuid as _uuid
+    from app.rag.services.canonical_ingest_service import CanonicalIngestService
+    from app.rag.canonical import (
+        CanonicalEvidence,
+        CanonicalEntity,
+        CanonicalAsset,
+        ParseReport,
+        extract_canonical_form_factor,
+        extract_entity_aliases,
+        normalize_entity_key,
+    )
+
+    can_service = CanonicalIngestService()
+    shadow_ktype = "PRODUCT" if extracted_doc_type == "PRODUCT" else ("TREATMENT" if extracted_doc_type == "TREATMENT" else "OTHER")
+    can_ver_info = can_service.get_or_create_version(
+        knowledge_id=str(knowledge_id),
+        file_hash=file_hash or "shadow_file_hash",
+        default_knowledge_type=shadow_ktype,
+        authority_level=2,
+        visibility=visibility_settings
+    )
+    can_vid = can_ver_info["version_id"]
+
+    can_evidences = []
+    for c_idx, ch in enumerate(enriched_chunks):
+        ch_txt = ch.get("text") if isinstance(ch, dict) else str(ch)
+        ch_meta = ch.get("metadata", {}) if isinstance(ch, dict) else {}
+        c_ev = CanonicalEvidence(
+            id=str(_uuid.uuid4()),
+            version_id=can_vid,
+            evidence_type="TEXT" if not ch_meta.get("is_table") else "TABLE_ROW",
+            knowledge_type=shadow_ktype,
+            section_path=[ch_meta.get("section", "General")],
+            title=ch_meta.get("title") or recommended_title,
+            body=ch_txt,
+            attributes=ch_meta,
+            provenance={"source_file": file_name, "page": ch_meta.get("page", 1)},
+            derivation="NATIVE",
+            processor="pipeline_ingest_shadow",
+            processor_version="2.1.0",
+            confidence=1.0,
+            visual_analysis_status="NATIVE_COMPLETE",
+            ordinal=c_idx
+        )
+        can_evidences.append(c_ev)
+
+    can_entities = []
+    seen_entity_keys = set()
+    ent_type = "PRODUCT" if extracted_doc_type == "PRODUCT" else "TREATMENT"
+
+    if recommended_title:
+        rec_clean = recommended_title.strip()
+        nkey = normalize_entity_key(rec_clean)
+        if nkey and nkey not in seen_entity_keys:
+            seen_entity_keys.add(nkey)
+            can_entities.append(CanonicalEntity(
+                entity_type=ent_type,
+                canonical_name=rec_clean,
+                normalized_key=nkey,
+                form_factor=extract_canonical_form_factor(rec_clean),
+                aliases=extract_entity_aliases(rec_clean)
+            ))
+
+    # Universal Entity Discovery from enriched chunks & markdown table rows
+    NAME_COL_PATTERNS = {"nama", "name", "nama tindakan", "nama produk", "treatment", "produk", "product", "item", "layanan", "service", "tindakan", "judul"}
+    for ch in enriched_chunks:
+        ch_meta = ch.get("metadata", {}) if isinstance(ch, dict) else {}
+        for m_key in ("product_name", "treatment_name", "entity_name", "item_name"):
+            cand_m = ch_meta.get(m_key)
+            if cand_m and isinstance(cand_m, str) and len(cand_m.strip()) >= 3:
+                cand_clean = cand_m.strip()
+                nkey = normalize_entity_key(cand_clean)
+                if nkey and nkey not in seen_entity_keys:
+                    seen_entity_keys.add(nkey)
+                    can_entities.append(CanonicalEntity(
+                        entity_type=ent_type,
+                        canonical_name=cand_clean,
+                        normalized_key=nkey,
+                        form_factor=extract_canonical_form_factor(cand_clean),
+                        aliases=extract_entity_aliases(cand_clean)
+                    ))
+
+        ch_txt = ch.get("text") if isinstance(ch, dict) else str(ch)
+        if "|" in ch_txt:
+            lines = ch_txt.splitlines()
+            col_name_idx = None
+            for line in lines:
+                stripped = line.strip()
+                if not stripped.startswith("|") or not stripped.endswith("|"):
+                    continue
+                cells = [c.strip() for c in stripped.split("|")[1:-1]]
+                if not cells:
+                    continue
+                lower_cells = [c.lower() for c in cells]
+                if any(lc in NAME_COL_PATTERNS or any(p in lc for p in ("nama", "treatment", "produk")) for lc in lower_cells):
+                    for idx, lc in enumerate(lower_cells):
+                        if lc in NAME_COL_PATTERNS or any(p in lc for p in ("nama tindakan", "nama produk", "treatment", "nama")):
+                            col_name_idx = idx
+                            break
+                    continue
+                if all(set(c).issubset({"-", " ", ":"}) for c in cells if c):
+                    continue
+                if col_name_idx is not None and col_name_idx < len(cells):
+                    raw_cand = cells[col_name_idx].strip()
+                    if len(raw_cand) >= 3 and not raw_cand.isdigit() and raw_cand.lower() not in NAME_COL_PATTERNS:
+                        nkey = normalize_entity_key(raw_cand)
+                        if nkey and nkey not in seen_entity_keys:
+                            seen_entity_keys.add(nkey)
+                            can_entities.append(CanonicalEntity(
+                                entity_type=ent_type,
+                                canonical_name=raw_cand,
+                                normalized_key=nkey,
+                                form_factor=extract_canonical_form_factor(raw_cand),
+                                aliases=extract_entity_aliases(raw_cand)
+                            ))
+
+    can_rep = ParseReport(
+        source_file=file_name,
+        total_physical_rows=len(can_evidences),
+        disposition_summary={"evidence_count": len(can_evidences), "context_rows": 0, "excluded_rows": 0}
+    )
+
+    can_service.ingest_canonical_document(
+        version_id=can_vid,
+        evidences=can_evidences,
+        entities=can_entities,
+        assets=[],
+        parse_report=can_rep,
+        summary_md=summary
+    )
 
 _ingestion_semaphore = asyncio.Semaphore(settings.max_ingestion_concurrency)
 
@@ -1942,6 +2268,8 @@ async def process_ingestion_background(
 ):
     if is_ingestion_cancelled(knowledge_id):
         logger.info(f"🛑 [INGESTION ABORTED] Knowledge ID '{knowledge_id}' ({file_name}) was cancelled before processing started.")
+        if file_hash:
+            ACTIVE_PROCESSING_HASHES.pop(file_hash, None)
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -1983,6 +2311,8 @@ async def process_ingestion_background(
             os.makedirs(pipeline.output_dir, exist_ok=True)
             
             t0_parse = _time.time()
+            # The parsers check this between pages (asyncio.to_thread carries it into the worker thread)
+            CURRENT_INGESTION_ID.set(str(knowledge_id))
             try:
                 output_file = await asyncio.to_thread(pipeline.ingest_file, file_path)
             finally:
@@ -2012,42 +2342,19 @@ async def process_ingestion_background(
             if not output_file:
                 raise RuntimeError(f"Gagal mengekstrak teks dari dokumen '{file_name}'. Format file mungkin rusak atau tidak didukung.")
                 
-            # Load the staged JSON containing raw parsed chunks
-            with open(output_file, 'r', encoding='utf-8') as f:
-                enriched_chunks = json.load(f)
-
-            # Inject metadata cleanly into every chunk immediately
-            for chunk in enriched_chunks:
-                if isinstance(chunk, dict):
-                    if "metadata" not in chunk:
-                        chunk["metadata"] = {}
-                    chunk["metadata"]["knowledge_id"] = knowledge_id
-                    chunk["metadata"]["batch_id"] = batch_id
-                    chunk["metadata"]["file_hash"] = file_hash
-                    chunk["metadata"]["source_file"] = file_name
-                    chunk.pop("suggested_categories", None)
-                    chunk["metadata"].pop("document_type", None)
-
-            full_extracted_text = "\n\n".join([c.get("text", "") for c in enriched_chunks if isinstance(c, dict) and c.get("text")])
+            # Offload chunk processing, table sanitization, and text normalization from the event loop
+            enriched_chunks, full_extracted_text, init_image_url, all_doc_image_urls, doc_s3_key = await asyncio.to_thread(
+                _process_extracted_chunks_sync,
+                output_file,
+                knowledge_id,
+                batch_id,
+                file_hash,
+                file_name
+            )
 
             clean_title_fallback = os.path.splitext(file_name)[0]
 
-            # Write initial pending state IMMEDIATELY (0.5s) so GET /pending and GET /documents work instantly
-            init_image_url = None
-            all_doc_image_urls = []
-            doc_s3_key = None
-            for c in enriched_chunks:
-                if isinstance(c, dict) and c.get("metadata"):
-                    m = c["metadata"]
-                    if m.get("image_url") and m["image_url"] not in all_doc_image_urls:
-                        all_doc_image_urls.append(m["image_url"])
-                    if m.get("s3_key") and not doc_s3_key:
-                        doc_s3_key = m["s3_key"]
-                    elif m.get("storage_key") and not doc_s3_key:
-                        doc_s3_key = m["storage_key"]
-            if all_doc_image_urls:
-                init_image_url = all_doc_image_urls[0]
-
+            # Write initial pending state asynchronously so GET /pending and GET /documents work instantly without blocking
             os.makedirs("data/pending", exist_ok=True)
             pending_file_path = os.path.join("data/pending", f"{knowledge_id}.json")
             initial_staged_doc = {
@@ -2075,11 +2382,10 @@ async def process_ingestion_background(
             if init_image_url:
                 initial_staged_doc["image_url"] = init_image_url
 
-            with open(pending_file_path, 'w', encoding='utf-8') as f:
-                json.dump(initial_staged_doc, f, indent=4, ensure_ascii=False)
+            await asyncio.to_thread(_write_json_sync, pending_file_path, initial_staged_doc)
             try:
                 from app.services.storage import upload_staging_json
-                upload_staging_json(knowledge_id, initial_staged_doc)
+                await asyncio.to_thread(upload_staging_json, knowledge_id, initial_staged_doc)
             except Exception as st_err:
                 logger.debug(f"MinIO staging upload note: {st_err}")
                 
@@ -2154,21 +2460,36 @@ async def process_ingestion_background(
                         or any(kw in canonical_lower for kw in ["harga", "price", "sku", "netto", "katalog", "catalogue", "daftar produk"])
                     )
 
-                    if is_academic_journal or (len(canonical_text) > 12000 and not is_product_catalog):
-                        # For papers/journals: extract title & metadata quickly using first 8000 chars (title, abstract, authors)
+                    # A spreadsheet, a very long document or a flattened design deck is published as its full parsed
+                    # text whatever the model writes (see the coverage guards below), so asking the model to rewrite
+                    # it as Markdown only costs time: for a large sheet that rewrite never fits in one request and
+                    # times out again and again. Only its metadata is asked for, from the beginning of the document.
+                    summary_kept_verbatim = (
+                        file_name_lower.endswith(('.xlsx', '.xls', '.csv'))
+                        or len(canonical_text) > 30000
+                        or "pdf_flat_doc" in canonical_text
+                        or any(isinstance(c, dict) and c.get("metadata", {}).get("is_flattened") for c in enriched_chunks)
+                    )
+                    if is_academic_journal or summary_kept_verbatim or (len(canonical_text) > 12000 and not is_product_catalog):
+                        # Title & metadata quickly from the first 8000 chars (title, abstract, authors, first rows)
                         doc_content_excerpt = canonical_text[:8000]
+                        doc_kind = (
+                            "This document is a scientific research paper, journal article, clinical study, or academic manuscript."
+                            if is_academic_journal else
+                            "Only the beginning of the document is shown; it is published in full separately."
+                        )
                         structuring_prompt = f"""
-You are an expert scientific document analysis AI for PT Arya Noble (ERHA).
-This document is a scientific research paper, journal article, clinical study, or academic manuscript.
+You are an expert document analysis AI for PT Arya Noble (ERHA).
+{doc_kind}
 
 Your tasks:
 1. **DETECT METADATA**:
-   - title: Extract the EXACT clean paper title (without file extensions, authors, or journal metadata).
+   - title: Extract the EXACT clean document title (without file extensions, authors, or journal metadata).
    - document_type: "GENERAL"
    - valid_from: null
    - valid_until: null
    - suggested_categories: Array of matching category objects strictly from the "Available Categories" list below.
-   - feedback: 1 informative sentence in Indonesian describing the paper topic, research findings, and scope.
+   - feedback: 1 informative sentence in Indonesian describing what the document is about and its scope.
 
 DOCUMENT CONTENT (Beginning excerpt):
 {doc_content_excerpt}
@@ -2178,16 +2499,24 @@ Available Categories:
 
 Return ONLY valid JSON (no surrounding markdown code blocks):
 {{
-    "title": "Clean Scientific Paper Title",
+    "title": "<clean document title>",
     "document_type": "GENERAL",
     "valid_from": null,
     "valid_until": null,
     "suggested_categories": [],
-    "feedback": "Jurnal ilmiah ini membahas..."
-}}"""
+    "feedback": "<1 kalimat bahasa Indonesia tentang isi dan cakupan dokumen ini>"
+}}
+The angle-bracket values describe what to write; never copy them literally."""
                     else:
-                        # Document content excerpt for structuring
-                        doc_content_excerpt = canonical_text[:30000] if len(canonical_text) > 30000 else canonical_text
+                        # Document content excerpt for structuring (smart head + mid + tail sample if very large)
+                        if len(canonical_text) > 30000:
+                            head_part = canonical_text[:16000]
+                            mid_start = max(16000, len(canonical_text) // 2 - 4000)
+                            mid_part = canonical_text[mid_start:mid_start + 8000]
+                            tail_part = canonical_text[-6000:]
+                            doc_content_excerpt = f"{head_part}\n\n[... CONT'D MIDDLE SECTIONS ...]\n\n{mid_part}\n\n[... CONT'D FINAL SECTIONS ...]\n\n{tail_part}"
+                        else:
+                            doc_content_excerpt = canonical_text
 
                         admin_instruction_block = ""
                         if user_prompt and str(user_prompt).strip():
@@ -2238,6 +2567,11 @@ Your tasks:
    - STRICT ZERO-HALLUCINATION & FACTUAL ACCURACY RULE FOR PRODUCT ATTRIBUTES (CRITICAL):
      * SKU RULE: ONLY include the `- **SKU**: [Nomor SKU]` line IF AND ONLY IF an explicit SKU code or number is written in the source document. If NO SKU code/number is explicitly written in the source document, YOU MUST COMPLETELY OMIT THE `- **SKU**:` LINE ENTIRELY! DO NOT INVENT, FABRICATE, GENERATE, OR GUESS ANY SKU CODE (e.g. NEVER create ERHA-ACNE-001, ERHA-TRU-001, or any random code).
      * ATTRIBUTE ACCURACY: ONLY include attribute bullet lines (`Brand`, `Kategori`, `Ukuran`, `Harga`, `Deskripsi`, `Komposisi`, `Cara Penggunaan`, `Kontraindikasi`, `Efek Samping`) for values that are EXPLICITLY present in the source document. Do NOT invent missing values or fabricate categories.
+     * PRODUCT STATUS & DISCONTINUED RULE (STRICT MANDATE - ZERO TOLERANCE FOR FALSE DISCONTINUED):
+       - By default, ALL products are ACTIVE and AVAILABLE.
+       - NEVER label, tag, or describe a product as 'Discontinue', 'Discontinued', 'Tidak Aktif', or 'Tidak Tersedia' unless the source document EXPLICITLY and UNAMBIGUOUSLY contains an official discontinuation notice (e.g. "DISCONTINUE", "stok klinik habis") ATTACHED DIRECTLY TO THAT SPECIFIC PRODUCT.
+       - If a document contains a list or comparison table where only one specific product is marked discontinued, DO NOT apply or generalize the discontinued status to other products or to the document as a whole!
+       - If NO explicit discontinuation notice is physically written for a product, DO NOT include any `- **Status**: Discontinue` line or `(DISCONTINUED)` badge for that product!
    - NON-PRODUCT DOCUMENTS RULE: If the document is a Technical Design Document, SOP, FAQ, operational manual, or general report (NOT a product catalog): DO NOT format content into `### Detail Produk` blocks. Use clean, standard Markdown headings (`##`, `###`) reflecting the actual document sections.
    - EXCEL & SPREADSHEET TABLE PRESERVATION:
      * For non-product SPREADSHEET / CSV files: PRESERVE AND KEEP TABLES AS MARKDOWN (`| Col 1 | Col 2 |`).
@@ -2273,16 +2607,33 @@ Available Categories:
 
 Return ONLY valid JSON (no surrounding markdown code blocks):
 {{
-    "title": "Clean Document Title",
-    "document_type": "PRODUCT",
+    "title": "<short title taken from this document's own content>",
+    "document_type": "<PRODUCT | TREATMENT | PROMOTIONAL | SOP | GENERAL>",
     "valid_from": null,
     "valid_until": null,
     "suggested_categories": [],
-    "feedback": "Dokumen ini berhasil diekstrak dan diformat dalam Markdown terstruktur.",
-    "formatted_summary": "# Clean Document Title\\n\\nFormatted Markdown content here..."
-}}"""
+    "feedback": "<1 kalimat bahasa Indonesia tentang jenis dan isi dokumen ini>",
+    "formatted_summary": "# <the same title>\\n\\n<formatted Markdown of this document>"
+}}
+The angle-bracket values describe what to write; never copy them literally."""
 
-                    llm_response = await asyncio.to_thread(llm.generate, structuring_prompt)
+                    llm_response = ""
+                    for attempt in range(3):
+                        # A large document's review can take minutes per attempt; a cancelled one skips it and
+                        # reaches the discard check below instead of running on after the admin deleted it.
+                        if is_ingestion_cancelled(knowledge_id):
+                            logger.info(f"🛑 [INGESTION ABORTED] '{knowledge_id}' was cancelled; skipping the LLM review.")
+                            break
+                        try:
+                            llm_response = await asyncio.to_thread(llm.generate, structuring_prompt)
+                            if llm_response and llm_response.strip():
+                                break
+                        except Exception as retry_err:
+                            logger.warning(f"⚠️ [INGESTION LLM RETRY] Attempt {attempt+1}/3 failed for '{file_name}': {retry_err}")
+                            if attempt < 2:
+                                await asyncio.sleep(1.5 * (attempt + 1))
+                            else:
+                                raise retry_err
                     timing_metrics["llm_review_ms"] = int((_time.time() - t0_llm) * 1000)
                     parsed_meta = safe_json_loads(llm_response)
 
@@ -2298,7 +2649,8 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
                     for ext in [".pdf", ".docx", ".xlsx", ".csv", ".pptx", ".ppt", ".doc", ".txt"]:
                         if recommended_title.lower().endswith(ext):
                             recommended_title = recommended_title[:-len(ext)].strip()
-                    if not recommended_title:
+                    # A title echoed from the prompt's response template is not a title of this document
+                    if not recommended_title or recommended_title.startswith("<") or recommended_title.lower() == "clean document title":
                         recommended_title = clean_title_fallback
 
                     extracted_doc_type = parsed_meta.get("document_type") or "GENERAL"
@@ -2323,21 +2675,16 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
                         canonical_lower = canonical_text.lower()
                         
                         # Identify if the document is an academic paper, scientific journal, manuscript, clinical study, or research publication
+                        # based purely on text density and structural content markers (0% filename heuristics)
                         is_academic_journal = (
-                            any(kw in file_name_lower for kw in [
-                                "published", "manuscript", "journal", "jurnal", "paper", "article",
-                                "penelitian", "skripsi", "tesis", "disertasi", "prosiding"
-                            ])
-                            or (
-                                len(canonical_text) > 8000
-                                and sum(1 for kw in [
-                                    "abstract", "abstrak", "introduction", "pendahuluan",
-                                    "method", "metode", "materials and methods", "results and discussion",
-                                    "hasil dan pembahasan", "conclusion", "kesimpulan",
-                                    "references", "daftar pustaka", "bibliography",
-                                    "doi:", "issn", "vol."
-                                ] if kw in canonical_lower) >= 2
-                            )
+                            len(canonical_text) > 6000
+                            and sum(1 for kw in [
+                                "abstract", "abstrak", "introduction", "pendahuluan",
+                                "method", "metode", "materials and methods", "results and discussion",
+                                "hasil dan pembahasan", "conclusion", "kesimpulan",
+                                "references", "daftar pustaka", "bibliography",
+                                "doi:", "issn", "vol."
+                            ] if kw in canonical_lower) >= 2
                         )
 
                         is_product_catalog = (
@@ -2348,26 +2695,48 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
 
                         ai_formatted_summary = parsed_meta.get("formatted_summary") or parsed_meta.get("summary")
 
-                        # For academic papers, scientific journals, or long non-catalog documents:
-                        # PRESERVE 100% OF THE COMPLETE CONTENT (tables, figures, text) without truncation!
-                        if is_academic_journal or (len(canonical_text) > 12000 and not is_product_catalog):
-                            clean_body = canonical_text.strip()
-                            if not clean_body.startswith(f"# {recommended_title}"):
-                                # Clean any existing duplicate top # Heading if present
-                                clean_body = re.sub(r'^#\s+[^\n]+\n*', '', clean_body)
-                                summary = f"# {recommended_title}\n\n{clean_body}"
-                            else:
-                                summary = clean_body
-                            extracted_doc_type = "GENERAL"
-                            logger.info(f"📚 [PAPER/JOURNAL] Preserved 100% full detail of '{recommended_title}' ({len(summary)} chars) without truncation.")
-                        else:
-                            # Use AI structured markdown as summary for product catalogs / short documents if provided and valid
-                            if ai_formatted_summary and len(str(ai_formatted_summary).strip()) > 30:
-                                summary = str(ai_formatted_summary).strip()
-                                logger.info(f"AI formatted document into structured Markdown ({len(summary)} chars)")
+                        # For academic papers, scientific journals, spreadsheets, or long documents:
+                        # PRESERVE 100% OF THE COMPLETE CONTENT without truncation!
+                        is_spreadsheet = file_name_lower.endswith(('.xlsx', '.xls', '.csv'))
+                        is_large_doc = len(canonical_text) > 30000
 
-                    if summary:
-                        summary = re.sub(r'!\[([^\]]*)\]\s*\n+\s*\(([^)]+)\)', r'![\1](\2)', summary)
+                        # Check if document was processed by FlattenedDesignParser (has is_flattened in chunks or pdf_flat_doc in canonical text)
+                        is_flattened_doc = (
+                            "pdf_flat_doc" in canonical_text
+                            or any(isinstance(c, dict) and c.get("metadata", {}).get("is_flattened") for c in enriched_chunks)
+                        )
+
+                        # Table Guard: check if canonical text contains markdown tables that the AI summary stripped or collapsed
+                        canonical_table_count = canonical_text.count("| ---") + canonical_text.count("|:---")
+                        ai_table_count = (str(ai_formatted_summary).count("| ---") + str(ai_formatted_summary).count("|:---")) if ai_formatted_summary else 0
+                        table_guard_failed = (canonical_table_count > 0 and ai_table_count < canonical_table_count)
+
+                        # Coverage Guard: evaluate if AI summary truncated the source content
+                        ai_summary_valid = False
+                        if ai_formatted_summary and len(str(ai_formatted_summary).strip()) > 30 and not table_guard_failed and not is_flattened_doc:
+                            ai_len = len(str(ai_formatted_summary).strip())
+                            # Accept AI formatting only if doc is small/moderate AND preserved at least 70% of canonical text
+                            if not is_large_doc and not is_spreadsheet and ai_len >= len(canonical_text) * 0.70:
+                                ai_summary_valid = True
+                            else:
+                                logger.info(f"🛡️ [COVERAGE GUARD] AI summary ({ai_len} chars) truncated canonical ({len(canonical_text)} chars) or large doc/spreadsheet. Preserving 100% canonical parser text.")
+                        elif table_guard_failed:
+                            logger.info(f"🛡️ [TABLE GUARD] AI summary stripped markdown tables ({ai_table_count} vs {canonical_table_count} in canonical text). Preserving 100% canonical parser tables.")
+                        elif is_flattened_doc:
+                            logger.info(f"🛡️ [VISION-NATIVE GUARD] Document is a visual flattened presentation deck. Preserving 100% vision-extracted canonical markdown & tables.")
+
+                        if is_academic_journal or is_spreadsheet or is_large_doc or is_flattened_doc or table_guard_failed or not ai_summary_valid:
+                            summary = await asyncio.to_thread(_finalize_summary_sync, canonical_text, recommended_title)
+                            extracted_doc_type = "PRODUCT" if (is_product_catalog or is_spreadsheet or is_flattened_doc) else (extracted_doc_type or ("GENERAL" if is_academic_journal else "GENERAL"))
+                            logger.info(f"📚 [FULL COVERAGE] Preserved 100% canonical detail of '{recommended_title}' ({len(summary)} chars) without truncation.")
+                        else:
+                            # Use AI structured markdown as summary for short documents if valid
+                            summary = str(ai_formatted_summary).strip()
+                            if summary:
+                                summary = re.sub(r'!\[([^\]]*)\]\s*\n+\s*\(([^)]+)\)', r'![\1](\2)', summary)
+                                from app.rag.services.rag_generator import repair_markdown_tables
+                                summary = repair_markdown_tables(summary)
+                            logger.info(f"AI formatted document into structured Markdown ({len(summary)} chars)")
 
                     # Apply deterministic refinements if user specified price/SKU/title in user_prompt
                     if user_prompt and str(user_prompt).strip() and summary:
@@ -2436,15 +2805,25 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
             default_role="PRODUCT_PACKAGING" if extracted_doc_type == "PRODUCT" else "GENERAL"
         )
 
-        # Smart contextual topic-based image embedding if omitted by LLM
-        if all_doc_image_urls:
+        # Smart contextual topic-based image embedding if omitted by LLM (only for non-flattened documents, as flattened parser already embeds images in-place)
+        is_flattened_doc_context = (
+            "pdf_flat_doc" in (summary or "")
+            or any(isinstance(c, dict) and c.get("metadata", {}).get("is_flattened") for c in enriched_chunks)
+        )
+        if all_doc_image_urls and not is_flattened_doc_context:
             summary = auto_embed_images_in_summary(summary, structured_images or all_doc_image_urls, recommended_title)
+
+        if summary:
+            from app.rag.services.rag_generator import repair_markdown_tables
+            summary = repair_markdown_tables(summary)
 
         # Category names for chunk metadata
         cat_names = [c["name"] for c in suggested_categories if isinstance(c, dict) and "name" in c] if suggested_categories else []
 
         # Structure-aware chunking from canonical text (raw parser output — never LLM-rewritten)
-        if summary and summary.strip():
+        # Preserve high-fidelity page-scoped chunks from pipeline if present.
+        # Only fallback to re-chunking summary markdown if enriched_chunks is empty.
+        if (not enriched_chunks or len(enriched_chunks) == 0) and summary and summary.strip():
             try:
                 from app.rag.utils.summary_chunker import chunk_summary_markdown
                 enriched_chunks = chunk_summary_markdown(
@@ -2463,6 +2842,12 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
                 logger.info(f"Canonical text chunking produced {len(enriched_chunks)} staging chunks.")
             except Exception as rechunk_err:
                 logger.warning(f"Canonical text chunking failed, keeping parser chunks: {rechunk_err}")
+        else:
+            logger.info(f"Preserving {len(enriched_chunks) if enriched_chunks else 0} granular page-scoped chunks extracted by pipeline parser.")
+
+        if summary:
+            from app.rag.services.rag_generator import repair_markdown_tables
+            summary = repair_markdown_tables(summary)
 
         # Populate Turn 0 in history so initial ingestion prompt and summary immediately render in Review Dashboard
         history_list = []
@@ -2475,7 +2860,9 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
         timing_metrics["total_ingestion_ms"] = int((_time.time() - t0_total) * 1000)
 
         # Structure the final pending document state in exact requested order
+        from app.rag.pipeline_versions import PARSER_VERSION
         staged_document = {
+            "pipeline_versions": {"parser": PARSER_VERSION} if is_flattened_doc_context else {},
             "knowledge_id": knowledge_id,
             "batch_id": batch_id,
             "file_name": file_name,
@@ -2488,6 +2875,7 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
             "image_urls": all_doc_image_urls,
             "images": structured_images,
             "text_accuracy": text_accuracy,
+            "full_coverage": True,
             "feedback": feedback,
             "batch_summary": None,
             "suggested_categories": suggested_categories,
@@ -2504,13 +2892,12 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
         
         # Save back to pending folder using knowledge_id in filename
         pending_file_path = os.path.join("data/pending", f"{knowledge_id}.json")
-        with open(pending_file_path, 'w', encoding='utf-8') as f:
-            json.dump(staged_document, f, indent=4, ensure_ascii=False)
+        await asyncio.to_thread(_write_json_sync, pending_file_path, staged_document)
 
         # Upload staging JSON to MinIO staging bucket (Source of Truth)
         try:
             from app.services.storage import upload_staging_json
-            upload_staging_json(knowledge_id, staged_document)
+            await asyncio.to_thread(upload_staging_json, knowledge_id, staged_document)
         except Exception as st_err:
             logger.debug(f"MinIO staging upload note for {knowledge_id}: {st_err}")
 
@@ -2560,14 +2947,26 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
                     k_entry.ai_confidence = float(text_accuracy.replace("%", "")) if isinstance(text_accuracy, str) and "%" in text_accuracy else 95.00
                     if k_entry.metadata_ is None:
                         k_entry.metadata_ = {}
+
+                    # Avoid multi-megabyte JSONB column bloat for large documents:
+                    # initial_summary and assistant turn history fall back cleanly to ai_summary in UI
+                    is_huge = len(summary) > 50000
+                    compact_history = history_list
+                    if is_huge and history_list:
+                        compact_history = [
+                            {"role": "user", "content": h.get("content", ""), "attachmentName": h.get("attachmentName")}
+                            if h.get("role") == "user" else {"role": "assistant", "content": ""}
+                            for h in history_list
+                        ]
+
                     k_entry.metadata_.update({
                         "batch_id": batch_id,
                         "file_hash": file_hash,
                         "document_type": extracted_doc_type,
                         "initial_prompt": user_prompt if user_prompt and str(user_prompt).strip() else None,
-                        "initial_summary": summary,
-                        "history": history_list,
-                        "chat_history": history_list,
+                        "initial_summary": "" if is_huge else summary,
+                        "history": compact_history,
+                        "chat_history": compact_history,
                         "suggested_categories": suggested_categories,
                         "categories": [c["name"] for c in suggested_categories if isinstance(c, dict) and "name" in c] if suggested_categories else [],
                         "visibility_settings": visibility_settings,
@@ -2577,6 +2976,8 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
                         "feedback": feedback,
                         "timing_metrics": timing_metrics
                     })
+                    # Do not store raw chunks in Postgres metadata_ JSONB; data/pending/{id}.json is the canonical staging store
+                    k_entry.metadata_.pop("chunks", None)
                     from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(k_entry, "metadata_")
                     await session.commit()
@@ -2588,8 +2989,27 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
 
         # Update staged document with final timing metrics and save to pending folder
         staged_document["timing_metrics"] = timing_metrics
-        with open(pending_file_path, 'w', encoding='utf-8') as f:
-            json.dump(staged_document, f, indent=4, ensure_ascii=False)
+        await asyncio.to_thread(_write_json_sync, pending_file_path, staged_document)
+
+        # Phase 1 Shadow Ingestion into Canonical Clinical Evidence Schema (Run in thread pool so it never blocks event loop)
+        try:
+            await asyncio.to_thread(
+                _run_canonical_shadow_ingest_sync,
+                knowledge_id=str(knowledge_id),
+                file_name=file_name,
+                file_hash=file_hash,
+                extracted_doc_type=extracted_doc_type,
+                visibility_settings=visibility_settings,
+                recommended_title=recommended_title,
+                enriched_chunks=enriched_chunks,
+                summary=summary
+            )
+            logger.info(f"✨ [SHADOW INGEST] Populated Canonical Evidence for {knowledge_id}")
+            # Coverage and structure of the draft, ready on the readiness gate before the admin approves
+            from app.rag.services.ingest_quality import schedule_quality_check
+            schedule_quality_check(str(knowledge_id), probes=False)
+        except Exception as can_err:
+            logger.warning(f"Shadow Ingest note (non-fatal): {can_err}")
 
         logger.info(
             f"\n"
@@ -2607,6 +3027,9 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
                 logger.debug(f"🧹 Cleaned up temporary ingestion file: {file_path}")
         except Exception:
             pass
+        finally:
+            if file_hash:
+                ACTIVE_PROCESSING_HASHES.pop(file_hash, None)
 
     except Exception as e:
         err_msg = str(e)
@@ -2644,8 +3067,7 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
                 "chunks": [],
                 "timing_metrics": timing_metrics
             }
-            with open(pending_file_path, 'w', encoding='utf-8') as f:
-                json.dump(failed_doc, f, indent=4, ensure_ascii=False)
+            await asyncio.to_thread(_write_json_sync, pending_file_path, failed_doc)
         except Exception as json_err:
             logger.warning(f"Could not write failed state JSON: {json_err}")
 
@@ -2679,6 +3101,8 @@ Return ONLY valid JSON (no surrounding markdown code blocks):
             logger.warning(f"Could not update Knowledge DB record on failure: {db_err}")
     finally:
         CANCELLED_INGESTION_IDS.discard(str(knowledge_id).lower())
+        if file_hash:
+            ACTIVE_PROCESSING_HASHES.pop(file_hash, None)
 
 async def trigger_batch_summary_after_all_done(batch_id: str, expected_count: int, llm: BaseLLMAdapter, user_prompt: Optional[str] = None, timeout_sec: int = 180):
     """
@@ -2911,11 +3335,27 @@ async def ingest_document(
     prompt: Optional[str] = Form(None, description="Optional custom AI processing instruction"),
     replace_existing: bool = Form(False, description="Set to true to overwrite existing pending draft"),
     pipeline: IngestionPipeline = Depends(get_ingestion_pipeline),
-    llm: BaseLLMAdapter = Depends(get_llm)
+    llm: BaseLLMAdapter = Depends(get_llm),
+    batch_id: Optional[str] = Form(None, description="Optional shared batch ID for multi-file upload session"),
+    replace_knowledge_id: Optional[str] = Form(None, include_in_schema=False)
 ):
     """
     Uploads and extracts document files (PDF, DOCX, XLSX, TXT, JPG, PNG) into the staging area for review.
+    replace_knowledge_id (set by the replace-file flow) re-processes that document in place instead of
+    treating its own file as a duplicate or creating a second knowledge record.
     """
+    # Called directly as a function (replace-file, chunked upload), omitted arguments are still FastAPI
+    # Form(...) markers, not values; they ended up in the job state and broke JSON serialization.
+    from pydantic.fields import FieldInfo
+    def _plain(value, default):
+        return default if isinstance(value, FieldInfo) else value
+    prompt = _plain(prompt, None)
+    replace_existing = _plain(replace_existing, False)
+    batch_id = _plain(batch_id, None)
+    replace_knowledge_id = _plain(replace_knowledge_id, None)
+    if replace_knowledge_id:
+        replace_existing = True
+
     upload_list = file if isinstance(file, list) else [file]
     upload_list = [f for f in upload_list if f is not None and f.filename]
     if not upload_list:
@@ -2927,7 +3367,8 @@ async def ingest_document(
         import hashlib
         
         os.makedirs("data/temp", exist_ok=True)
-        batch_id = str(_uuid.uuid4()) if len(upload_list) > 1 else None
+        if not batch_id:
+            batch_id = str(_uuid.uuid4()) if len(upload_list) > 1 else None
         total_files = len(upload_list)
 
         logger.info(
@@ -2945,7 +3386,9 @@ async def ingest_document(
                     k_type = KnowledgeType.GENERAL
 
                     os.makedirs("data/temp", exist_ok=True)
-                    file_path = f"data/temp/{target_file.filename}"
+                    unique_prefix = _uuid.uuid4().hex[:12]
+                    clean_orig_name = os.path.basename(target_file.filename)
+                    file_path = f"data/temp/{unique_prefix}_{clean_orig_name}"
                     hasher = hashlib.sha256()
 
                     # Stream upload chunk-by-chunk directly to disk to prevent RAM spikes (safe for >100MB files)
@@ -2957,11 +3400,46 @@ async def ingest_document(
                     file_hash = hasher.hexdigest()
                     file_size = os.path.getsize(file_path)
 
+                    if replace_existing and file_hash:
+                        ACTIVE_PROCESSING_HASHES.pop(file_hash, None)
+
                     # -------------------------------------------------------------
-                    # 3-WAY DUPLICATE DETECTION LIFECYCLE
+                    # 4-WAY DUPLICATE DETECTION LIFECYCLE (PROCESSING / PUBLISHED / PENDING / NEW)
                     # -------------------------------------------------------------
-                    dup_info = detect_duplicate_lifecycle(file_hash, target_file.filename)
+                    dup_info = detect_duplicate_lifecycle(file_hash, target_file.filename, exclude_knowledge_id=replace_knowledge_id)
                     dup_status = dup_info.get("status", "NEW")
+                    if replace_knowledge_id and dup_status in ("NEW", "PROCESSING"):
+                        # Replacing a document in place: re-use its record like an overwritten draft
+                        dup_info = {"status": "PENDING", "knowledge_id": replace_knowledge_id,
+                                    "existing_file": target_file.filename, "match_reason": "Replace File"}
+                        dup_status = "PENDING"
+
+                    # 0. STATE: PROCESSING -> PREVENT REDUNDANT CONCURRENT INGESTION
+                    if dup_status == "PROCESSING" and not replace_existing:
+                        if os.path.exists(file_path):
+                            try:
+                                os.remove(file_path)
+                            except Exception:
+                                pass
+                        proc_msg = (
+                            f"Dokumen '{target_file.filename}' saat ini sedang dianalisis dan diekstrak di antrean server "
+                            f"(Knowledge ID: {dup_info.get('knowledge_id')}). Mohon tunggu proses selesai."
+                        )
+                        logger.warning(f"⏳ {file_label} {proc_msg}")
+                        if total == 1:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=proc_msg
+                            )
+                        return {
+                            "file_name": target_file.filename,
+                            "existing_knowledge_id": dup_info.get("knowledge_id"),
+                            "batch_id": batch_id,
+                            "status": "PROCESSING",
+                            "action": "QUEUED_ALREADY",
+                            "duplicate_status": "PROCESSING",
+                            "detail": proc_msg
+                        }
 
                     # 1. STATE: PUBLISHED -> BLOCK
                     if dup_status == "PUBLISHED":
@@ -2991,13 +3469,32 @@ async def ingest_document(
                         }
 
                     # 2. STATE: PENDING -> REQUIRE ADMIN CONFIRMATION (DO NOT SILENTLY OVERWRITE)
-                    if dup_status == "PENDING" and not replace_existing:
+                    # BUT if the existing pending document was REJECTED / FAILED, automatically permit re-ingestion!
+                    is_existing_failed = False
+                    existing_k_id = dup_info.get("knowledge_id")
+                    if existing_k_id:
+                        try:
+                            from app.core.database import get_sync_engine
+                            from sqlalchemy import text
+                            with get_sync_engine().connect() as sync_conn:
+                                chk = sync_conn.execute(
+                                    text("SELECT status, ai_summary FROM knowledge WHERE id = :kid"),
+                                    {"kid": str(existing_k_id)}
+                                ).first()
+                                if chk:
+                                    chk_st = str(chk.status or "").upper()
+                                    chk_sum = str(chk.ai_summary or "")
+                                    if chk_st == "REJECTED" or chk_sum.startswith("[Gagal Diproses]"):
+                                        is_existing_failed = True
+                        except Exception:
+                            pass
+
+                    if dup_status == "PENDING" and not replace_existing and not is_existing_failed:
                         if os.path.exists(file_path):
                             try:
                                 os.remove(file_path)
                             except Exception:
                                 pass
-                        existing_k_id = dup_info.get("knowledge_id")
                         pending_msg = (
                             f"Draft peninjauan untuk '{target_file.filename}' (ID: {existing_k_id}) "
                             f"sudah ada di antrean On Review (Pending) ({dup_info.get('match_reason')}: '{dup_info.get('existing_file')}')."
@@ -3018,8 +3515,8 @@ async def ingest_document(
                             "detail": pending_msg + " Kirim 'replace_existing=true' jika ingin menimpa draft ini."
                         }
 
-                    # 3. STATE: NEW or PENDING with replace_existing=True -> PROCEED
-                    k_id = dup_info.get("knowledge_id") if (dup_status == "PENDING" and replace_existing) else None
+                    # 3. STATE: NEW or PENDING with replace_existing=True (or auto-recovered failed draft) -> PROCEED
+                    k_id = existing_k_id if (dup_status == "PENDING" and (replace_existing or is_existing_failed)) else None
 
                     try:
                         from app.core.database import AsyncSessionLocal
@@ -3112,6 +3609,15 @@ async def ingest_document(
                             logger.info(f"📄 {file_label} [ID: {k_id}] Original document uploaded to MinIO: {original_s3_key}")
                     except Exception as minio_err:
                         logger.warning(f"{file_label} MinIO upload note: {minio_err}")
+
+                    # Register active in-flight processing hash
+                    if file_hash:
+                        import time as _time
+                        ACTIVE_PROCESSING_HASHES[file_hash] = {
+                            "knowledge_id": k_id,
+                            "file_name": target_file.filename,
+                            "started_at": _time.time()
+                        }
 
                     # Spawn concurrent background ingestion task (governed by _ingestion_semaphore)
                     uncancel_ingestion_job(k_id)
@@ -3487,6 +3993,273 @@ async def get_pending_details(knowledge_id: str = Path(..., description="Pending
         raise HTTPException(status_code=500, detail=f"Failed to read document details: {e}")
 
 
+# =============================================================================
+# PHASE 1.5 QUALITY GATE & STAGING OBSERVABILITY ENDPOINTS (D1-a & D9)
+# =============================================================================
+
+@router.get(
+    "/ingest/staging/{knowledge_id}/quality-gate",
+    tags=["Ingestion"],
+    summary="Get Quality Gate Staging Audit & Readiness",
+    response_model=QualityGateResponse
+)
+async def get_staging_quality_gate(
+    knowledge_id: str = Path(..., description="Knowledge UUID"),
+    summary_only: bool = Query(False, description="If true, return readiness and metrics only without evidences list")
+):
+    """
+    Returns audit details for Staging Knowledge:
+    - Knowledge Readiness Gate (D9)
+    - Row Disposition Breakdown (Evidence / Context / Excluded)
+    - Visual Jobs & Asset Classification Summary
+    - List of Canonical Evidences & Scored Media Assets
+    """
+    try:
+        import asyncio as _asyncio
+        from app.rag.services.canonical_ingest_service import CanonicalIngestService
+        can_service = CanonicalIngestService()
+        audit_data = await _asyncio.to_thread(can_service.get_quality_gate_audit, knowledge_id, summary_only)
+        return audit_data
+    except Exception as e:
+        logger.error(f"Error fetching quality gate audit for {knowledge_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch quality gate audit: {e}")
+
+
+@router.put(
+    "/ingest/staging/{knowledge_id}/evidence/{evidence_id}",
+    tags=["Ingestion"],
+    summary="Update Canonical Evidence (D1-a Direct Correction)"
+)
+async def update_staging_evidence(
+    knowledge_id: str = Path(..., description="Knowledge UUID"),
+    evidence_id: str = Path(..., description="Evidence UUID"),
+    request: UpdateEvidenceRequest = Body(...)
+):
+    """
+    D1-a Implementation:
+    Admin corrects clinical facts directly on Canonical Evidence SSOT.
+    Derivation is marked 'ADMIN_EDIT', SHA-256 hash is recomputed,
+    and derived kb_chunk retrieval_text is kept synchronized.
+    """
+    try:
+        from app.rag.services.canonical_ingest_service import CanonicalIngestService
+        can_service = CanonicalIngestService()
+        with can_service.engine.connect() as conn:
+            from sqlalchemy import text as _text
+            v_row = conn.execute(
+                _text("SELECT id FROM knowledge_version WHERE knowledge_id = :kid ORDER BY version_no DESC LIMIT 1;"),
+                {"kid": str(knowledge_id)}
+            ).fetchone()
+        if not v_row:
+            raise HTTPException(status_code=404, detail=f"No knowledge version found for doc '{knowledge_id}'")
+        
+        version_id = str(v_row[0])
+        result = can_service.update_evidence(
+            version_id=version_id,
+            evidence_id=evidence_id,
+            update_data=request.model_dump(exclude_unset=True)
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update evidence {evidence_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update evidence: {e}")
+
+
+@router.post(
+    "/ingest/staging/{knowledge_id}/evidence/{evidence_id}/resolve",
+    tags=["Ingestion"],
+    summary="Resolve Pending Evidence Review (Knowledge Readiness Gate D9)"
+)
+async def resolve_staging_evidence(
+    knowledge_id: str = Path(..., description="Knowledge UUID"),
+    evidence_id: str = Path(..., description="Evidence UUID")
+):
+    """
+    Resolves an item in REVIEW_REQUIRED or LOW_CONFIDENCE state to VISION_COMPLETE,
+    unblocking the Knowledge Readiness Gate for publication.
+    """
+    try:
+        from app.rag.services.canonical_ingest_service import CanonicalIngestService
+        can_service = CanonicalIngestService()
+        with can_service.engine.connect() as conn:
+            from sqlalchemy import text as _text
+            v_row = conn.execute(
+                _text("SELECT id FROM knowledge_version WHERE knowledge_id = :kid ORDER BY version_no DESC LIMIT 1;"),
+                {"kid": str(knowledge_id)}
+            ).fetchone()
+        if not v_row:
+            raise HTTPException(status_code=404, detail=f"No knowledge version found for doc '{knowledge_id}'")
+        
+        version_id = str(v_row[0])
+        result = can_service.resolve_evidence(version_id=version_id, evidence_id=evidence_id)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to resolve evidence {evidence_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to resolve evidence: {e}")
+
+
+@router.post(
+    "/ingest/staging/{knowledge_id}/regenerate-summary",
+    tags=["Ingestion"],
+    summary="Regenerate Summary from Canonical Evidence (D1-a)",
+    response_model=RegenerateSummaryResponse
+)
+async def regenerate_summary_from_evidence(
+    knowledge_id: str = Path(..., description="Knowledge UUID")
+):
+    """
+    D1-a Implementation:
+    Regenerates clean summary markdown from approved/corrected Canonical Evidence SSOT.
+    Updates knowledge_version.summary_md and knowledge.ai_summary.
+    Also synchronizes any staged pending JSON file.
+    """
+    try:
+        from app.rag.services.canonical_ingest_service import CanonicalIngestService
+        can_service = CanonicalIngestService()
+        with can_service.engine.connect() as conn:
+            from sqlalchemy import text as _text
+            v_row = conn.execute(
+                _text("SELECT id FROM knowledge_version WHERE knowledge_id = :kid ORDER BY version_no DESC LIMIT 1;"),
+                {"kid": str(knowledge_id)}
+            ).fetchone()
+        if not v_row:
+            raise HTTPException(status_code=404, detail=f"No knowledge version found for doc '{knowledge_id}'")
+        
+        version_id = str(v_row[0])
+        new_summary = can_service.regenerate_summary_from_evidences(knowledge_id, version_id)
+        
+        # Synchronize staged JSON if exists
+        pending_file = resolve_pending_file(knowledge_id)
+        if pending_file and os.path.exists(pending_file):
+            try:
+                with open(pending_file, "r", encoding="utf-8") as pf:
+                    staged_data = json.load(pf)
+                staged_data["summary"] = new_summary
+                staged_data["ai_summary"] = new_summary
+                with open(pending_file, "w", encoding="utf-8") as pf:
+                    json.dump(staged_data, pf, indent=4, ensure_ascii=False)
+            except Exception as pf_err:
+                logger.warning(f"Could not update staged pending JSON: {pf_err}")
+                
+        return RegenerateSummaryResponse(
+            knowledge_id=knowledge_id,
+            version_id=version_id,
+            summary_md=new_summary
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to regenerate summary for {knowledge_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate summary: {e}")
+
+
+# =============================================================================
+# PHASE 2 VERSIONING, ATOMIC PUBLISH & MEDIA SERVING ENDPOINTS
+# =============================================================================
+
+@router.post(
+    "/ingest/staging/{knowledge_id}/publish",
+    tags=["Ingestion"],
+    summary="Publish Document Version Atomically (Phase 2 Transaction)",
+    response_model=PublishVersionResponse
+)
+async def publish_staging_version(
+    knowledge_id: str = Path(..., description="Knowledge UUID"),
+    request: Optional[PublishVersionRequest] = Body(default=None)
+):
+    """
+    Promotes a staging version to ACTIVE atomically:
+    - Verifies Knowledge Readiness Gate (D9)
+    - Supersedes previous ACTIVE version(s)
+    - Deactivates previous chunks
+    - Promotes new version to ACTIVE and activates its chunks
+    - Invariant: 0 orphan active projections
+    """
+    try:
+        from app.rag.services.canonical_ingest_service import CanonicalIngestService
+        can_service = CanonicalIngestService()
+
+        # Find version_id if not supplied
+        v_id = request.version_id if request and request.version_id else None
+        if not v_id:
+            with can_service.engine.connect() as conn:
+                from sqlalchemy import text as _text
+                v_row = conn.execute(
+                    _text("SELECT id FROM knowledge_version WHERE knowledge_id = :kid ORDER BY version_no DESC LIMIT 1;"),
+                    {"kid": str(knowledge_id)}
+                ).fetchone()
+            if not v_row:
+                raise HTTPException(status_code=404, detail=f"No version found for document '{knowledge_id}'")
+            v_id = str(v_row[0])
+
+        approved_by = request.approved_by if request else None
+        result = can_service.publish_version_atomic(
+            knowledge_id=knowledge_id,
+            version_id=v_id,
+            approved_by=approved_by
+        )
+        return PublishVersionResponse(**result)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Atomic publish failed for document {knowledge_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Atomic publish failed: {e}")
+
+
+@router.get(
+    "/media/resolve/{asset_id}",
+    tags=["Media Serving"],
+    summary="Resolve Media Asset Presigned URL from kb_asset",
+    response_model=MediaResolveResponse
+)
+async def resolve_media_asset_endpoint(
+    asset_id: str = Path(..., description="Media Asset UUID or Storage Key"),
+    preview: bool = Query(False, description="Allow resolution of staging/preview assets")
+):
+    """
+    Phase 2 Media Serving:
+    Resolves browser-accessible and presigned MinIO URL validated against kb_asset.
+    Production doctor chatbot inquiries only resolve assets of ACTIVE versions.
+    """
+    try:
+        from app.rag.services.canonical_ingest_service import CanonicalIngestService
+        can_service = CanonicalIngestService()
+        result = can_service.resolve_media_asset(asset_id=asset_id, preview_mode=preview)
+        return MediaResolveResponse(**result)
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Failed to resolve media asset '{asset_id}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to resolve media asset: {e}")
+
+
+@router.get(
+    "/ingest/invariants/verify",
+    tags=["Ingestion"],
+    summary="Verify Canonical Invariants (No Orphan Active Projections)",
+    response_model=InvariantCheckResponse
+)
+async def verify_invariants_endpoint():
+    """
+    Phase 2 System Invariant Verification:
+    Verifies 0 orphan active chunks, exactly 1 active version per document, and chunk alignment.
+    """
+    try:
+        from app.rag.services.canonical_ingest_service import CanonicalIngestService
+        can_service = CanonicalIngestService()
+        inv_result = can_service.verify_no_orphan_projections()
+        return InvariantCheckResponse(**inv_result)
+    except Exception as e:
+        logger.error(f"Invariant check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Invariant check failed: {e}")
+
+
 @router.post("/ingest/pending/{knowledge_id}/refine", tags=["Ingestion"], summary="Refine Pending Document", response_model=PendingDocumentResponse)
 async def refine_pending_document(
     knowledge_id: str = Path(..., description="Pending document identifier (UUID)"),
@@ -3515,6 +4288,11 @@ async def refine_pending_document(
     try:
         with open(pending_file, "r", encoding="utf-8") as f:
             staged_data = json.load(f)
+
+        # Incorporate current_summary if user provided manual edits from frontend
+        req_curr_summary = getattr(request, "current_summary", None)
+        if req_curr_summary and str(req_curr_summary).strip():
+            staged_data["summary"] = str(req_curr_summary).strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read staged document: {e}")
         
@@ -4072,6 +4850,195 @@ CRITICAL REQUIREMENT FOR THE "summary" FIELD:
         raise HTTPException(status_code=500, detail=f"Failed to refine document: {e}")
 
 
+@router.post("/ingest/pending/{knowledge_id}/reparse_vision", tags=["Ingestion"], summary="Reparse Pending Document with Vision", response_model=PendingDocumentResponse)
+@router.post("/ingest/staging/{knowledge_id}/reparse_vision", tags=["Ingestion"], summary="Reparse Staging Document with Vision", response_model=PendingDocumentResponse)
+async def reparse_pending_with_vision(
+    knowledge_id: str = Path(..., description="Pending document identifier (UUID)"),
+    request: Optional[ReparseVisionRequest] = None
+):
+    """
+    Re-parses a pending document using Vision-Native VLM extraction.
+    Useful when a document was initially parsed with plain text/heuristic mode
+    but contains complex visual layouts, infographics, badges, or slide designs.
+    """
+    pending_file = resolve_pending_file(knowledge_id)
+    if not pending_file:
+        raise HTTPException(status_code=404, detail=f"Pending document '{knowledge_id}' not found.")
+
+    try:
+        with open(pending_file, "r", encoding="utf-8") as f:
+            staged_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read staged document: {e}")
+
+    file_name = staged_data.get("file_name", "")
+    file_path = staged_data.get("file_path", "")
+
+    # Resolve local file path
+    resolved_path = None
+    candidate_paths = [
+        file_path,
+        os.path.join("data", "uploads", file_name) if file_name else None,
+        os.path.join("data", "temp", file_name) if file_name else None,
+        os.path.join("data", "temp", "assembled", f"{knowledge_id}_{file_name}") if file_name else None,
+    ]
+    for cp in candidate_paths:
+        if cp and os.path.exists(cp):
+            resolved_path = cp
+            break
+
+    if not resolved_path:
+        assembled_dir = os.path.join("data", "temp", "assembled")
+        if os.path.exists(assembled_dir) and file_name:
+            for fname in os.listdir(assembled_dir):
+                if file_name in fname:
+                    resolved_path = os.path.join(assembled_dir, fname)
+                    break
+
+    downloaded_copy = None
+    if not resolved_path:
+        # Local upload files are cleaned after ingestion; the durable original lives in MinIO.
+        from app.services.storage import download_original_document
+        resolved_path = downloaded_copy = download_original_document(
+            knowledge_id, os.path.join("data", "temp", "assembled"), file_name
+        )
+
+    if not resolved_path or not os.path.exists(resolved_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Original document file for '{file_name}' could not be located on disk or in storage for re-parsing."
+        )
+
+    try:
+        max_p = request.max_pages if (request and request.max_pages) else 1000
+        from app.rag.utils.flattened_parser import FlattenedDesignParser
+        flat_parser = FlattenedDesignParser()
+
+        logger.info(f"[REPARSE-VISION] Beginning Vision-native re-parse of '{resolved_path}' (knowledge_id={knowledge_id})")
+        # Minutes of rendering and vision calls: run off the event loop so chat requests (CIS doctors)
+        # keep being served while an admin re-parses a document.
+        parsed_pages = await asyncio.to_thread(
+            flat_parser.parse_pdf,
+            file_path=resolved_path,
+            document_id=knowledge_id,
+            max_pages=max_p
+        )
+
+        if not parsed_pages:
+            raise HTTPException(status_code=500, detail="Vision re-parsing produced 0 pages.")
+
+        if request and request.page_numbers:
+            target_set = set(request.page_numbers)
+            pages_to_assemble = [p for p in parsed_pages if p.get("page") in target_set]
+            if not pages_to_assemble:
+                pages_to_assemble = parsed_pages
+        else:
+            pages_to_assemble = parsed_pages
+
+        page_mds = [p.get("text", "") for p in pages_to_assemble if p.get("text")]
+        full_summary = "\n\n---\n\n".join(page_mds)
+
+        all_imgs = []
+        for p in pages_to_assemble:
+            for u in p.get("image_urls", []):
+                if u and u not in all_imgs:
+                    all_imgs.append(u)
+
+        from app.rag.utils.summary_chunker import chunk_summary_markdown
+        updated_chunks = chunk_summary_markdown(
+            summary=full_summary,
+            source_file=file_name,
+            categories=staged_data.get("categories", []),
+            title=staged_data.get("title", file_name)
+        )
+
+        detected_domains = [p.get("domain") for p in pages_to_assemble if p.get("domain") and p.get("domain") != "general"]
+        primary_domain = (detected_domains[0] if detected_domains else staged_data.get("clinical_domain", "GENERAL")).upper()
+        any_discontinued = any(bool(p.get("is_discontinued")) for p in pages_to_assemble)
+
+        staged_data["summary"] = full_summary
+        staged_data["chunks"] = updated_chunks
+        staged_data["image_urls"] = all_imgs
+        staged_data["image_url"] = all_imgs[0] if all_imgs else None
+        staged_data["clinical_domain"] = primary_domain
+        staged_data["is_discontinued"] = any_discontinued
+        staged_data["file_path"] = resolved_path
+
+        hist = staged_data.get("history", [])
+        if not isinstance(hist, list):
+            hist = []
+        hist.append({"role": "user", "content": "Re-parse with Vision"})
+        feedback_msg = (
+            f"Dokumen berhasil di-reparse dengan Vision LLM ({len(pages_to_assemble)} halaman diproses, "
+            f"{len(updated_chunks)} chunks dibuat, domain={primary_domain}, discontinued={any_discontinued})."
+        )
+        hist.append({"role": "assistant", "content": feedback_msg})
+        staged_data["history"] = hist
+        staged_data["reply"] = feedback_msg
+        staged_data["feedback"] = feedback_msg
+        from app.rag.pipeline_versions import PARSER_VERSION
+        staged_data["pipeline_versions"] = {**(staged_data.get("pipeline_versions") or {}), "parser": PARSER_VERSION}
+
+        with open(pending_file, "w", encoding="utf-8") as f:
+            json.dump(staged_data, f, indent=4, ensure_ascii=False)
+
+        try:
+            from app.services.storage import upload_staging_json
+            upload_staging_json(knowledge_id, staged_data)
+        except Exception as storage_err:
+            logger.debug(f"[REPARSE-VISION] MinIO staging sync note: {storage_err}")
+
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.models.knowledge import Knowledge
+            from sqlalchemy import select
+            import uuid as _uuid
+
+            async with AsyncSessionLocal() as session:
+                try:
+                    k_uuid = _uuid.UUID(str(knowledge_id))
+                    stmt = select(Knowledge).where(Knowledge.id == k_uuid, Knowledge.deleted_at.is_(None))
+                except ValueError:
+                    stmt = select(Knowledge).where(Knowledge.file_name.ilike(f"%{file_name}%"), Knowledge.deleted_at.is_(None))
+                res = await session.execute(stmt)
+                k_entry = res.scalars().first()
+                if k_entry:
+                    k_entry.ai_summary = full_summary
+                    k_entry.content = full_summary
+                    if k_entry.metadata_ is None:
+                        k_entry.metadata_ = {}
+                    k_entry.metadata_.update({
+                        "summary": full_summary,
+                        "chunks": updated_chunks,
+                        "staging_history": hist,
+                        "image_urls": all_imgs,
+                        "clinical_domain": primary_domain,
+                        "is_discontinued": any_discontinued,
+                        "parsed_with_vision": True
+                    })
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(k_entry, "metadata_")
+                    await session.commit()
+                    logger.info(f"[REPARSE-VISION] Updated Knowledge DB record for '{knowledge_id}'")
+        except Exception as db_err:
+            logger.warning(f"[REPARSE-VISION] Could not sync to Knowledge DB: {db_err}")
+
+        return staged_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[REPARSE-VISION] Failed to re-parse document '{knowledge_id}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to re-parse document with Vision: {e}")
+    finally:
+        # A copy fetched from storage only for this re-parse; the original stays in the bucket
+        if downloaded_copy and os.path.exists(downloaded_copy):
+            try:
+                os.remove(downloaded_copy)
+            except OSError:
+                pass
+
+
 @router.get("/ingest/documents", tags=["Ingestion"], summary="List All Documents", response_model=List[DocumentListItem])
 async def list_all_documents():
     """
@@ -4293,46 +5260,6 @@ async def edit_approved_document(
     Updates summary, categories, and metadata of an approved document and re-indexes vector embeddings.
     """
     approved_file = resolve_approved_file(knowledge_id)
-    if not approved_file or not os.path.exists(approved_file):
-        # Self-healing DB fallback: reconstruct approved JSON from PostgreSQL record if missing from disk
-        try:
-            from app.core.database import AsyncSessionLocal
-            from app.models.knowledge import Knowledge
-            import uuid as _uuid
-
-            async with AsyncSessionLocal() as session:
-                custom_uuid = None
-                try:
-                    custom_uuid = _uuid.UUID(knowledge_id)
-                except ValueError:
-                    pass
-                if custom_uuid:
-                    k_obj = await session.get(Knowledge, custom_uuid)
-                    if k_obj:
-                        os.makedirs("data/output", exist_ok=True)
-                        approved_file = os.path.join("data/output", f"{knowledge_id}.json")
-                        m_dict = dict(k_obj.metadata_) if isinstance(k_obj.metadata_, dict) else {}
-                        doc_data = {
-                            "knowledge_id": str(knowledge_id),
-                            "batch_id": m_dict.get("batch_id"),
-                            "file_name": k_obj.file_name or str(knowledge_id),
-                            "title": k_obj.title or k_obj.file_name or "Knowledge Document",
-                            "status": "Approved",
-                            "summary": k_obj.ai_summary or "",
-                            "initial_prompt": m_dict.get("initial_prompt"),
-                            "staging_history": m_dict.get("staging_history", []),
-                            "edit_history": m_dict.get("edit_history", []),
-                            "timing_metrics": m_dict.get("timing_metrics"),
-                            "batch_summary": m_dict.get("batch_summary"),
-                            "image_urls": m_dict.get("image_urls", []),
-                            "categories": m_dict.get("categories", []),
-                            "visibility_settings": m_dict.get("visibility_settings", {"clinics": ["all"], "doctor_types": ["all"], "doctors": ["all"]}),
-                            "chunks": m_dict.get("chunks", [{"text": k_obj.ai_summary or k_obj.title or "", "metadata": {"knowledge_id": str(knowledge_id)}}])
-                        }
-                        with open(approved_file, "w", encoding="utf-8") as f:
-                            json.dump(doc_data, f, indent=4, ensure_ascii=False)
-        except Exception:
-            pass
 
     if not approved_file or not os.path.exists(approved_file):
         raise HTTPException(status_code=404, detail=f"Approved document '{knowledge_id}' not found.")
@@ -4436,6 +5363,7 @@ async def edit_approved_document(
 
 
 @router.put("/ingest/pending/{knowledge_id}", tags=["Ingestion"], summary="Edit Pending Document")
+@router.put("/ingest/staging/{knowledge_id}", tags=["Ingestion"], summary="Edit Staging Document")
 async def edit_pending_document(
     knowledge_id: str = Path(..., description="Pending document identifier (UUID)"),
     request: EditApprovedDocumentRequest = ...
@@ -4444,45 +5372,6 @@ async def edit_pending_document(
     Updates summary, categories, and metadata of a pending staged document.
     """
     pending_file = resolve_pending_file(knowledge_id)
-    if not pending_file or not os.path.exists(pending_file):
-        # Self-healing DB fallback: reconstruct pending JSON from PostgreSQL record if missing from disk
-        try:
-            from app.core.database import AsyncSessionLocal
-            from app.models.knowledge import Knowledge
-            import uuid as _uuid
-
-            async with AsyncSessionLocal() as session:
-                custom_uuid = None
-                try:
-                    custom_uuid = _uuid.UUID(knowledge_id)
-                except ValueError:
-                    pass
-                if custom_uuid:
-                    k_obj = await session.get(Knowledge, custom_uuid)
-                    if k_obj:
-                        os.makedirs("data/pending", exist_ok=True)
-                        pending_file = os.path.join("data/pending", f"{knowledge_id}.json")
-                        m_dict = dict(k_obj.metadata_) if isinstance(k_obj.metadata_, dict) else {}
-                        doc_data = {
-                            "knowledge_id": str(knowledge_id),
-                            "batch_id": m_dict.get("batch_id"),
-                            "file_name": k_obj.file_name or str(knowledge_id),
-                            "title": k_obj.title or k_obj.file_name or "Knowledge Document",
-                            "status": "On review",
-                            "summary": k_obj.ai_summary or "",
-                            "initial_prompt": m_dict.get("initial_prompt"),
-                            "history": m_dict.get("history", []),
-                            "staging_history": m_dict.get("staging_history", []),
-                            "timing_metrics": m_dict.get("timing_metrics"),
-                            "batch_summary": m_dict.get("batch_summary"),
-                            "image_urls": m_dict.get("image_urls", []),
-                            "suggested_categories": m_dict.get("suggested_categories", []),
-                            "chunks": m_dict.get("chunks", [{"text": k_obj.ai_summary or k_obj.title or "", "metadata": {"knowledge_id": str(knowledge_id)}}])
-                        }
-                        with open(pending_file, "w", encoding="utf-8") as f:
-                            json.dump(doc_data, f, indent=4, ensure_ascii=False)
-        except Exception:
-            pass
 
     if not pending_file or not os.path.exists(pending_file):
         raise HTTPException(status_code=404, detail=f"Pending document '{knowledge_id}' not found.")
@@ -4569,6 +5458,37 @@ async def edit_pending_document(
         except Exception as st_err:
             logger.debug(f"MinIO staging upload note: {st_err}")
 
+        # Synchronize manual edits directly to PostgreSQL Knowledge entry
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.models.knowledge import Knowledge
+            import uuid as _uuid
+            async with AsyncSessionLocal() as session:
+                custom_uuid = None
+                try:
+                    custom_uuid = _uuid.UUID(str(knowledge_id))
+                except ValueError:
+                    pass
+                if custom_uuid:
+                    k_obj = await session.get(Knowledge, custom_uuid)
+                    if k_obj:
+                        k_obj.ai_summary = updated_summary
+                        k_obj.content = updated_summary
+                        k_obj.title = updated_title
+                        meta = dict(k_obj.metadata_) if isinstance(k_obj.metadata_, dict) else {}
+                        meta["summary"] = updated_summary
+                        meta["title"] = updated_title
+                        meta["suggested_categories"] = normalized_categories
+                        meta["visibility_settings"] = vis_settings
+                        meta["is_manually_edited"] = True
+                        if "chunks" in existing_doc:
+                            meta["chunks"] = existing_doc["chunks"]
+                        k_obj.metadata_ = meta
+                        await session.commit()
+                        logger.info(f"💾 Synced pending manual edit for '{knowledge_id}' directly to PostgreSQL.")
+        except Exception as db_sync_err:
+            logger.debug(f"DB sync in edit_pending_document note: {db_sync_err}")
+
         return existing_doc
     except HTTPException:
         raise
@@ -4611,6 +5531,11 @@ async def refine_approved_document(
     try:
         with open(approved_file, "r", encoding="utf-8") as f:
             existing_doc = json.load(f)
+
+        # Incorporate current_summary if user provided manual edits from frontend
+        req_curr_summary = getattr(request, "current_summary", None)
+        if req_curr_summary and str(req_curr_summary).strip():
+            existing_doc["summary"] = str(req_curr_summary).strip()
 
         # 0. Parse attached file if provided
         attached_file_context = ""
@@ -4905,8 +5830,11 @@ CRITICAL REQUIREMENT FOR THE "summary" FIELD:
         if delete_img_match:
             del_target = delete_img_match.group(1).strip() if delete_img_match.group(1) else ""
             if del_target:
-                target_words = [w for w in re.split(r'[\s\-_/]+', del_target) if len(w) > 2 and w.lower() not in ["erha", "produk", "product", "gambar", "foto", "image"]]
                 img_tags = list(re.finditer(r'!\[([^\]]*)\]\(([^\)]+)\)', updated_summary))
+                from app.rag.utils.summary_chunker import common_words
+                shared_label_words = common_words([t.group(1) for t in img_tags])
+                target_words = [w for w in re.split(r'[\s\-_/]+', del_target) if len(w) > 2
+                                and w.lower() not in shared_label_words and w.lower() not in ["produk", "product", "gambar", "foto", "image"]]
                 for itag in img_tags:
                     alt = itag.group(1)
                     url = itag.group(2)
@@ -5164,10 +6092,14 @@ CRITICAL REQUIREMENT FOR THE "summary" FIELD:
 async def approve_document(
     knowledge_id: str = Path(..., description="Document ID(s) to approve (supports single ID, comma-separated list, batch/session ID, or 'all')"),
     pipeline: IngestionPipeline = Depends(get_ingestion_pipeline),
-    bm25: BM25Index = Depends(get_bm25_index)
+    bm25: BM25Index = Depends(get_bm25_index),
+    background_tasks: BackgroundTasks = None,
+    quality_probes: bool = True
 ):
     """
     Approves pending staged document(s) and indexes them into vector and BM25 search databases.
+    quality_probes=False keeps the post-publish quality check to its token-free part (coverage and
+    structure); automatic re-processing of the whole knowledge base uses it.
     Supports:
     - Single document ID (e.g. '3dc6c820-...')
     - Comma-separated list of document IDs (e.g. 'id1,id2')
@@ -5289,6 +6221,7 @@ async def approve_document(
                     targets.append(p)
 
     approved_results = []
+    publish_failures = []
     all_chunks_to_index = []
     
     first_target_id = targets[0] if targets else "N/A"
@@ -5349,8 +6282,15 @@ async def approve_document(
             doc_valid_from = data.get("valid_from") if isinstance(data, dict) else None
             doc_valid_until = data.get("valid_until") if isinstance(data, dict) else None
             
-            # Re-chunk from the LATEST summary (admin may have refined it)
+            # Re-chunk from the LATEST summary (admin may have refined it). Tables are repaired here too, so
+            # a summary edited by hand or produced before a table fix is published with intact tables.
             approve_summary = data.get("summary", "") if isinstance(data, dict) else ""
+            if approve_summary:
+                from app.rag.services.rag_generator import repair_markdown_tables
+                from app.rag.utils.text_hygiene import drop_null_placeholders
+                approve_summary = drop_null_placeholders(repair_markdown_tables(approve_summary))
+                if isinstance(data, dict):
+                    data["summary"] = approve_summary
             raw_cats = data.get("categories") or data.get("suggested_categories") or []
             parsed_cats = []
             if isinstance(raw_cats, list):
@@ -5366,7 +6306,16 @@ async def approve_document(
                 "doctors": ["all"]
             }
 
-            if approve_summary and approve_summary.strip():
+            existing_chunks = data.get("chunks")
+            from app.rag.pipeline_versions import CHUNKER_VERSION
+            # Chunks made by the current chunker (an edit, an AI refine) are kept; parser page chunks and chunks
+            # of an older chunker are re-made from the summary, so every published document is chunked alike
+            current_chunks = bool(existing_chunks) and isinstance(existing_chunks, list) and chunker_version_of(existing_chunks) >= CHUNKER_VERSION
+            chunks_remade = not (current_chunks or (existing_chunks and not (approve_summary and approve_summary.strip())))
+            if not chunks_remade:
+                chunks = existing_chunks
+                logger.info(f"Approve: Preserving {len(chunks)} high-fidelity parser chunks with page-scoped metadata.")
+            elif approve_summary and approve_summary.strip():
                 try:
                     from app.rag.utils.summary_chunker import chunk_summary_markdown
                     doc_img_url = data.get("image_url") or (data.get("image_urls")[0] if (data.get("image_urls") and isinstance(data.get("image_urls"), list)) else None)
@@ -5388,8 +6337,11 @@ async def approve_document(
                     logger.warning(f"Approve: re-chunking failed, using existing chunks: {rechunk_err}")
 
             if isinstance(chunks, list):
+                from app.rag.utils.text_hygiene import drop_null_placeholders
                 for ch in chunks:
                     if isinstance(ch, dict):
+                        if isinstance(ch.get("text"), str):
+                            ch["text"] = drop_null_placeholders(ch["text"])
                         if "metadata" not in ch or not isinstance(ch["metadata"], dict):
                             ch["metadata"] = {}
                         ch["metadata"]["clinics"] = vis_settings.get("clinics", ["all"])
@@ -5448,6 +6400,7 @@ async def approve_document(
             approved_doc_structure = {
                 "knowledge_id": k_id,
                 "batch_id": data.get("batch_id") if isinstance(data, dict) else None,
+                "project_id": data.get("project_id") if isinstance(data, dict) else None,
                 "file_name": file_name,
                 "file_hash": data.get("file_hash") if isinstance(data, dict) else None,
                 "title": doc_title,
@@ -5463,6 +6416,8 @@ async def approve_document(
                 "categories": parsed_cats,
                 "suggested_categories": raw_cats,
                 "visibility_settings": vis_settings,
+                "pipeline_versions": {**((data.get("pipeline_versions") if isinstance(data, dict) else None) or {}),
+                                      "chunker": chunker_version_of(chunks)},
                 "chunks": chunks
             }
             with open(approved_file, "w", encoding="utf-8") as f:
@@ -5500,8 +6455,15 @@ async def approve_document(
                     k_entry = res_k.scalars().first()
                     if k_entry:
                         k_entry.status = KnowledgeStatus.APPROVED
+                        if isinstance(data, dict) and data.get("project_id"):
+                            try:
+                                k_entry.project_id = _uuid.UUID(str(data["project_id"]))
+                            except Exception:
+                                pass
                         if k_entry.metadata_ is None:
                             k_entry.metadata_ = {}
+                        if isinstance(data, dict) and data.get("project_id"):
+                            k_entry.metadata_["project_id"] = str(data["project_id"])
                         if staging_hist:
                             k_entry.metadata_["staging_history"] = staging_hist
                         k_entry.metadata_["history"] = []
@@ -5520,68 +6482,160 @@ async def approve_document(
             trace.log_stage("DB_COMMIT", int((time.time() - t0_db) * 1000), status="SUCCESS")
             approved_results.append(k_id)
 
+            # Phase 1/2: Canonical Schema Atomic Publish
+            try:
+                from app.rag.services.canonical_ingest_service import CanonicalIngestService
+                from sqlalchemy import text as _text
+                can_service = CanonicalIngestService()
+                def _latest_version():
+                    with can_service.engine.connect() as _c_conn:
+                        return _c_conn.execute(
+                            _text("SELECT id, status FROM knowledge_version WHERE knowledge_id = :kid ORDER BY version_no DESC LIMIT 1;"),
+                            {"kid": str(k_id)}
+                        ).fetchone()
+
+                def _wait_for_ingest(v_id):
+                    # The draft's canonical ingest (embeddings) finishes in the background after the document
+                    # already shows as ready for review; an approval arriving first waits for it instead of
+                    # having the publish rejected by the readiness gate.
+                    wait_deadline = time.time() + 300
+                    while time.time() < wait_deadline:
+                        with can_service.engine.connect() as _c_conn:
+                            job_status = _c_conn.execute(
+                                _text("SELECT ingestion_job_status FROM knowledge_version WHERE id = :v_id;"),
+                                {"v_id": v_id}
+                            ).scalar()
+                        if job_status != "PENDING":
+                            return
+                        time.sleep(2)
+
+                v_row = _latest_version()
+                draft_is_stale = False
+                if v_row and v_row[1] != "ACTIVE":
+                    # A draft holds the content as it was parsed; when the admin edited the summary since,
+                    # the draft no longer matches what is being approved.
+                    await asyncio.to_thread(_wait_for_ingest, str(v_row[0]))
+                    with can_service.engine.connect() as _c_conn:
+                        draft_summary, draft_job = _c_conn.execute(
+                            _text("SELECT summary_md, ingestion_job_status FROM knowledge_version WHERE id = :v_id;"),
+                            {"v_id": str(v_row[0])}
+                        ).fetchone()
+                    # The draft no longer matches when the summary was edited or the chunks were re-made here.
+                    # A draft whose own indexing failed or never finished cannot be published either: without
+                    # this, the document would show as approved while the chatbot has none of its content.
+                    draft_is_stale = (
+                        chunks_remade
+                        or draft_job != "COMPLETED"
+                        or (bool(approve_summary) and summary_text_changed(draft_summary, approve_summary))
+                    )
+                    if draft_job != "COMPLETED":
+                        logger.warning(f"[CANONICAL] Draft index of '{k_id}' is '{draft_job}' at approval; indexing the approved content again.")
+                if (not v_row or v_row[1] == "ACTIVE" or draft_is_stale) and chunks:
+                    # The content being approved (an edit or re-parse of an already published document, or a
+                    # draft edited by hand) was never ingested into the canonical index the chatbot retrieves
+                    # from: ingest it as a new version so the publish below makes it live.
+                    await asyncio.to_thread(
+                        _run_canonical_shadow_ingest_sync,
+                        knowledge_id=str(k_id),
+                        file_name=file_name,
+                        file_hash=(data.get("file_hash") if isinstance(data, dict) else None) or f"approve:{k_id}:{int(time.time())}",
+                        extracted_doc_type=doc_type or "GENERAL",
+                        visibility_settings=vis_settings,
+                        recommended_title=doc_title,
+                        enriched_chunks=chunks,
+                        summary=approve_summary
+                    )
+                    v_row = _latest_version()
+                    logger.info(f"[CANONICAL] Ingested approved content of '{k_id}' as new version {v_row[0] if v_row else '?'}")
+                if v_row:
+                    ver_to_pub = str(v_row[0])
+                    await asyncio.to_thread(_wait_for_ingest, ver_to_pub)
+                    can_service.publish_version_atomic(
+                        knowledge_id=str(k_id),
+                        version_id=ver_to_pub
+                    )
+                    logger.info(f"✨ [CANONICAL ATOMIC PUBLISH] Version {ver_to_pub} is now ACTIVE in Canonical Knowledge Schema for doc {k_id}")
+                    # Measure what the doctors now get from this document, generated questions included
+                    from app.rag.services.ingest_quality import schedule_quality_check
+                    schedule_quality_check(str(k_id), version_id=ver_to_pub, probes=quality_probes)
+            except Exception as can_pub_err:
+                # The chatbot keeps answering from the previously published version: report it.
+                logger.warning(f"Canonical Publish note for {k_id}: {can_pub_err}")
+                publish_failures.append({"knowledge_id": str(k_id), "reason": str(can_pub_err)})
+
         except Exception as e:
             logger.error(f"Approval failed for document '{target_id}': {e}")
             trace.fail("APPROVAL_STEP", str(e))
 
-    # BATCH EMBEDDING & INDEXING: Index all chunks across approved documents in one single batch!
-    pgvector_status = "SUCCESS"
-    bm25_status = "SUCCESS"
-
+    # BATCH EMBEDDING & INDEXING: Decoupled to non-blocking background task
+    # Canonical knowledge (kb_chunk) was already published synchronously above in <50ms.
     if all_chunks_to_index:
-        t0_emb = time.time()
-        trace.log_stage("EMBEDDING", int((time.time() - t0_emb) * 1000), status="SUCCESS", count=len(all_chunks_to_index))
+        trace.log_stage("CANONICAL_INDEX", 0, status="SUCCESS", count=len(all_chunks_to_index))
+        
+        def _sync_legacy_worker(chunks_list=all_chunks_to_index, pl=pipeline, b_inst=bm25):
+            try:
+                vs = pl.vector_store if pl else None
+                if not vs:
+                    try:
+                        from app.rag.services.vector_store import PGVectorAdapter
+                        vs = PGVectorAdapter()
+                    except Exception as vs_e:
+                        logger.error(f"Failed to instantiate PGVectorAdapter for background sync: {vs_e}")
+                if vs:
+                    try:
+                        vs.insert_chunks(chunks_list)
+                    except Exception as pg_e:
+                        logger.error(f"PGVector background batch insertion failed: {pg_e}")
 
-        t0_pg = time.time()
-        v_store = pipeline.vector_store if pipeline else None
-        if not v_store:
-            try:
-                from app.rag.services.vector_store import PGVectorAdapter
-                v_store = PGVectorAdapter()
-            except Exception as vs_err:
-                logger.error(f"Failed to instantiate PGVectorAdapter: {vs_err}")
-        if v_store:
-            try:
-                v_store.insert_chunks(all_chunks_to_index)
-            except Exception as pg_err:
-                logger.error(f"PGVector batch insertion failed: {pg_err}")
-                pgvector_status = "FAILED"
-        else:
-            pgvector_status = "WARNING"
-        trace.log_stage("PGVECTOR", int((time.time() - t0_pg) * 1000), status=pgvector_status, count=len(all_chunks_to_index))
+                b_obj = b_inst
+                if not b_obj:
+                    try:
+                        from app.rag.services.rag_retriever import BM25Index
+                        b_obj = BM25Index()
+                        if os.path.exists(settings.bm25_index_path):
+                            b_obj.load(settings.bm25_index_path)
+                    except Exception as bm_e:
+                        logger.error(f"Failed to load BM25Index for background sync: {bm_e}")
+                if b_obj:
+                    try:
+                        b_obj.add_chunks(chunks_list)
+                        os.makedirs(os.path.dirname(settings.bm25_index_path), exist_ok=True)
+                        b_obj.save(settings.bm25_index_path)
+                    except Exception as bms_e:
+                        logger.error(f"BM25 background batch indexing failed: {bms_e}")
+            except Exception as bg_e:
+                logger.warning(f"Background legacy sync note: {bg_e}")
 
-        t0_bm25 = time.time()
-        bm25_inst = bm25
-        if not bm25_inst:
-            try:
-                from app.rag.services.rag_retriever import BM25Index
-                bm25_inst = BM25Index()
-                if os.path.exists(settings.bm25_index_path):
-                    bm25_inst.load(settings.bm25_index_path)
-            except Exception as bm_err:
-                logger.error(f"Failed to load BM25Index: {bm_err}")
-        if bm25_inst:
-            try:
-                bm25_inst.add_chunks(all_chunks_to_index)
-                os.makedirs(os.path.dirname(settings.bm25_index_path), exist_ok=True)
-                bm25_inst.save(settings.bm25_index_path)
-            except Exception as bm_save_err:
-                logger.error(f"BM25 batch indexing failed: {bm_save_err}")
-                bm25_status = "FAILED"
-        trace.log_stage("BM25", int((time.time() - t0_bm25) * 1000), status=bm25_status)
+        # The older PGVector/BM25 stores are only kept up to date while they are still read as a fallback
+        from app.rag.config import settings as _rag_settings
+        if getattr(_rag_settings, "legacy_retrieval_fallback", False):
+            if background_tasks is not None:
+                background_tasks.add_task(_sync_legacy_worker)
+            else:
+                asyncio.create_task(asyncio.to_thread(_sync_legacy_worker))
 
     trace.complete(
         approved_count=len(approved_results),
         failed_count=len(targets) - len(approved_results),
         total_chunks=len(all_chunks_to_index),
         embedding_count=len(all_chunks_to_index),
-        bm25_status=bm25_status,
+        bm25_status="BACKGROUND_ASYNC",
         storage_status="SUCCESS"
     )
 
+    if publish_failures:
+        return {
+            "status": "partial",
+            "message": (
+                f"Approved {len(approved_results)} document(s), but {len(publish_failures)} could not be published "
+                "to the chatbot knowledge index; the chatbot still answers from the previous version."
+            ),
+            "approved_ids": approved_results,
+            "publish_failures": publish_failures,
+        }
     return {
-        "status": "success", 
-        "message": f"Successfully approved {len(approved_results)} document(s).", 
+        "status": "success",
+        "message": f"Successfully approved {len(approved_results)} document(s).",
         "approved_ids": approved_results
     }
 
@@ -5667,7 +6721,7 @@ async def delete_document_endpoint(
         try:
             from app.core.database import AsyncSessionLocal
             from app.models.knowledge import Knowledge
-            from sqlalchemy import select, func
+            from sqlalchemy import select, func, text
             import uuid as _uuid
 
             async with AsyncSessionLocal() as session:
@@ -5706,10 +6760,16 @@ async def delete_document_endpoint(
                         logger.debug(f"DB image purge note: {s3_db_err}")
 
                     d_doc.deleted_at = func.now()
+                    await session.execute(text("""
+                        UPDATE kb_chunk SET is_active = false
+                        WHERE version_id IN (
+                            SELECT id FROM knowledge_version WHERE knowledge_id = :kid
+                        )
+                    """), {"kid": d_doc.id})
                 if db_docs:
                     await session.commit()
                     was_deleted = True
-                    logger.info(f"Soft-deleted {len(db_docs)} record(s) in PostgreSQL Knowledge DB for '{k_id}'")
+                    logger.info(f"Soft-deleted {len(db_docs)} record(s) and deactivated active chunks in PostgreSQL Knowledge DB for '{k_id}'")
         except Exception as db_err:
             logger.warning(f"Could not soft-delete Knowledge DB record for '{k_id}': {db_err}")
 
@@ -5831,14 +6891,57 @@ async def run_chat_pipeline(
     if not doc_name and user_context and getattr(user_context, "doctor_name", None):
         doc_name = user_context.doctor_name
 
-    # STRICT APPROVAL GATE: Chatbot only retrieves officially approved documents.
+    # APPROVAL GATE: Chatbot verifies document exists in KB (approved, staged, or DB).
     # Check if query specifically mentions a document UUID
     import re as _re
     uuid_matches = _re.findall(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', str(effective_query))
     if uuid_matches:
         for requested_uuid in uuid_matches:
-            if not resolve_approved_file(requested_uuid):
-                logger.warning(f"🚫 [ChatPipeline] Document '{requested_uuid}' is not in approved KB.")
+            target_f = resolve_approved_file(requested_uuid) or resolve_pending_file(requested_uuid)
+            if not target_f:
+                from app.core.database import get_sync_engine
+                from sqlalchemy import text as _text
+                has_doc = False
+                try:
+                    sync_eng = get_sync_engine()
+                    with sync_eng.connect() as conn:
+                        row = conn.execute(_text("SELECT id FROM knowledge WHERE id::text = :k_id"), {"k_id": requested_uuid}).fetchone()
+                        if row:
+                            has_doc = True
+                except Exception:
+                    pass
+                if not has_doc:
+                    logger.warning(f"🚫 [ChatPipeline] Document '{requested_uuid}' is not in approved KB.")
+                    return ChatResponse(
+                        query=query,
+                        answer="Untuk saat ini informasi tersebut belum tersedia.",
+                        context="",
+                        results=[],
+                        agent_used=False
+                    )
+
+    # If a specific knowledge_id is provided, verify it is accessible in approved, staged, or DB
+    if knowledge_id:
+        k_id_str = str(knowledge_id).strip()
+        app_file = resolve_approved_file(k_id_str) or resolve_pending_file(k_id_str)
+        if app_file:
+            filter_metadata["knowledge_id"] = k_id_str
+        else:
+            from app.core.database import get_sync_engine
+            from sqlalchemy import text as _text
+            has_doc = False
+            try:
+                sync_eng = get_sync_engine()
+                with sync_eng.connect() as conn:
+                    row = conn.execute(_text("SELECT id FROM knowledge WHERE id::text = :k_id"), {"k_id": k_id_str}).fetchone()
+                    if row:
+                        has_doc = True
+            except Exception:
+                pass
+            if has_doc:
+                filter_metadata["knowledge_id"] = k_id_str
+            else:
+                logger.warning(f"🚫 [ChatPipeline] Document '{k_id_str}' is not in approved KB.")
                 return ChatResponse(
                     query=query,
                     answer="Untuk saat ini informasi tersebut belum tersedia.",
@@ -5846,22 +6949,6 @@ async def run_chat_pipeline(
                     results=[],
                     agent_used=False
                 )
-
-    # If a specific knowledge_id is provided, verify it is approved; if not, reject immediately.
-    if knowledge_id:
-        k_id_str = str(knowledge_id).strip()
-        app_file = resolve_approved_file(k_id_str)
-        if app_file:
-            filter_metadata["knowledge_id"] = k_id_str
-        else:
-            logger.warning(f"🚫 [ChatPipeline] Document '{k_id_str}' is not in approved KB.")
-            return ChatResponse(
-                query=query,
-                answer="Untuk saat ini informasi tersebut belum tersedia.",
-                context="",
-                results=[],
-                agent_used=False
-            )
 
     try:
         response = pipeline.generate_answer(
@@ -6267,9 +7354,13 @@ async def _resolve_query_general_prompt(db_session) -> str:
             needs_sync = (
                 "GAMBAR PRODUK & TREATMENT RESMI" not in db_prompt
                 or "PENYAJIAN JURNAL ILMIAH & KATALOG TABEL" not in db_prompt
+                or "PENYAJIAN PERBANDINGAN PRODUK & TREATMENT" not in db_prompt
                 or "BATASAN AKSES ROLE DOKTER" in db_prompt
                 or "Currently, we are unable to provide this information." in db_prompt
                 or "KONTRAINDIKASI, KONDISI KHUSUS" not in db_prompt
+                or "KONSISTENSI PENOMORAN DAFTAR" not in db_prompt
+                or "ZERO PROCEDURAL EXTRAPOLATION" not in db_prompt
+                or "KOMBO TREATMENT & INDIKASI SPESIFIK" not in db_prompt
             )
             if needs_sync:
                 try:
@@ -6986,242 +8077,35 @@ async def query_general_endpoint(
                         results=[]
                     )
 
-        # 3.2 Resolve system prompt from DB (or hardcoded fallback with 7 strict rules)
-        from app.core.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as db_session:
-            system_prompt = await _resolve_query_general_prompt(db_session)
-
-        # 3.3 Contextualize query and retrieve approved knowledge
-        t0_retrieval = time.time()
-        search_query = GenerationPipeline.contextualize_retrieval_query(user_prompt, request.history)
-
-        # Dynamic top_k: Broad/Synthesis queries covering multi-page journals or multi-sheet Excel catalogs
+        # 3.2 Dynamic top_k calculation
         broad_keywords = [
             "semua", "lengkap", "runtut", "seluruh", "jurnal", "paper", "katalog", "tabel",
-            "daftar", "sebutkan", "jelaskan", "kandungan", "manfaat", "hasil", "penelitian", "metode"
+            "daftar", "sebutkan", "jelaskan", "kandungan", "manfaat", "hasil", "penelitian", "metode",
+            "perbedaan", "beda", "bandingkan", "perbandingan", "vs", "versus", "komparasi", "list"
         ]
-        q_lower = search_query.lower()
+        q_lower = effective_prompt.lower()
         is_broad = any(kw in q_lower for kw in broad_keywords)
         general_top_k = 18 if is_broad else 10
 
-        retrieval_response = pipeline.retriever.retrieve(
-            query=search_query,
+        # 3.3 Execute Unified Generation Pipeline (100% parity with Mock CIS)
+        response_dict = pipeline.generate_answer(
+            query=effective_prompt,
             top_k=general_top_k,
-            filter_metadata=None,
-            rerank=False,
-            include_expired=True
+            rerank=True,
+            history=request.history or [],
+            doctor_name="Admin"
         )
 
-        results = retrieval_response.get("results", [])
-        context = retrieval_response.get("context", "")
-        retrieval_ms = int((time.time() - t0_retrieval) * 1000)
-
-        is_context_empty = (
-            not results
-            or context in ("Maaf, saya tidak menemukan informasi.", "No relevant context found.")
-            or len(context.strip()) == 0
-        )
-
-        if is_context_empty:
-            logger.info(f"[QUERY-GENERAL] No approved knowledge found for: '{user_prompt}'")
-            from app.rag.services.rag_generator import log_rag_chat
-            log_rag_chat(
-                query=user_prompt,
-                intent_val="UNKNOWN",
-                top_k=10,
-                results=[],
-                context_status="REJECTED",
-                retrieval_ms=retrieval_ms,
-                llm_ms=0,
-                guardrails_status="PASSED",
-                header_title="RAG CHAT ADMIN"
-            )
-            return QueryGeneralResponse(
-                prompt=user_prompt,
-                answer="Untuk saat ini informasi tersebut belum tersedia.",
-                action="read",
-                target_knowledge_id=None,
-                total_found=0,
-                results=[]
-            )
-
-        context_for_prompt = context if not is_context_empty else "(Tidak ada dokumen yang ditemukan di Knowledge Base untuk kueri ini.)"
-
-        history_str = ""
-        if request.history:
-            for msg in request.history:
-                role = "User" if msg.get("role") == "user" else "Assistant"
-                content = msg.get("content", "")
-                history_str += f"{role}: {content}\n"
-        else:
-            history_str = "No previous conversation.\n"
-
-        full_prompt = (
-            f"{system_prompt}\n\n"
-            f"--- DATA KNOWLEDGE BASE YANG DITEMUKAN ---\n"
-            f"{context_for_prompt}\n\n"
-            f"--- RIWAYAT PERCAKAPAN ---\n"
-            f"{history_str}\n"
-            f"User: {user_prompt}\n"
-            f"Assistant:"
-        )
-
-        import asyncio
-        t0_llm = time.time()
-        answer = await asyncio.to_thread(pipeline.llm_adapter.generate, full_prompt)
-        llm_ms = int((time.time() - t0_llm) * 1000)
-
-        from app.rag.services.guardrails import OutputGuard
-        answer = OutputGuard.redact_pii(answer)
-        answer = OutputGuard.strip_patient_disclaimers(answer)
-
-        action_type = "read"
-        target_kid = None
-        action_data = _extract_kb_action(answer)
-        if action_data:
-            act = action_data.get("action")
-            kid = action_data.get("knowledge_id")
-            if kid and resolve_approved_file(kid):
-                if act in ("edit_preview", "edit"):
-                    action_type = "edit_preview"
-                    target_kid = kid
-                elif act in ("delete_preview", "delete"):
-                    action_type = "delete_preview"
-                    target_kid = kid
-                elif act == "cancel":
-                    action_type = "cancelled"
-            else:
-                action_data = None
-
-        # -------------------------------------------------------------
-        # PHASE 4: Output Sanitization & Entity-Isolated Image Injection
-        # -------------------------------------------------------------
-        clean_answer = re.sub(r'```json\s*\n?\s*\{[^`]+?\}\s*\n?\s*```', '', answer).strip()
-        clean_answer = re.sub(r'\{"action":\s*"[^"]+",\s*"knowledge_id":\s*"[^"]+".*?\}', '', clean_answer, flags=re.DOTALL).strip()
-
-        # Inject authentic approved MinIO images (Strict 1-to-1 Entity Isolated, Zero Cross-Product Fallback)
-        injected_imgs = set()
-        injected_entities = set()
-        for hit in results:
-            meta = hit.get("metadata", {})
-            img = meta.get("image_url") or meta.get("image")
-            
-            chunk_content = hit.get("content") or hit.get("text") or ""
-            target_match = _extract_specific_treatment_or_product_name(meta, chunk_text=chunk_content)
-            if not target_match:
-                continue
-
-            entity_key = target_match.lower().strip()
-            if entity_key in injected_entities:
-                continue
-
-            # Strict 1-to-1 matching: If chunk does not have an explicit image_url, check images list for exact product_name match
-            if not img and isinstance(meta.get("images"), list):
-                for img_obj in meta["images"]:
-                    if isinstance(img_obj, dict) and img_obj.get("url"):
-                        p_name = img_obj.get("product_name") or img_obj.get("caption") or ""
-                        if p_name and (p_name.lower() in entity_key or entity_key in p_name.lower()):
-                            img = img_obj["url"]
-                            break
-
-            # STRICT RULE: Verify physical asset exists on MinIO or storage before injecting
-            from app.services.storage import is_valid_storage_asset
-            if not img or not is_valid_storage_asset(str(img)):
-                continue
-
-            img_filename = os.path.basename(str(img)).lower()
-            if ("cover" in img_filename or "header_logo" in img_filename or meta.get("image_role") == "COVER") and not any(k in img_filename for k in ["before", "after", "product", "treatment", "photo", "image", "img"]):
-                continue
-
-            display_label = target_match
-
-            if str(img) in injected_imgs:
-                continue
-
-            if target_match.lower() in clean_answer.lower() and str(img) not in clean_answer:
-                pattern = re.compile(rf'(?:\n|^)([^\n]*{re.escape(target_match)}[^\n]*)', re.IGNORECASE)
-                if pattern.search(clean_answer):
-                    clean_answer = pattern.sub(rf'\1\n\n![{display_label}]({img})\n\n', clean_answer, count=1)
-                    injected_imgs.add(str(img))
-                    injected_entities.add(entity_key)
-
-        clean_answer = OutputGuard.strip_patient_disclaimers(clean_answer)
-
-        # Strip any accidental "(jika ada gambar valid)" or "(URL gambar valid)" literal text strings
-        clean_answer = re.sub(r'\(\s*(?:jika\s+ada\s+)?(?:gambar|foto|url)(?:\s+valid|\s+resmi)?\s*\)', '', clean_answer, flags=re.IGNORECASE)
-
-        # Strip any "Gambar:" or "• Gambar:" text labels per user requirement
-        clean_answer = re.sub(r'^[|\-\*]?\s*(?:Gambar|Foto|Foto Produk)\s*:\s*', '', clean_answer, flags=re.MULTILINE | re.IGNORECASE)
-
-        # Clean invalid/placeholder image markdown tags and deduplicate image tags for the same product/treatment
-        seen_img_keys = set()
-        def _clean_and_dedup_img_tag(m):
-            alt_t = m.group(1).strip()
-            url_t = m.group(2).strip()
-            url_lower = url_t.lower()
-            if not url_t or url_lower in ("none", "null", "undefined", "#", "url_gambar", "url"):
-                return ""
-            key = (alt_t.lower(), url_lower)
-            if key in seen_img_keys:
-                return ""
-            seen_img_keys.add(key)
-            return f"![{alt_t}]({url_t})"
-
-        clean_answer = re.sub(r'!\[([^\]]*)\]\(([^\)]*)\)', _clean_and_dedup_img_tag, clean_answer)
-
-        # Ensure introductory phrases like "Berikut ...:" have a blank line after them
-        clean_answer = re.sub(r'^(Berikut [^\n:]+:)[ \t]*\n(?!\n)', r'\1\n\n', clean_answer, flags=re.MULTILINE | re.IGNORECASE)
-
-        # Ensure all markdown images have double newlines before and after for clean block rendering
-        clean_answer = re.sub(r'([^\n])\n?(!\[.*?\]\([^\)]+\))', r'\1\n\n\2', clean_answer)
-        clean_answer = re.sub(r'(!\[.*?\]\([^\)]+\))\n?([^\n])', r'\1\n\n\2', clean_answer)
-
-        # Ensure any unbolded title line directly preceding an image becomes bolded
-        clean_answer = re.sub(r'(?:\n|^)(?!#|\*|-|\d\.)([A-Za-z0-9][^\n]{3,80})\n\n(!\[.*?\]\([^\)]+\))', r'\n\n**\1**\n\n\2', clean_answer)
-
-        # Post-process: Ensure image tag is always positioned RIGHT BELOW the item title line (above bullet points)
-        clean_answer = re.sub(r'(\*\*[^\*\n]+\*\*)\n+((?:[ \t]*-\s*\*\*[^\n]+\n+)+)\n*(!\[.*?\]\([^\)]+\))', r'\1\n\n\3\n\n\2', clean_answer)
-
-        # Ensure all image URLs are expanded to full absolute URLs using S3_PUBLIC_URL
-        clean_answer = expand_image_urls_in_markdown(clean_answer)
-
-        # Normalize excessive consecutive newlines (max 2)
-        clean_answer = re.sub(r'\n{3,}', '\n\n', clean_answer).strip()
-
-
-        # Strip redundant trailing disclaimer if answer already contains valid factual content
-        disclaimer_phrase = "Untuk saat ini informasi tersebut belum tersedia."
-        if len(clean_answer.strip()) > len(disclaimer_phrase) + 30 and clean_answer.strip().endswith(disclaimer_phrase):
-            clean_answer = clean_answer.strip()[:-len(disclaimer_phrase)].rstrip()
-
-        # Normalize missing/unavailable responses from LLM
-        if (
-            clean_answer.strip().lower() == "untuk saat ini informasi tersebut belum tersedia."
-            or clean_answer.strip().lower().startswith("untuk saat ini informasi tersebut belum tersedia")
-        ) and action_type == "read":
-            clean_answer = "Untuk saat ini informasi megenai hal tersebut belum tersedia."
-            results = []
-
-        from app.rag.services.rag_generator import log_rag_chat
-        log_rag_chat(
-            query=user_prompt,
-            intent_val="UNKNOWN",
-            top_k=len(results),
-            results=results,
-            context_status="ACCEPTED" if (results and not is_context_empty) else "EMPTY",
-            retrieval_ms=retrieval_ms,
-            llm_ms=llm_ms,
-            guardrails_status="PASSED",
-            header_title="RAG CHAT ADMIN"
-        )
+        clean_answer = response_dict.get("answer", "")
+        results = response_dict.get("results", [])
 
         return QueryGeneralResponse(
             type="answer",
             message=clean_answer,
             prompt=user_prompt,
             answer=clean_answer,
-            action=action_type,
-            target_knowledge_id=target_kid,
+            action="read",
+            target_knowledge_id=None,
             total_found=len(results),
             results=results
         )

@@ -10,6 +10,7 @@ from rank_bm25 import BM25Okapi
 
 from app.rag.services.interfaces import BaseVectorStoreAdapter
 from app.rag.config import settings
+from app.rag.services.canonical_retriever import CanonicalV2Retriever, ClinicalConflictResolver, evaluate_acl_3level
 
 # Shared persistent worker pool for parallel hybrid dense + sparse retrieval (sized for 1.5 vCPU)
 _RETRIEVAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -87,6 +88,11 @@ def is_chunk_valid_temporal(
 
 
 # --- Local BM25 Index ---
+def _legacy_index_in_use() -> bool:
+    """The BM25 store is read (and so worth loading or maintaining) only as the legacy retrieval fallback."""
+    return bool(getattr(settings, "legacy_retrieval_fallback", False))
+
+
 class BM25Index:
     def __init__(self):
         self.chunks: List[Dict[str, Any]] = []       # Original chunks with text and metadata
@@ -106,10 +112,10 @@ class BM25Index:
         """
         try:
             from app.rag.services.vector_store import DocumentChunk
-            from sqlalchemy import create_engine
+            from app.core.database import get_sync_engine
             from sqlalchemy.orm import sessionmaker
 
-            engine = create_engine(settings.pg_conn_str, pool_pre_ping=True)
+            engine = get_sync_engine()
             Session = sessionmaker(bind=engine)
             with Session() as session:
                 docs = session.query(DocumentChunk).all()
@@ -140,7 +146,7 @@ class BM25Index:
 
     def add_chunks(self, new_chunks: List[Dict[str, Any]]):
         """Adds new chunks to the BM25 index, removing old chunks of the same source file first."""
-        if not new_chunks:
+        if not new_chunks or not _legacy_index_in_use():
             return
 
         # Ensure index is loaded before appending to prevent wiping existing index
@@ -176,6 +182,8 @@ class BM25Index:
 
     def remove_file_chunks(self, source_file: str):
         """Removes all chunks associated with a given source file name or knowledge_id."""
+        if not _legacy_index_in_use():
+            return
         if not self.chunks:
             self.load(settings.bm25_index_path)
             if not self.chunks:
@@ -277,12 +285,13 @@ class BM25Index:
                             continue
                         # If chunk has specific restrictions, check if user's specific attributes match
                         user_specific_items = [item for item in v if item and item != "all"]
-                        if not any(
-                            any(str(item).lower() in str(c).lower() or str(c).lower() in str(item).lower() for c in chunk_val)
-                            for item in user_specific_items
-                        ):
-                            match = False
-                            break
+                        if user_specific_items:
+                            if not any(
+                                any(str(item).lower() in str(c).lower() or str(c).lower() in str(item).lower() for c in chunk_val)
+                                for item in user_specific_items
+                            ):
+                                match = False
+                                break
                     elif meta.get(k) != v:
                         match = False
                         break
@@ -378,6 +387,8 @@ class BM25Index:
 
     def load(self, file_path: str = None):
         """Loads and deserializes the index from MinIO (SSOT) with local disk fallback."""
+        if not _legacy_index_in_use():
+            return
         data = None
 
         # 1. Fast MinIO fetch (SSOT)
@@ -459,8 +470,10 @@ class PromptContextBuilder:
 
         for idx, hit in enumerate(hits, start=1):
             metadata = hit.get("metadata", {})
+            text = hit.get("text", "")
             source_file = metadata.get("source_file", "unknown")
-            product_name = metadata.get("product_name") or metadata.get("title") or metadata.get("treatment_name")
+            title = metadata.get("title") or ""
+            product_name = metadata.get("product_name") or title or metadata.get("treatment_name")
             if not product_name:
                 product_name = os.path.splitext(source_file)[0].replace("-", " ").replace("_", " ").strip()
 
@@ -468,25 +481,83 @@ class PromptContextBuilder:
             category = metadata.get("category") or (metadata.get("categories")[0] if metadata.get("categories") else "")
             cat_header = f" | Category: {category}" if category else ""
 
+            form_factor = metadata.get("form_factor")
+            if not form_factor:
+                cat_lower = str(category).lower()
+                for ff in ["serum", "toner", "facial wash", "cleanser", "cream", "krim", "gel", "lotion", "sunscreen", "moisturizer", "pelembap", "shampoo", "sampo", "mask", "masker"]:
+                    if ff in cat_lower:
+                        form_factor = ff.title()
+                        break
+            ff_header = f" | Form Factor: {form_factor}" if form_factor else ""
+
+            section = metadata.get("section", "General")
+            page = metadata.get("page", 1)
+
             rel_prods = metadata.get("related_products", [])
             rel_prods_header = f" | Related Products: {', '.join(rel_prods[:4])}" if rel_prods else ""
 
             rel_treats = metadata.get("related_treatments", [])
             rel_treats_header = f" | Related Treatments: {', '.join(rel_treats[:4])}" if rel_treats else ""
 
-            indications = metadata.get("indications", [])
-            ind_header = f" | Indications: {', '.join(indications[:5])}" if indications else ""
+            # Clinical Indication Guardrail: Prevent document-level fallback indications
+            # from leaking into incompatible categories (e.g. hair/scalp products inheriting acne indications)
+            raw_indications = metadata.get("indications", [])
+            text_lower = text.lower()
+            combined_domain = f"{section} {category} {title} {product_name} {text_lower}".lower()
 
-            section = metadata.get("section", "General")
-            page = metadata.get("page", 1)
+            hair_scalp_keywords = [
+                "scalp", "hair", "rambut", "kulit kepala", "shampoo", "sampo",
+                "dandruff", "ketombe", "seboroik", "alopecia", "rontok", "folikel"
+            ]
+            facial_indications = {
+                "acne_vulgaris", "comedones", "acne_scar", "sebum_oily", "enlarged_pores",
+                "hyperpigmentation", "dull_skin", "aging_wrinkles", "sensitive_barrier"
+            }
+            hair_indications = {
+                "dandruff", "hair_loss", "seborrheic_dermatitis", "scalp_barrier", "hair_thinning", "oily_scalp"
+            }
+
+            is_hair_or_scalp = any(kw in combined_domain for kw in hair_scalp_keywords)
+            if is_hair_or_scalp:
+                # Strictly purge facial indications from scalp/hair care products
+                filtered_indications = [
+                    ind for ind in raw_indications 
+                    if ind in hair_indications or (ind not in facial_indications and ind.lower() in text_lower)
+                ]
+            else:
+                # For non-hair products, only retain indications if substantiated by chunk text or category
+                filtered_indications = [
+                    ind for ind in raw_indications
+                    if ind.lower() in text_lower or ind.lower() in str(category).lower()
+                ]
+
+            ind_header = f" | Indications: {', '.join(filtered_indications[:5])}" if filtered_indications else ""
+
             image_url = metadata.get("image_url") or metadata.get("image")
-            if not image_url and metadata.get("image_urls") and isinstance(metadata.get("image_urls"), list) and len(metadata["image_urls"]) > 0:
-                image_url = metadata["image_urls"][0]
-            text = hit.get("text", "")
             if not image_url:
                 img_matches = re.findall(r'!\[.*?\]\(([^\)]+)\)', text)
                 if img_matches:
                     image_url = img_matches[0]
+                elif metadata.get("image_urls") and isinstance(metadata.get("image_urls"), list) and len(metadata["image_urls"]) == 1:
+                    image_url = metadata["image_urls"][0]
+
+            # Multi-product Infographic & Routine Slide context synthesis:
+            # If chunk text contains an image with multi-product alt label (e.g. ![Foto Produk - A, B, C, D](...))
+            # and the text does not already list them, synthesize the sequential product list into the text
+            text_without_images = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text)
+            alt_img_matches = re.findall(r'!\[Foto Produk\s*-\s*([^\]]+)\]\(([^)]+)\)', text)
+            for alt_prods, _img_link in alt_img_matches:
+                if "," in alt_prods:
+                    prods = [p.strip() for p in alt_prods.split(",") if len(p.strip()) > 3]
+                    if len(prods) >= 2 and not any(p.lower() in text_without_images.lower() for p in prods):
+                        steps_text = "\nRangkaian Produk / Urutan Pemakaian:\n" + "\n".join(f"{idx+1}. {p}" for idx, p in enumerate(prods))
+                        text = f"{text}\n{steps_text}"
+
+            from app.services.storage import _format_browser_url, expand_image_urls_in_markdown
+            # Normalize images in text and metadata to absolute URLs so LLM outputs valid reachable URLs for CIS
+            text = expand_image_urls_in_markdown(text, verify_exists=False)
+            if image_url:
+                image_url = _format_browser_url(raw_url=image_url, s3_key=image_url)
 
             # Deduplicate table rows across chunks to prevent duplicate table outputs
             if "|" in text:
@@ -526,10 +597,15 @@ class PromptContextBuilder:
             price = metadata.get("price")
             price_header = f" | Price: {price}" if price else ""
 
+            domain = metadata.get("clinical_domain") or metadata.get("domain")
+            domain_header = f" | Domain: {domain}" if domain else ""
+            is_discontinued = bool(metadata.get("is_discontinued", False))
+            status_header = " | Status: DISCONTINUED" if is_discontinued else ""
+
             # Exclude raw filename and internal system IDs from context header to prevent LLM leaking them
             img_header = f" | Image: {image_url}" if image_url else ""
             part = (
-                f"[{idx}] Type: {doc_type} | Title: {product_name}{cat_header}{sku_header}{price_header}{ind_header}{promo_header}{img_header}{rel_prods_header}{rel_treats_header} | Section: {section}\n"
+                f"[{idx}] Type: {doc_type}{ff_header} | Title: {product_name}{domain_header}{status_header}{cat_header}{sku_header}{price_header}{ind_header}{promo_header}{img_header}{rel_prods_header}{rel_treats_header} | Section: {section}\n"
                 f"Content:\n{text.strip()}"
             )
 
@@ -587,24 +663,23 @@ CLINICAL_SYNONYM_DICTIONARY = {
     "melasma": ["melasma", "hyperpigmentation", "flek hormonal", "brightening center"],
     "melasma ringan": ["melasma ringan", "mild melasma", "brightening center", "pih"],
     "pih": ["post-inflammatory hyperpigmentation", "hiperpigmentasi pasca inflamasi", "noda hitam bekas jerawat"],
-    "brightening center": ["brightening center", "erha brightening", "produk pencerah melasma"],
+    "brightening center": ["brightening center", "klinik pencerah", "program pencerah"],
     
-    # ── Reverse Ingredient & Active Substances ───────────────
-    "ethyl ascorbic acid": ["10% ethyl ascorbic acid", "active glow booster", "vitamin c", "brightening peptides"],
-    "10% ethyl ascorbic acid": ["erha truwhite active glow booster", "ethyl ascorbic acid", "brightening peptides"],
-    "brightening peptides": ["erha truwhite active glow booster", "peptides pencerah", "ethyl ascorbic acid"],
-    "active glow booster": ["erha truwhite active glow booster", "glow booster", "brightening serum"],
-    "truwhite": ["erha truwhite", "brightening facial wash", "active glow booster"],
-    "acneact": ["erha acneact", "gentle acne moisturizer", "acne spot gel"],
-    "gentle acne moisturizer": ["erha acneact gentle acne moisturizer", "pelembap jerawat", "acne moisturizer"],
+    # ── Ingredient & Active Substances (Generic Clinical Synonyms) ──
+    "ethyl ascorbic acid": ["3-o-ethyl ascorbic acid", "turunan vitamin c", "ascorbic acid"],
+    "vitamin c": ["ascorbic acid", "ethyl ascorbic acid", "l-ascorbic acid", "antioksidan"],
+    "brightening peptides": ["peptides", "peptida", "oligopeptide", "tetrapeptide"],
+    "salicylic acid": ["asam salisilat", "bha", "salicylate"],
+    "niacinamide": ["nicotinamide", "vitamin b3"],
+    "retinol": ["retinoid", "vitamin a", "retinal"],
     
     # ── Pores, Sebum & Cleansers ─────────────────────────────
     "pori gede": ["enlarged pores", "pori pori besar", "seborrhea"],
     "pori besar": ["enlarged pores", "pori pori besar", "sebum oily"],
     "minyakan": ["sebum oily", "kulit berminyak", "excess sebum", "oil control"],
     "sabun": ["facial wash", "cleanser", "pembersih wajah"],
-    "sabun muka": ["gentle acne facial wash", "cleanser", "pembersih wajah"],
-    "facial wash": ["facial wash", "cleanser", "pembersih wajah", "brightening facial wash"],
+    "sabun muka": ["facial wash", "cleanser", "pembersih wajah"],
+    "facial wash": ["facial wash", "cleanser", "pembersih wajah"],
     
     # ── Product Attributes (Size, Category, Ingredients) ────
     "ukuran": ["netto", "kemasan", "gram", "ml", "size"],
@@ -726,91 +801,41 @@ class HybridRetriever:
         self, 
         vector_store: BaseVectorStoreAdapter, 
         bm25_index: BM25Index,
-        reranker: Optional[Reranker] = None
+        reranker: Optional[Reranker] = None,
+        canonical_engine: Optional[Any] = None
     ):
         self.vector_store = vector_store
         self.bm25_index = bm25_index
         self.reranker = reranker
+        self.canonical_engine = canonical_engine
 
-    def retrieve(
-        self, 
-        query: str, 
-        top_k: int = 8, 
-        filter_metadata: Optional[Dict[str, Any]] = None,
-        rerank: bool = True,
-        rerank_top_n: int = 6,
-        confidence_threshold: Optional[float] = None,
-        include_expired: bool = False
+    def get_canonical_engine(self) -> CanonicalV2Retriever:
+        if self.canonical_engine is None:
+            self.canonical_engine = CanonicalV2Retriever()
+        return self.canonical_engine
+
+    def retrieve_canonical_v2(
+        self,
+        query: str,
+        top_k: int = 8,
+        doctor_id: Optional[str] = None,
+        doctor_type: Optional[str] = None,
+        clinic_id: Optional[str] = None,
+        filter_metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Executes Advanced Retrieval Pipeline:
-        1. Clinical Synonym & Slang Expansion
-        2. Dynamic Hybrid Router (Alpha Weight Tuning)
-        3. Parallel Dense (PGVector) & Sparse (BM25)
-        4. Reciprocal Rank Fusion (RRF) with weighted alpha
-        5. Temporal Validity Filtering
-        6. Cross-Encoder Reranking with Clinical Indication Boost
+        Direct accessor for Canonical Retrieval Engine V2 (Phase 3).
+        Executes Dense HNSW Partial + PostgreSQL Native FTS + Structured Entity Channel + RRF + Conflict Policy.
         """
-        # 1. Clinical Query Expansion
-        expanded_query = expand_clinical_query(query)
-        if expanded_query != query:
-            logger.info(f"🔍 [Query Expansion] '{query}' -> '{expanded_query}'")
-        else:
-            logger.debug(f"Retrieving for query: '{query}' with top_k={top_k}")
-
-        # 2. Dynamic Hybrid Router (Alpha Weight Tuning)
-        q_lower = query.lower()
-        exact_indicators = ["sku", "harga", "berapa", "kandungan", "komposisi", "nama produk", "kode", "brand", "netto", "isi"]
-        is_exact_lookup = any(ind in q_lower for ind in exact_indicators)
-
-        if is_exact_lookup:
-            dense_weight = 0.7
-            sparse_weight = 1.3
-            logger.debug("🎯 [Dynamic Router] Exact lookup detected -> Boosting BM25 sparse weight (1.3)")
-        else:
-            dense_weight = 1.2
-            sparse_weight = 0.8
-            logger.debug("🩺 [Dynamic Router] Clinical query detected -> Boosting PGVector dense weight (1.2)")
-
-        candidate_k = top_k * 2
-
-        # Use global persistent singleton executor to avoid per-query thread churn
-        future_dense = _RETRIEVAL_EXECUTOR.submit(self.vector_store.search, expanded_query, candidate_k, filter_metadata) if self.vector_store else None
-        future_sparse = _RETRIEVAL_EXECUTOR.submit(self.bm25_index.search, expanded_query, candidate_k, filter_metadata, include_expired) if self.bm25_index else None
-        
-        dense_hits = future_dense.result() if future_dense else []
-        sparse_hits = future_sparse.result() if future_sparse else []
-
-        if self.vector_store:
-            logger.debug(f"Dense retrieval returned {len(dense_hits)} candidates.")
-        if self.bm25_index:
-            logger.debug(f"Sparse retrieval returned {len(sparse_hits)} candidates.")
-        
-        fused_hits = reciprocal_rank_fusion(dense_hits, sparse_hits, dense_weight=dense_weight, sparse_weight=sparse_weight)
-        logger.debug(f"RRF Fusion completed. Fused {len(fused_hits)} candidates.")
-
-        # Deduplicate
-        seen_texts = set()
-        deduplicated_hits = []
-        for hit in fused_hits:
-            text = hit.get("text", "").strip()
-            norm_text = " ".join(text.split()).lower()
-            if norm_text not in seen_texts:
-                seen_texts.add(norm_text)
-                deduplicated_hits.append(hit)
-        logger.debug(f"Deduplicated fused hits from {len(fused_hits)} to {len(deduplicated_hits)} unique candidates.")
-
-        # Temporal filtering: exclude expired promotional chunks when include_expired=False
-        today = datetime.now(timezone.utc).date()
-        active_hits = []
-        for hit in deduplicated_hits:
-            meta = hit.get("metadata", {})
-            if is_chunk_valid_temporal(meta, current_date=today, include_expired=include_expired):
-                active_hits.append(hit)
-            else:
-                p_name = meta.get("product_name") or meta.get("source_file", "unknown")
-                vu = meta.get("valid_until") or meta.get("expiry_date")
-                logger.info(f"Filtered out expired promotional chunk: '{p_name}' (valid_until: {vu})")
+        engine = self.get_canonical_engine()
+        return engine.retrieve(
+            query=query,
+            top_k=top_k,
+            doctor_id=doctor_id,
+            doctor_type=doctor_type,
+            clinic_id=clinic_id,
+            filter_metadata=filter_metadata
+        )
 
     @staticmethod
     def _extract_target_ingredient(query: str) -> Optional[str]:
@@ -942,6 +967,34 @@ class HybridRetriever:
         5. Temporal Validity Filtering
         6. Cross-Encoder Reranking with Clinical Indication Boost
         """
+        # 0. Canonical Engine V2 Primary Highway (Phase 3)
+        from app.rag.config import settings as _rag_settings
+        force_legacy = bool(filter_metadata.get("force_legacy")) if filter_metadata else False
+        legacy_fallback = getattr(_rag_settings, "legacy_retrieval_fallback", False)
+        if not force_legacy:
+            try:
+                can_res = self.retrieve_canonical_v2(
+                    query=query,
+                    top_k=top_k,
+                    filter_metadata=filter_metadata
+                )
+                top_can_score = can_res.get("results", [{}])[0].get("score", 0.0) if can_res.get("results") else 0.0
+                if can_res.get("results") and top_can_score >= 0.018:
+                    logger.info(f"[Canonical V2 Engine] Served {len(can_res['results'])} active hits via Dense HNSW + FTS + Entity Channel (top score: {top_can_score:.4f}).")
+                    return can_res
+                if not legacy_fallback:
+                    # The canonical index holds every published document: a weak or empty result means the
+                    # knowledge base does not cover the question, not that another store should be tried.
+                    logger.info(f"[Canonical V2 Engine] {len(can_res.get('results') or [])} hits (top score: {top_can_score:.4f}); no legacy fallback.")
+                    return can_res
+                if can_res.get("results"):
+                    logger.info(f"[Canonical V2 Engine] Low confidence ({top_can_score:.4f}) in kb_chunk. Falling back to PGVector & BM25 store to check all ingested documents...")
+            except Exception as e:
+                if not legacy_fallback:
+                    logger.error(f"Canonical Engine V2 failed: {e}")
+                    return {"query": query, "results": [], "context": "", "error": str(e)}
+                logger.warning(f"Canonical Engine V2 note: {e}. Falling back to legacy pipeline.")
+
         # 1. Clinical Query Expansion
         expanded_query = expand_clinical_query(query)
         if expanded_query != query:
@@ -1050,20 +1103,21 @@ class HybridRetriever:
                 active_hits = matching_active
 
         # Fast-Path / Exact Match Reranker Bypass
-        # Fast-Path / Exact Match Reranker Bypass
         # If active_hits <= 2 or dense/sparse agree on top chunk with high confidence (>= 0.70),
         # we can bypass the heavy PyTorch Cross-Encoder, saving 2-7s CPU latency.
         skip_heavy_reranker = False
         if len(active_hits) <= 2:
             skip_heavy_reranker = True
-            logger.info(f"⚡ [Fast-Path Bypass] Only {len(active_hits)} chunk(s) matched. Skipping CPU cross-encoder.")
+            logger.info(f"[Fast-Path Bypass] Only {len(active_hits)} chunk(s) matched. Skipping CPU cross-encoder.")
         elif dense_hits and sparse_hits:
             top_dense_src = dense_hits[0].get("metadata", {}).get("source_file") or dense_hits[0].get("metadata", {}).get("knowledge_id")
             top_sparse_src = sparse_hits[0].get("metadata", {}).get("source_file") or sparse_hits[0].get("metadata", {}).get("knowledge_id")
             top_dense_score = float(dense_hits[0].get("score", 0.0))
             if top_dense_src and top_dense_src == top_sparse_src and top_dense_score >= 0.70:
                 skip_heavy_reranker = True
-                logger.info(f"⚡ [Fast-Path Bypass] Dense & Sparse top match agreed on '{top_dense_src}' (score: {top_dense_score:.3f}). Skipping CPU cross-encoder.")
+                logger.info(f"[Fast-Path Bypass] Dense & Sparse top match agreed on '{top_dense_src}' (score: {top_dense_score:.3f}). Skipping CPU cross-encoder.")
+
+        target_form_factor: Optional[str] = self._extract_target_form_factor(query)
 
         final_hits = active_hits
         if active_hits:
@@ -1081,21 +1135,19 @@ class HybridRetriever:
             usage_keywords = ["how to use", "directions", "cara pakai", "cara penggunaan", "aturan pakai", "dosis", "instruksi"]
             procedure_keywords = ["tahapan", "tahap", "prosedur", "protokol", "langkah", "step", "alur", "cara tindakan"]
             ingredients_keywords = ["kandungan", "ingredients", "bahan aktif", "komposisi", "active ingredients"]
-            treatment_keywords = ["treatment", "tindakan", "prosedur", "perawatan", "peeling", "ekstraksi", "facial", "terapi", "laser"]
+            treatment_keywords = ["treatment", "tindakan", "prosedur", "perawatan", "peeling", "ekstraksi", "facial", "terapi", "laser", "kombo", "combo", "visit"]
             product_keywords = ["produk", "skincare", "serum", "krim", "cream", "facial wash", "cleanser", "sunscreen", "moisturizer", "sku"]
+            combo_keywords = ["kombo", "combo", "kombinasi", "paket"]
 
             is_usage_intent = any(k in query_lower for k in usage_keywords)
             is_procedure_intent = any(k in query_lower for k in procedure_keywords)
             is_ingredients_intent = any(k in query_lower for k in ingredients_keywords)
             is_treatment_intent = any(k in query_lower for k in treatment_keywords)
             is_product_intent = any(k in query_lower for k in product_keywords)
+            is_combo_intent = any(k in query_lower for k in combo_keywords)
 
             # Target ingredient extraction for precision filtering & anti-contamination
             target_ingredient = self._extract_target_ingredient(query)
-
-            # Target clinical form factor extraction for entity integrity
-            target_form_factor = self._extract_target_form_factor(query)
-
 
             # Clinical indication keywords for automatic medical cross-referencing
             clinical_indications_query = []
@@ -1119,6 +1171,9 @@ class HybridRetriever:
                 meta = updated_hit.get("metadata", {})
                 section_upper = meta.get("section", "").upper()
                 doc_type_upper = str(meta.get("document_type", "")).upper()
+                source_file_lower = str(meta.get("source_file", "")).lower()
+                prod_name_lower = str(meta.get("product_name", "")).lower()
+                hit_text_lower = updated_hit.get("text", "").lower()
                 boost = 0.0
                 
                 if is_usage_intent and any(s in section_upper for s in ["HOW TO USE", "DIRECTIONS", "CARA PAKAI"]):
@@ -1129,7 +1184,6 @@ class HybridRetriever:
                 # Strict ingredient match boost (+0.35)
                 if target_ingredient:
                     target_ing_lower = target_ingredient.lower()
-                    hit_text_lower = updated_hit.get("text", "").lower()
                     meta_lower = str(meta).lower()
                     if target_ing_lower in hit_text_lower or target_ing_lower in meta_lower:
                         boost += 0.35
@@ -1146,6 +1200,17 @@ class HybridRetriever:
                 elif is_product_intent and (doc_type_upper == "PRODUCT" or any(s in section_upper for s in ["PRODUCT", "PRODUK", "KATALOG", "SKINCARE"])):
                     boost += 0.05
 
+                # Combo treatment sheet recognition (handles typo RUMUS KOMBO TRATMENT) (+0.35)
+                is_combo_source = any(k in source_file_lower or k in section_upper.lower() or k in prod_name_lower for k in ["kombo", "combo", "tratment", "treatment"]) or any(k in hit_text_lower for k in ["rumus kombo", "kombo tratment", "kombo treatment", "nama kombo"])
+                if (is_treatment_intent or is_combo_intent) and is_combo_source:
+                    boost += 0.35
+                    logger.debug(f"[Retriever Boost] Combo sheet source detected for '{meta.get('product_name')}'. Boosted +0.35")
+
+                # Penalize standalone OTC products when user specifically requests clinical treatment or combo (-0.25)
+                if (is_treatment_intent or is_combo_intent) and not is_product_intent and doc_type_upper == "PRODUCT" and not is_combo_source:
+                    boost -= 0.25
+                    logger.debug(f"[Retriever Penalty] Standalone product penalized for treatment intent: '{meta.get('product_name')}' (-0.25)")
+
                 # Strict Form Factor (Sediaan) Relevance & Anti-Drift Boost (+0.30)
                 if target_form_factor:
                     ff_aliases = {
@@ -1158,7 +1223,6 @@ class HybridRetriever:
                         "masker": ["masker", "sheet mask", "clay mask"]
                     }.get(target_form_factor, [target_form_factor])
 
-                    hit_text_lower = updated_hit.get("text", "").lower()
                     meta_lower = str(meta).lower()
                     has_form_factor = any(re.search(rf'\b{re.escape(a)}\b', hit_text_lower) or re.search(rf'\b{re.escape(a)}\b', meta_lower) for a in ff_aliases)
                     if has_form_factor:
@@ -1176,9 +1240,57 @@ class HybridRetriever:
                         boost += 0.12
                         logger.debug(f"Applied clinical indication boost +0.12 for {shared_inds} to '{meta.get('product_name')}'")
 
-                if boost > 0:
+                # Indication Affinity Filter (Anti-Context Poisoning across tabular rows)
+                if "acne_vulgaris" in clinical_indications_query:
+                    is_conflicting_indication = False
+                    has_acne_in_text = ("kategori: acne" in hit_text_lower or "kategori: jerawat" in hit_text_lower or "acne vulgaris" in hit_text_lower or "jerawat" in hit_text_lower)
+                    is_other_category = ("kategori: hyperpigmentasi" in hit_text_lower or "kategori: kusam" in hit_text_lower or "kategori: aging" in hit_text_lower or "kategori: melasma" in hit_text_lower)
+                    if is_other_category and not has_acne_in_text:
+                        is_conflicting_indication = True
+
+                    if is_conflicting_indication:
+                        boost -= 0.70
+                        logger.debug(f"[Retriever Penalty] Disqualified chunk with conflicting non-acne indication category: '{meta.get('product_name')}' (-0.70)")
+
+                elif "hyperpigmentation" in clinical_indications_query:
+                    is_conflicting_indication = False
+                    has_hyper_in_text = ("kategori: hyperpigmentasi" in hit_text_lower or "kategori: kusam" in hit_text_lower or "kategori: melasma" in hit_text_lower or "flek" in hit_text_lower)
+                    is_acne_category = ("kategori: acne" in hit_text_lower or "kategori: jerawat" in hit_text_lower)
+                    if is_acne_category and not has_hyper_in_text:
+                        is_conflicting_indication = True
+
+                    if is_conflicting_indication:
+                        boost -= 0.70
+                        logger.debug(f"[Retriever Penalty] Disqualified chunk with conflicting acne indication category for hyperpigmentation query: '{meta.get('product_name')}' (-0.70)")
+
+                # Clinical Domain Affinity & Isolation Guardrail (Hard Filtering)
+                query_domain = None
+                if any(k in query_lower for k in ["ketombe", "scalp", "shampoo", "sampo", "rambut", "rontok", "kebotakan"]):
+                    query_domain = "hair_and_scalp"
+                elif any(k in query_lower for k in ["jerawat", "acne", "komedo", "pustul", "papul"]):
+                    query_domain = "acne"
+                elif any(k in query_lower for k in ["flek", "melasma", "brightening", "kusam", "mencerahkan", "hiperpigmentasi"]):
+                    query_domain = "brightening"
+
+                chunk_domain = (meta.get("clinical_domain") or meta.get("domain") or "").lower()
+                if query_domain and chunk_domain:
+                    if query_domain == "hair_and_scalp":
+                        if "hair" in chunk_domain or "scalp" in chunk_domain:
+                            boost += 0.50
+                            logger.debug(f"[Domain Boost] hair_and_scalp match for '{meta.get('product_name')}' (+0.50)")
+                        else:
+                            boost -= 0.85
+                            logger.debug(f"[Domain Penalty] Disqualified non-hair chunk '{meta.get('product_name')}' for hair/scalp query (-0.85)")
+                    elif query_domain in ("acne", "brightening"):
+                        if "hair" in chunk_domain or "scalp" in chunk_domain:
+                            boost -= 0.85
+                            logger.debug(f"[Domain Penalty] Disqualified hair/scalp chunk '{meta.get('product_name')}' for facial query (-0.85)")
+                        elif query_domain in chunk_domain:
+                            boost += 0.35
+
+                if boost != 0.0:
                     updated_hit["rerank_score"] = updated_hit.get("rerank_score", 0.0) + boost
-                    logger.debug(f"Applied total boost of +{boost:.2f} to section '{section_upper}' / doc_type '{doc_type_upper}' (new score: {updated_hit['rerank_score']:.4f})")
+                    logger.debug(f"Applied total boost of {boost:+.2f} to section '{section_upper}' / doc_type '{doc_type_upper}' (new score: {updated_hit['rerank_score']:.4f})")
                 boosted_hits.append(updated_hit)
 
             # Document Diversity Selection:

@@ -5,6 +5,162 @@ import type {
 } from "./types";
 import { isValidImageUrl, parseBulletLines, resolveImageUrl } from "./utils";
 
+function extractCells(line: string): string[] {
+	let l = line.trim();
+	if (!l.endsWith("|")) l += " |";
+	const ESCAPED_PIPE = "\u241F";
+	l = l.replace(/\\\|/g, ESCAPED_PIPE);
+	while (l.includes("||")) l = l.replace(/\|\|/g, "|  |");
+	return l
+		.split("|")
+		.slice(1, -1)
+		.map((c) => c.replace(new RegExp(ESCAPED_PIPE, "g"), "|").trim());
+}
+
+function isDelimRow(cells: string[]): boolean {
+	return cells.length > 0 && cells.every((c) => !c || /^:?-{3,}:?$/.test(c));
+}
+
+export function extractTableSegments(markdown: string): Segment[] {
+	if (!markdown || !markdown.includes("|")) {
+		return markdown.trim() ? [{ type: "markdown", content: markdown }] : [];
+	}
+
+	const lines = markdown.split("\n");
+	const segments: Segment[] = [];
+	let textBuffer: string[] = [];
+	let currentTable: {
+		title?: string;
+		headers: string[];
+		rows: string[][];
+		rawLines: string[];
+	} | null = null;
+
+	const flushTable = () => {
+		if (!currentTable) return;
+		if (currentTable.rows.length > 0 || currentTable.headers.length > 0) {
+			segments.push({
+				type: "data-table",
+				content: currentTable.rawLines.join("\n"),
+				tableData: {
+					title: currentTable.title,
+					headers: currentTable.headers,
+					rows: currentTable.rows,
+				},
+			});
+		}
+		currentTable = null;
+	};
+
+	const flushTextBuffer = () => {
+		const textContent = textBuffer.join("\n").trim();
+		if (textContent) {
+			segments.push({ type: "markdown", content: textContent });
+		}
+		textBuffer = [];
+	};
+
+	for (let i = 0; i < lines.length; i++) {
+		const rawLine = lines[i];
+		const line = rawLine.trim();
+		const isTableRow = line.startsWith("|") && (line.endsWith("|") || line.includes("---"));
+
+		if (isTableRow) {
+			const cells = extractCells(line);
+			if (isDelimRow(cells)) {
+				if (currentTable) {
+					currentTable.rawLines.push(rawLine);
+				}
+				continue;
+			}
+
+			if (!currentTable) {
+				let title: string | undefined = undefined;
+				let k = textBuffer.length - 1;
+				while (k >= 0 && textBuffer[k].trim() === "") k--;
+				if (k >= 0 && /^#{1,4}\s+/.test(textBuffer[k].trim())) {
+					const headingMatch = textBuffer[k].trim().match(/^#{1,4}\s*(?:Sheet:\s*)?(.*)$/i);
+					title = headingMatch ? headingMatch[1].trim() : textBuffer[k].trim().replace(/^#{1,4}\s+/, "");
+					textBuffer.splice(k, textBuffer.length - k);
+				}
+
+				flushTextBuffer();
+
+				currentTable = {
+					title,
+					headers: cells,
+					rows: [],
+					rawLines: [rawLine],
+				};
+			} else {
+				if (!currentTable) continue;
+				const activeTable = currentTable;
+
+				const isDupHeader =
+					cells.length === activeTable.headers.length &&
+					cells.every((c, idx) => c.toLowerCase() === activeTable.headers[idx]?.toLowerCase());
+
+				if (!isDupHeader) {
+					const rowCells = [...cells];
+					while (rowCells.length < activeTable.headers.length) {
+						rowCells.push("");
+					}
+					activeTable.rows.push(rowCells.slice(0, activeTable.headers.length));
+				}
+				activeTable.rawLines.push(rawLine);
+			}
+		} else {
+			const isSheetHeading = /^#{1,4}\s*(?:Sheet:\s*)?([^\n]+)$/i.test(line);
+			const isEmpty = line === "";
+
+			if (currentTable) {
+				if (isEmpty) {
+					let j = i + 1;
+					while (j < lines.length && lines[j].trim() === "") j++;
+					let peekIsTable = false;
+					if (j < lines.length) {
+						const nextLine = lines[j].trim();
+						if (nextLine.startsWith("|")) {
+							peekIsTable = true;
+						} else if (/^#{1,4}\s*(?:Sheet:\s*)?/i.test(nextLine)) {
+							let nextK = j + 1;
+							while (nextK < lines.length && lines[nextK].trim() === "") nextK++;
+							if (nextK < lines.length && lines[nextK].trim().startsWith("|")) {
+								peekIsTable = true;
+							}
+						}
+					}
+
+					if (peekIsTable) {
+						currentTable.rawLines.push(rawLine);
+						continue;
+					}
+				} else if (isSheetHeading) {
+					const match = line.match(/^#{1,4}\s*(?:Sheet:\s*)?([^\n]+)$/i);
+					const sheetName = match ? match[1].trim() : "";
+					if (!currentTable.title || currentTable.title.toLowerCase() === sheetName.toLowerCase()) {
+						let j = i + 1;
+						while (j < lines.length && lines[j].trim() === "") j++;
+						if (j < lines.length && lines[j].trim().startsWith("|")) {
+							currentTable.rawLines.push(rawLine);
+							continue;
+						}
+					}
+				}
+
+				flushTable();
+			}
+
+			textBuffer.push(rawLine);
+		}
+	}
+
+	flushTable();
+	flushTextBuffer();
+
+	return segments.length > 0 ? segments : (markdown.trim() ? [{ type: "markdown", content: markdown }] : []);
+}
+
 export function parseMarkdownSegments(markdown: string): Segment[] {
 	if (!markdown) return [];
 
@@ -88,15 +244,26 @@ export function parseMarkdownSegments(markdown: string): Segment[] {
 			continue;
 		}
 
-		const hasProductAttributes = items.some((item) => {
+		const hasCardAttributes = items.some((item) => {
 			const k = item.key.toLowerCase();
 			return (
 				k.includes("nama") ||
 				k.includes("brand") ||
 				k.includes("merek") ||
 				k.includes("kategori") ||
+				k.includes("category") ||
+				k.includes("case") ||
+				k.includes("kasus") ||
+				k.includes("grade") ||
+				k.includes("derajat") ||
+				k.includes("definisi") ||
+				k.includes("definition") ||
+				k.includes("patient") ||
+				k.includes("pasien") ||
 				k.includes("ukuran") ||
 				k.includes("harga") ||
+				k.includes("tarif") ||
+				k.includes("biaya") ||
 				k.includes("sku") ||
 				k.includes("deskripsi") ||
 				k.includes("net content") ||
@@ -107,15 +274,25 @@ export function parseMarkdownSegments(markdown: string): Segment[] {
 				k.includes("komposisi") ||
 				k.includes("kontraindikasi") ||
 				k.includes("treatment") ||
+				k.includes("tindakan") ||
+				k.includes("layanan") ||
+				k.includes("durasi") ||
+				k.includes("downtime") ||
+				k.includes("anestesi") ||
+				k.includes("dokter") ||
+				k.includes("cabang") ||
+				k.includes("visit") ||
+				k.includes("sesi") ||
+				k.includes("status") ||
 				k.includes("produk")
 			);
 		});
 
-		if (!isKnownCardHeader && !hasProductAttributes) {
+		if (!isKnownCardHeader && !hasCardAttributes) {
 			continue;
 		}
 
-		const isTreatment = /treatment|tindakan|prosedur|protokol/i.test(headerTitle) || items.some((i) => /treatment|tindakan|durasi|dokter/i.test(i.key));
+		const isTreatment = /treatment|tindakan|prosedur|protokol|terapi|kombo|klinis|medis|kasus|case/i.test(headerTitle) || items.some((i) => /treatment|tindakan|prosedur|protokol|durasi|dokter|pasien|patient|kasus|case|grade|kombo|visit/i.test(i.key));
 		const cleanImgUrl = isValidImageUrl(rawImgUrl) ? resolveImageUrl(rawImgUrl) : undefined;
 		const finalAlt = rawImgAlt || (!isKnownCardHeader ? headerTitle : "");
 
@@ -126,6 +303,7 @@ export function parseMarkdownSegments(markdown: string): Segment[] {
 				type: isTreatment ? "treatment-card" : "product-card",
 				content: m[0],
 				data: {
+					title: !isKnownCardHeader ? headerTitle : undefined,
 					imageUrl: cleanImgUrl,
 					rawImageUrl: rawImgUrl,
 					imageAlt: finalAlt,
@@ -536,7 +714,7 @@ export function parseMarkdownSegments(markdown: string): Segment[] {
 		if (range.start > lastIndex) {
 			const beforeText = markdown.slice(lastIndex, range.start);
 			if (beforeText.trim()) {
-				segments.push({ type: "markdown", content: beforeText });
+				segments.push(...extractTableSegments(beforeText));
 			}
 		}
 
@@ -547,7 +725,7 @@ export function parseMarkdownSegments(markdown: string): Segment[] {
 	if (lastIndex < markdown.length) {
 		const remainingText = markdown.slice(lastIndex);
 		if (remainingText.trim()) {
-			segments.push({ type: "markdown", content: remainingText });
+			segments.push(...extractTableSegments(remainingText));
 		}
 	}
 

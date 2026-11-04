@@ -31,6 +31,7 @@ import {
 	RiImage2Line,
 	RiStopCircleLine,
 	RiEyeLine,
+	RiDownload2Line,
 } from "@remixicon/react";
 import { useRouter } from "next/navigation";
 import { use, useRef, useState } from "react";
@@ -294,6 +295,17 @@ export default function BatchKnowledgePage({ params }: { params: Promise<{ id: s
 					</DropdownMenu>
 				</div>
 				<div className="flex items-center gap-2">
+					{activeDoc && (
+						<Button
+							variant="outline"
+							onClick={() => window.open(`/api/knowledge/${activeDoc.id}/file`, "_blank")}
+							className="gap-2 border-gray-200 bg-white text-zinc-700 hover:bg-zinc-50 rounded-lg px-3.5 h-10 font-medium text-sm transition-colors cursor-pointer shadow-none"
+							title="View / Download original uploaded file"
+						>
+							<RiDownload2Line className="size-4 text-zinc-500" />
+							View Original File
+						</Button>
+					)}
 					{hasDeleteAccess && activeDocStatus === "PROCESSING" && (
 						<Button
 							variant="outline"

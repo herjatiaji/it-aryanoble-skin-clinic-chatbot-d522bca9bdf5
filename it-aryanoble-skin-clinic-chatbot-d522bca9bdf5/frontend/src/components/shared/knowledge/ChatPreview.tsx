@@ -28,10 +28,9 @@ import {
 	RiRobot2Line,
 	RiUser3Line,
 } from "@remixicon/react";
-import { useQueryClient } from "@tanstack/react-query";
 import { useRef, useState, useEffect } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { useQueryClient } from "@tanstack/react-query";
+import { MarkdownContent } from "@/components/shared/markdown-content";
 import { toast } from "sonner";
 
 interface ChatPreviewProps {
@@ -298,7 +297,7 @@ export function ChatPreview({
 												prose-td:px-3 prose-td:py-2.5 prose-td:border-b prose-td:border-blue-100/60 last:prose-td:border-0 whitespace-pre-wrap`}
 											>
 												{msg.role === "assistant" ? (
-													<ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+													<MarkdownContent content={msg.content} />
 												) : (
 													msg.content
 												)}

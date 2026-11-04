@@ -51,12 +51,13 @@ import {
 	invalidateAllKnowledgeQueries,
 	useCancelOperation,
 	useConfirmOperation,
+	useEditKnowledge,
 	useGeneralChatSession,
 	useReplaceKnowledgeFile,
 	useSendGeneralChatMessage,
 } from "@/app/dashboard/knowledge/hooks/use-knowledge";
 import { MarkdownContent } from "@/components/shared/markdown-content";
-import { cleanDeletedItemFromMarkdown, cleanMessageTurn, resolveImageUrl } from "@/components/shared/markdown/utils";
+import { cleanDeletedItemFromMarkdown, cleanMessageTurn, repairMarkdownTables, resolveImageUrl } from "@/components/shared/markdown/utils";
 import { StreamingMarkdown } from "@/components/shared/streaming-markdown";
 import { WysiwygEditor } from "@/components/shared/wysiwyg-editor";
 import { toast } from "sonner";
@@ -177,7 +178,7 @@ function getInitialMessages(
 	if (initialSummary) {
 		turn0.push({
 			role: "assistant",
-			content: initialSummary,
+			content: repairMarkdownTables(initialSummary),
 		});
 	}
 
@@ -200,18 +201,9 @@ function getInitialMessages(
 					attachmentNames: cleaned.attachmentNames,
 				};
 			}
-			let content = m.content;
-			if (idx > 0 && content && />\s*\*\*Ringkasan Perubahan:\*\*/i.test(content)) {
-				const match = content.match(
-					/(?:^|\n)>\s*\*\*Ringkasan Perubahan:\*\*[\s\S]*?(?=\n#{1,3}\s+|\n\*\*[^*]+\*\*|\Z)/i,
-				);
-				if (match) {
-					content = match[0].replace(/^>\s*/gm, "").trim();
-				}
-			}
 			return {
 				role: "assistant",
-				content: content,
+				content: repairMarkdownTables(m.content),
 				attachmentName: m.attachmentName,
 				attachmentNames: m.attachmentNames,
 			};
@@ -225,11 +217,13 @@ function getInitialMessages(
 		if (startsWithTurn0 || history[0]?.role === "user") {
 			const mapped = history.map(mapTurn);
 			if (currentSummary) {
-				for (let i = mapped.length - 1; i >= 0; i--) {
+				for (let i = 0; i < mapped.length; i++) {
 					if (mapped[i].role === "assistant" && !mapped[i].content) {
-						mapped[i].content = currentSummary;
-						break;
+						mapped[i].content = repairMarkdownTables(currentSummary);
 					}
+				}
+				if (!mapped.some((m) => m.role === "assistant")) {
+					mapped.push({ role: "assistant", content: repairMarkdownTables(currentSummary) });
 				}
 			}
 			return mapped;
@@ -237,24 +231,27 @@ function getInitialMessages(
 
 		const mapped = [...turn0, ...history.map(mapTurn)];
 		if (currentSummary) {
-			for (let i = mapped.length - 1; i >= 0; i--) {
+			for (let i = 0; i < mapped.length; i++) {
 				if (mapped[i].role === "assistant" && !mapped[i].content) {
-					mapped[i].content = currentSummary;
-					break;
+					mapped[i].content = repairMarkdownTables(currentSummary);
 				}
+			}
+			if (!mapped.some((m) => m.role === "assistant")) {
+				mapped.push({ role: "assistant", content: repairMarkdownTables(currentSummary) });
 			}
 		}
 		return mapped;
 	}
 
 	if (initialSummary) {
+		const repaired = repairMarkdownTables(initialSummary);
 		if (effectivePrompt) {
 			return [
 				{ role: "user", content: effectivePrompt, attachmentName: docFile },
-				{ role: "assistant", content: initialSummary },
+				{ role: "assistant", content: repaired },
 			];
 		}
-		return [{ role: "assistant", content: initialSummary }];
+		return [{ role: "assistant", content: repaired }];
 	}
 
 	return [];
@@ -290,6 +287,7 @@ export function ChatPreview({
 	const confirmOp = useConfirmOperation();
 	const cancelOp = useCancelOperation();
 	const replaceFileMutation = useReplaceKnowledgeFile();
+	const editKnowledge = useEditKnowledge();
 	const retryFileInputRef = useRef<HTMLInputElement>(null);
 	const [isReplacingFile, setIsReplacingFile] = useState(false);
 	const [activeOpId, setActiveOpId] = useState<string | null>(null);
@@ -309,6 +307,7 @@ export function ChatPreview({
 
 		const formData = new FormData();
 		formData.append("file", selectedFile);
+		formData.append("replace_existing", "true");
 		if (initialPrompt) {
 			formData.append("prompt", initialPrompt);
 		}
@@ -404,6 +403,7 @@ export function ChatPreview({
 
 		updated = updated.replace(/\n{3,}/g, "\n\n").trim();
 		handleSummaryChange(updated);
+		setBackupManualSummary(updated);
 		setManualEditRevision((r) => r + 1);
 	};
 
@@ -478,6 +478,7 @@ export function ChatPreview({
 
 		if (updated !== currentContent) {
 			handleSummaryChange(updated);
+			setBackupManualSummary(updated);
 			setManualEditRevision((r) => r + 1);
 			setEditingImage(null);
 			toast.success("Label gambar berhasil diperbarui");
@@ -488,7 +489,8 @@ export function ChatPreview({
 
 	const handleStartManualEdit = (currentDisplayContent: string) => {
 		const rawText = localSummary || currentDisplayContent;
-		const initialText = rawText.replace(/!\[([^\]]*)\]\s*\n+\s*\(([^)]+)\)/g, "![$1]($2)");
+		const repaired = repairMarkdownTables(rawText);
+		const initialText = repaired.replace(/!\[([^\]]*)\]\s*\n+\s*\(([^)]+)\)/g, "![$1]($2)");
 		setBackupManualSummary(initialText);
 		setLocalSummary(initialText);
 		setEditingImage(null);
@@ -503,12 +505,43 @@ export function ChatPreview({
 		setIsManualEditing(false);
 	};
 
-	const handleSaveManualEdit = (newSummary?: string) => {
+	const handleSaveManualEdit = async (newSummary?: string) => {
 		const finalVal = typeof newSummary === "string" ? newSummary : localSummary;
-		handleSummaryChange(finalVal);
-		setBackupManualSummary(finalVal);
+		const repairedVal = repairMarkdownTables(finalVal);
+		handleSummaryChange(repairedVal);
+		setBackupManualSummary(repairedVal);
 		setEditingImage(null);
 		setIsManualEditing(false);
+
+		if (knowledgeId) {
+			try {
+				const isApproved = (knowledgeStatus || knowledge?.status || "").toUpperCase() === "APPROVED";
+				if (isApproved) {
+					await editKnowledge.mutateAsync({
+						id: knowledgeId,
+						data: {
+							summary: repairedVal,
+							title: title || knowledge?.title,
+							categories: categories,
+							visibility_settings: visibilitySettings,
+						},
+						hideToast: false,
+					});
+				} else {
+					await api.put(`/ai/ingest/pending/${knowledgeId}`, {
+						summary: repairedVal,
+						title: title || knowledge?.title,
+						categories: categories,
+						visibility_settings: visibilitySettings,
+					});
+					toast.success("Perubahan manual berhasil disimpan.");
+				}
+				invalidateAllKnowledgeQueries(queryClient, { knowledgeId });
+			} catch (err) {
+				console.error("Failed to save manual edit:", err);
+				toast.error("Gagal menyimpan perubahan manual ke server.");
+			}
+		}
 	};
 
 	const [prevScopeId, setPrevScopeId] = useState(`${knowledgeId}-${sessionId}`);
@@ -613,7 +646,7 @@ export function ChatPreview({
 				}
 				return {
 					role: m.role as "user" | "assistant",
-					content: m.content || "",
+					content: repairMarkdownTables(m.content || ""),
 					action: m.action || undefined,
 					type: m.type || (att?.type as string) || undefined,
 					operation_id: m.operation_id || (att?.operation_id as string) || undefined,
@@ -1011,6 +1044,11 @@ export function ChatPreview({
 			: "DOC";
 		const { Icon: DocIcon } = getFileIconAndColor(docFileName);
 		const status = (knowledgeStatus || knowledge.status || "PENDING").toUpperCase();
+		const isFailedState =
+			status === "REJECTED" ||
+			status === "FAILED" ||
+			docTitle.includes("[Gagal Diproses]") ||
+			(confidence !== null && confidence !== undefined && numConfidence === 0 && !isProcessing);
 
 		const renderStatusBadge = () => {
 			switch (status) {
@@ -1080,6 +1118,14 @@ export function ChatPreview({
 								style={{ width: `${clampedPercent}%` }}
 							/>
 						</div>
+					</div>
+				)}
+
+				{/* 100% Ingestion Badge for Spreadsheets (Isu #8) */}
+				{["XLSX", "XLS", "CSV"].includes(ext) && !isFailedState && (
+					<div className="flex items-center gap-2 px-3 py-2 bg-emerald-50 border border-emerald-200/80 rounded-lg text-emerald-800 text-xs mt-1">
+						<span className="font-semibold text-emerald-700 shrink-0">✓ 100% Data Terindeks:</span>
+						<span>Seluruh baris dan kolom tabel tersimpan & terindeks penuh untuk pencarian chatbot (ringkasan di bawah adalah ikhtisar modular).</span>
 					</div>
 				)}
 			</div>
@@ -1279,6 +1325,7 @@ export function ChatPreview({
 					const formData = new FormData();
 					formData.append("prompt", userMsg.content);
 					formData.append("history", JSON.stringify([...messages, userMsg]));
+					formData.append("current_summary", localSummary || summaryValue || aiSummary || "");
 					formData.append("file", filesToSend[0]);
 					formData.append("attached_file", filesToSend[0]);
 
@@ -1291,6 +1338,7 @@ export function ChatPreview({
 						{
 							prompt: userMsg.content,
 							history: [...messages, userMsg],
+							current_summary: localSummary || summaryValue || aiSummary || "",
 						},
 						{ signal: controller.signal },
 					);
@@ -1329,12 +1377,6 @@ export function ChatPreview({
 				if (knowledgeId) {
 					invalidateAllKnowledgeQueries(queryClient, { knowledgeId });
 				}
-
-				// Clear local chatTurns after successful refine:
-				// The server persists the full conversation in metadata.edit_history,
-				// and after query invalidation, initialMsgs will rebuild from that
-				// server metadata. Keeping chatTurns would cause duplicate messages.
-				setTimeout(() => setChatTurns([]), 300);
 			} else {
 				const response = await api.post(
 					"/knowledge/chat",
@@ -1586,8 +1628,10 @@ export function ChatPreview({
 		const isPendingDoc = (knowledgeStatus || knowledge?.status || "").toUpperCase() === "PENDING";
 		const isTargetForEdit =
 			isInitialTurn && mode === "knowledge" && (isPendingDoc || isEditMode || isManualEditing);
+		// The document card always shows the knowledge as it is now; the history entry it sits on may hold an
+		// older version (an earlier chat reply or the first summary) from before later edits.
 		const displayContent = isInitialTurn
-			? localSummary || msg.content || aiSummary || knowledge?.ai_summary || ""
+			? localSummary || aiSummary || knowledge?.ai_summary || msg.content || ""
 			: msg.content || "";
 
 		if (isTargetForEdit) {
@@ -1621,7 +1665,7 @@ export function ChatPreview({
 			return (
 				<div className="flex flex-col w-full my-2 gap-2">
 					{(() => {
-						const text = localSummary || displayContent || "";
+						const text = backupManualSummary || localSummary || displayContent || "";
 						const matches = Array.from(text.matchAll(/!\[([^\]]*)\]\s*\n*\s*\(([^)]+)\)/g));
 						const seen = new Set<string>();
 						const docImages: { alt: string; url: string }[] = [];
@@ -1802,7 +1846,7 @@ export function ChatPreview({
 				{index === firstAssistantIndex && headerNode}
 				{index === firstAssistantIndex && renderConfidenceScore()}
 				<StreamingMarkdown
-					content={msg.content || ""}
+					content={displayContent}
 					animate={index === firstAssistantIndex && streamedDocs[knowledgeId || ""] === true}
 					onFinished={() => {
 						if (knowledgeId) {

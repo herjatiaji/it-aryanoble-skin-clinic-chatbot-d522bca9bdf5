@@ -1,14 +1,23 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { createContext, useContext, useState } from "react";
 import { RiCloseLine, RiZoomInLine } from "@remixicon/react";
-import type { Components } from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { extractNodeText, isValidImageUrl, resolveImageUrl } from "./utils";
 import { ImagePreviewDialog } from "../image-preview-dialog";
+import { MarkdownTable, MarkdownTbody } from "./markdown-table";
+
+/**
+ * True when rendering inside a table cell: images collapse to compact thumbnails
+ * so product photos fit the cell instead of expanding to full card size.
+ */
+export const CompactImageContext = createContext(false);
 
 function MarkdownImage({ src, alt, onDelete, ...props }: React.ComponentProps<"img"> & { onDelete?: (src: string, alt: string) => void }) {
 	const [isOpen, setIsOpen] = useState(false);
 	const [isHidden, setIsHidden] = useState(false);
+	const isCompact = useContext(CompactImageContext);
 	const strSrc = typeof src === "string" ? src.trim() : "";
 	if (!isValidImageUrl(strSrc) || isHidden) {
 		return null;
@@ -65,7 +74,7 @@ function MarkdownImage({ src, alt, onDelete, ...props }: React.ComponentProps<"i
 	return (
 		<>
 			<span
-				className="my-2 flex flex-col w-64 sm:w-72 max-w-full rounded-lg border border-zinc-200/80 bg-zinc-50/60 overflow-hidden shrink-0 relative group shadow-none"
+				className={`${isCompact ? "my-1 w-28" : "my-2 w-64 sm:w-72"} flex flex-col max-w-full rounded-lg border border-zinc-200/80 bg-zinc-50/60 overflow-hidden shrink-0 relative group shadow-none`}
 			>
 				{/* Delete button (only shown when onDelete is provided, i.e. edit mode) */}
 				{onDelete && (
@@ -83,7 +92,7 @@ function MarkdownImage({ src, alt, onDelete, ...props }: React.ComponentProps<"i
 					</button>
 				)}
 				<span
-					className="h-40 sm:h-44 w-full p-2 flex items-center justify-center overflow-hidden relative cursor-pointer"
+					className={`${isCompact ? "h-24 p-1" : "h-40 sm:h-44 p-2"} w-full flex items-center justify-center overflow-hidden relative cursor-pointer`}
 					onClick={() => setIsOpen(true)}
 				>
 					{/* eslint-disable-next-line @next/next/no-img-element */}
@@ -112,7 +121,10 @@ function MarkdownImage({ src, alt, onDelete, ...props }: React.ComponentProps<"i
 					</button>
 				</span>
 				{alt && typeof alt === "string" && (
-					<span className="block px-2.5 py-1.5 text-xs text-zinc-700 font-medium bg-white border-t border-zinc-200/70 truncate w-full text-center">
+					<span
+						className={`block ${isCompact ? "px-1.5 py-1 text-[11px]" : "px-2.5 py-1.5 text-xs"} text-zinc-700 font-medium bg-white border-t border-zinc-200/70 truncate w-full text-center`}
+						title={alt}
+					>
 						{alt}
 					</span>
 				)}
@@ -126,6 +138,38 @@ function MarkdownImage({ src, alt, onDelete, ...props }: React.ComponentProps<"i
 			/>
 		</>
 	);
+}
+
+/**
+ * Recursively resolves \u241E sentinels and raw <br> tags into JSX <br /> elements.
+ */
+export function renderWithBreaks(children: React.ReactNode): React.ReactNode {
+	if (typeof children === "string") {
+		if (
+			!children.includes("\u241E") &&
+			!/<br\s*\/?>/i.test(children) &&
+			!/&lt;br\s*\/?&gt;/i.test(children)
+		) {
+			return children;
+		}
+		const parts = children.split(/(?:\u241E|<br\s*\/?>|&lt;br\s*\/?&gt;)/gi);
+		return parts.map((part, idx) => (
+			<React.Fragment key={idx}>
+				{idx > 0 && <br />}
+				{part}
+			</React.Fragment>
+		));
+	}
+	if (Array.isArray(children)) {
+		return children.map((child, idx) => (
+			<React.Fragment key={idx}>{renderWithBreaks(child)}</React.Fragment>
+		));
+	}
+	if (React.isValidElement(children) && (children.props as any)?.children) {
+		const newChildren = renderWithBreaks((children.props as any).children);
+		return React.cloneElement(children, undefined, newChildren);
+	}
+	return children;
 }
 
 export const defaultMarkdownComponents: Components = {
@@ -151,7 +195,7 @@ export const defaultMarkdownComponents: Components = {
 			<div
 				className={`my-1.5 py-1.5 px-3 rounded-r-md ${borderClass} text-xs sm:text-sm leading-normal shadow-none [&>p]:m-0`}
 			>
-				{children}
+				{renderWithBreaks(children)}
 			</div>
 		);
 	},
@@ -168,41 +212,50 @@ export const defaultMarkdownComponents: Components = {
 							<span className="text-xs font-semibold text-zinc-700 bg-zinc-100 px-1.5 py-0.5 rounded border border-zinc-200">
 								Q
 							</span>
-							<span>{question}</span>
+							<span>{renderWithBreaks(question)}</span>
 						</span>
 						<span className="text-zinc-400 text-xs font-mono transition-transform group-open:rotate-180">
 							▾
 						</span>
 					</summary>
 					<div className="pt-2 pl-7 text-xs sm:text-sm text-zinc-700 leading-normal border-t border-zinc-100 mt-2">
-						{answer}
+						{renderWithBreaks(answer)}
 					</div>
 				</details>
 			);
 		}
-		return <p className="my-1 text-sm text-zinc-900 leading-normal font-normal">{children}</p>;
+		return <p className="my-1 text-sm text-zinc-900 leading-normal font-normal">{renderWithBreaks(children)}</p>;
 	},
-	ol: ({ children }) => (
-		<ol className="list-decimal pl-5 my-1 space-y-0.5 text-sm text-zinc-900 leading-normal font-normal marker:text-zinc-600">
+	ol: ({ children, start, node: _node, ...props }: React.ComponentProps<"ol"> & { node?: unknown }) => (
+		<ol
+			start={start}
+			className="list-decimal pl-5 my-1 space-y-0.5 text-sm text-zinc-900 leading-normal font-normal marker:text-zinc-600"
+			{...props}
+		>
 			{children}
 		</ol>
 	),
-	ul: ({ children }) => (
-		<ul className="list-disc pl-5 my-1 space-y-0.5 text-sm text-zinc-900 leading-normal font-normal marker:text-zinc-500">
+	ul: ({ children, node: _node, ...props }: React.ComponentProps<"ul"> & { node?: unknown }) => (
+		<ul
+			className="list-disc pl-5 my-1 space-y-0.5 text-sm text-zinc-900 leading-normal font-normal marker:text-zinc-500"
+			{...props}
+		>
 			{children}
-		</ul>
+		</ul >
 	),
-	li: ({ children }) => (
-		<li className="text-sm leading-normal text-zinc-900 font-normal">{children}</li>
+	li: ({ children, node: _node, ...props }: React.ComponentProps<"li"> & { node?: unknown }) => (
+		<li className="text-sm leading-normal text-zinc-900 font-normal" {...props}>
+			{renderWithBreaks(children)}
+		</li>
 	),
 	h1: ({ children }) => (
 		<h1 className="text-base font-semibold text-zinc-950 first:mt-1 mt-4 mb-2 tracking-tight">
-			{children}
+			{renderWithBreaks(children)}
 		</h1>
 	),
 	h2: ({ children }) => (
 		<h2 className="text-sm sm:text-base font-semibold text-zinc-950 first:mt-1 mt-4 mb-1.5 flex items-center gap-2 tracking-tight">
-			{children}
+			{renderWithBreaks(children)}
 		</h2>
 	),
 	h3: ({ children }) => {
@@ -223,26 +276,24 @@ export const defaultMarkdownComponents: Components = {
 								: "text-zinc-900"
 				}`}
 			>
-				{children}
+				{renderWithBreaks(children)}
 			</h3>
 		);
 	},
-	strong: ({ children }) => <strong className="font-semibold text-zinc-950">{children}</strong>,
+	strong: ({ children }) => <strong className="font-semibold text-zinc-950">{renderWithBreaks(children)}</strong>,
 	hr: () => <div className="my-2 border-t border-zinc-100" />,
-	table: ({ children }) => (
-		<div className="my-2 overflow-x-auto rounded-md border border-zinc-200 bg-white">
-			<table className="w-full text-left text-xs sm:text-sm border-collapse divide-y divide-zinc-200">
-				{children}
-			</table>
-		</div>
-	),
+	table: (props) => <MarkdownTable {...props} />,
 	thead: ({ children }) => (
 		<thead className="bg-zinc-50 text-zinc-900 font-semibold">{children}</thead>
 	),
-	tbody: ({ children }) => <tbody className="divide-y divide-zinc-100 bg-white">{children}</tbody>,
+	tbody: (props) => <MarkdownTbody {...props} />,
 	tr: ({ children }) => <tr className="hover:bg-zinc-50/60 transition-colors">{children}</tr>,
-	th: ({ children }) => <th className="px-3 py-1.5 font-semibold text-zinc-900">{children}</th>,
-	td: ({ children }) => <td className="px-3 py-1.5 text-zinc-800 font-normal">{children}</td>,
+	th: ({ children }) => <th className="px-3 py-1.5 font-semibold text-zinc-900 whitespace-nowrap min-w-[90px]">{renderWithBreaks(children)}</th>,
+	td: ({ children }) => (
+		<td className="px-3 py-1.5 text-zinc-800 font-normal min-w-[110px] break-normal align-top">
+			<CompactImageContext.Provider value={true}>{renderWithBreaks(children)}</CompactImageContext.Provider>
+		</td>
+	),
 	code: ({ children, className }) => {
 		const isInline = !className || !className.includes("language-");
 		if (isInline) {
@@ -274,4 +325,49 @@ export function createEditableMarkdownComponents(
 			<MarkdownImage {...imgProps} onDelete={onDeleteImage} />
 		),
 	};
+}
+
+// Any inline markdown token: image, link, bold/italic, inline code, strikethrough
+const INLINE_MARKDOWN_RE = /!\[|\]\(|\*\*|__|(^|[\s(])[*_][^\s*_]|`|~~/;
+
+/**
+ * Strips inline markdown from a table cell for plain-text search and sorting
+ * (`![alt](url)` -> `alt`, `**x**` -> `x`).
+ */
+export function cellPlainText(cell: string): string {
+	return cell
+		.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/[*_`~]/g, "")
+		.replace(/␞/g, " ");
+}
+
+/**
+ * Renders a single table cell's inline markdown (images, bold, links) with the same
+ * components as body content. Plain-text cells skip the markdown parser so large
+ * tables stay fast.
+ */
+export function MarkdownTableCell({
+	content,
+	onDeleteImage,
+}: {
+	content: string;
+	onDeleteImage?: (src: string, alt: string) => void;
+}) {
+	if (!INLINE_MARKDOWN_RE.test(content)) {
+		return <>{renderWithBreaks(content)}</>;
+	}
+	const base = onDeleteImage ? createEditableMarkdownComponents(onDeleteImage) : defaultMarkdownComponents;
+	const cellComponents: Components = {
+		...base,
+		// A cell is inline context: never emit block <p> margins
+		p: ({ children }) => <span className="block">{renderWithBreaks(children)}</span>,
+	};
+	return (
+		<CompactImageContext.Provider value={true}>
+			<ReactMarkdown remarkPlugins={[remarkGfm]} components={cellComponents}>
+				{content}
+			</ReactMarkdown>
+		</CompactImageContext.Provider>
+	);
 }

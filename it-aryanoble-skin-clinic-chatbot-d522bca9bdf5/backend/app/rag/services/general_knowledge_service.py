@@ -27,143 +27,49 @@ from app.rag.services.rag_retriever import parse_date_safely
 
 
 def resolve_approved_file(knowledge_id: str, output_dir: str = "data/output") -> Optional[str]:
-    """Resolves the physical JSON file path for an approved document, hydrating from MinIO if needed."""
-    if not knowledge_id:
-        return None
+    """The published document's JSON path (one implementation, shared with the ingestion router)."""
+    from app.rag.router import resolve_approved_file as _resolve
+    return _resolve(knowledge_id) if knowledge_id else None
 
-    k_id = str(knowledge_id).strip()
-
-    # 1. Try exact paths
-    direct_paths = [
-        k_id,
-        os.path.join(output_dir, f"{k_id}.json"),
-        os.path.join(output_dir, f"{k_id}_parsed.json"),
-        os.path.join("backend", output_dir, f"{k_id}.json"),
-        os.path.join("backend", output_dir, f"{k_id}_parsed.json"),
-    ]
-    for p in direct_paths:
-        if os.path.exists(p) and os.path.isfile(p):
-            return p
-
-    # 2. Search in directories
-    for folder in [output_dir, "data/pending", os.path.join("backend", output_dir), os.path.join("backend", "data/pending")]:
-        if os.path.exists(folder):
-            for f in os.listdir(folder):
-                if f.endswith(".json") and f != "bm25_index.pkl":
-                    f_path = os.path.join(folder, f)
-                    try:
-                        with open(f_path, "r", encoding="utf-8") as fp:
-                            doc = json.load(fp)
-                        if isinstance(doc, dict):
-                            doc_id = str(doc.get("knowledge_id") or doc.get("id") or "")
-                            doc_title = str(doc.get("title") or "")
-                            file_name = str(doc.get("file_name") or "")
-                            f_no_ext = f.replace(".json", "").replace("_parsed", "")
-                            if k_id.lower() in (doc_id.lower(), doc_title.lower(), file_name.lower(), f_no_ext.lower(), f.lower()):
-                                return f_path
-                    except Exception as err:
-                        logger.debug(f"[DedicatedService] Error scanning file {f}: {err}")
-
-    # 3. MinIO Hydration fallback
-    clean_p = os.path.join(output_dir, f"{k_id}.json")
-    try:
-        from app.services.storage import get_approved_json
-        approved_data = get_approved_json(k_id)
-        if approved_data:
-            os.makedirs(output_dir, exist_ok=True)
-            with open(clean_p, "w", encoding="utf-8") as fp:
-                json.dump(approved_data, fp, indent=4, ensure_ascii=False)
-            return clean_p
-    except Exception as e:
-        logger.debug(f"[DedicatedService] MinIO approved hydration note: {e}")
-
-    # 4. PostgreSQL Database Hydration fallback
-    try:
-        import asyncio
-        import concurrent.futures
-        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-        from sqlalchemy import text
-        from app.core.config import settings
-
-        async def _fetch_from_db():
-            temp_engine = create_async_engine(settings.DATABASE_URL)
-            try:
-                async with AsyncSession(temp_engine) as session:
-                    res = await session.execute(
-                        text("SELECT id, title, file_name, ai_summary, metadata FROM knowledge WHERE (id::text = :k_id OR LOWER(title) = LOWER(:k_id) OR LOWER(file_name) = LOWER(:k_id)) AND status = 'APPROVED' AND deleted_at IS NULL LIMIT 1"),
-                        {"k_id": k_id}
-                    )
-                    return res.fetchone()
-            finally:
-                await temp_engine.dispose()
-
-        def _worker():
-            return asyncio.run(_fetch_from_db())
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                row = pool.submit(_worker).result()
-        else:
-            row = asyncio.run(_fetch_from_db())
-
-        if row:
-            row_id, title, fname, summary, meta_val = row[0], row[1], row[2], row[3], row[4]
-            m_dict = meta_val if isinstance(meta_val, dict) else (json.loads(meta_val) if isinstance(meta_val, str) else {})
-            doc = {
-                "knowledge_id": str(row_id),
-                "batch_id": m_dict.get("batch_id"),
-                "file_name": fname or str(row_id),
-                "title": title or fname or str(row_id),
-                "status": "Approved",
-                "summary": summary or "",
-                "chunks": m_dict.get("chunks", []),
-                "images": m_dict.get("images", []),
-                "image_urls": m_dict.get("image_urls", []),
-                "categories": m_dict.get("categories", []),
-                "visibility_settings": m_dict.get("visibility_settings", {})
-            }
-            os.makedirs(output_dir, exist_ok=True)
-            clean_p = os.path.join(output_dir, f"{row_id}.json")
-            with open(clean_p, "w", encoding="utf-8") as fp:
-                json.dump(doc, fp, indent=4, ensure_ascii=False)
-            return clean_p
-    except Exception as db_e:
-        logger.debug(f"[DedicatedService] DB hydration fallback note: {db_e}")
 
 def resolve_pending_file(knowledge_id: str, pending_dir: str = "data/pending") -> Optional[str]:
-    """Resolves physical JSON file path for a pending/staging document."""
-    if not knowledge_id:
-        return None
-    k_id = str(knowledge_id).strip()
-    candidate_dirs = [pending_dir, os.path.join("backend", pending_dir)]
-    for p_dir in candidate_dirs:
-        if not os.path.exists(p_dir):
+    """The document's draft JSON path, if it has a draft (one implementation, shared with the ingestion router)."""
+    from app.rag.router import resolve_pending_file as _resolve
+    return _resolve(knowledge_id) if knowledge_id else None
+
+
+def update_table_cell(markdown: str, item_name: str, field_names: list, new_value: str):
+    """
+    Sets the cell of the column named like the field (e.g. 'Harga') in the table row naming the item.
+    Returns the updated Markdown, or None when no such table cell exists.
+    """
+    lines = markdown.split("\n")
+    item_l = (item_name or "").strip().lower()
+    names = [re.sub(r"\\", "", f).lower() for f in field_names]
+    header_cols = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            header_cols = None
             continue
-        clean_p = os.path.join(p_dir, f"{k_id}.json")
-        if os.path.exists(clean_p) and os.path.isfile(clean_p):
-            return clean_p
-        parsed_p = os.path.join(p_dir, f"{k_id}_parsed.json")
-        if os.path.exists(parsed_p) and os.path.isfile(parsed_p):
-            return parsed_p
-        for f in os.listdir(p_dir):
-            if f.endswith(".json"):
-                full_p = os.path.join(p_dir, f)
-                name_no_ext = f[:-5]
-                if f.startswith(k_id) or name_no_ext == k_id or name_no_ext.replace("_parsed", "") == k_id:
-                    return full_p
-                try:
-                    with open(full_p, "r", encoding="utf-8") as fp:
-                        data = json.load(fp)
-                    if isinstance(data, dict) and (data.get("knowledge_id") == k_id or data.get("file_name") == k_id):
-                        return full_p
-                except Exception:
-                    pass
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            continue
+        if header_cols is None:
+            header_cols = [re.sub(r"[*_]", "", c).strip().lower() for c in cells]
+            continue
+        if item_l and any(item_l in c.lower() for c in cells):
+            col = next((j for j, h in enumerate(header_cols) if any(n == h or n in h.split() for n in names)), None)
+            if col is None or col >= len(cells):
+                return None
+            cells[col] = new_value
+            lines[i] = "| " + " | ".join(cells) + " |"
+            return "\n".join(lines)
     return None
+
+
+class _AttributeNotLocated(Exception):
+    """The edited attribute has no recognizable place in the document (no field line, no table column)."""
 
 
 class GeneralKnowledgeService:
@@ -682,7 +588,7 @@ status       : {status}
                                     for col in cols:
                                         col_clean = re.sub(r'!\[.*?\]\(.*?\)', '', col).strip()
                                         if len(col_clean) > 3 and not col_clean.startswith("http") and not col_clean.startswith("/api/storage"):
-                                            if any(kw in col_clean.lower() for kw in ["erha", "serum", "gel", "cream", "wash", "lotion", "moisturizer", "toner", "sabun"]):
+                                            if any(kw in col_clean.lower() for kw in ["serum", "gel", "cream", "wash", "lotion", "moisturizer", "toner", "sabun"]):
                                                 target_sub_items.append(col_clean)
                                                 break
 
@@ -1178,6 +1084,24 @@ status       : {status}
             logger.error(f"[DedicatedService] Failed to sync Knowledge DB record '{knowledge_id}': {e}")
 
     @staticmethod
+    async def publish_document(doc_kid: str, doc: Dict[str, Any], pipeline=None, bm25_index=None) -> Optional[str]:
+        """
+        Makes a changed document live the way every edit is: staged, then published by approve_document, which
+        promotes it, syncs the database and ingests it into the index the chatbot reads. A document without
+        chunks is re-chunked from its summary. Returns an error message, or None when the change is live.
+        """
+        os.makedirs("data/pending", exist_ok=True)
+        with open(os.path.join("data/pending", f"{doc_kid}.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=4, ensure_ascii=False)
+        from app.rag.router import approve_document
+        pub = await approve_document(knowledge_id=doc_kid, pipeline=pipeline, bm25=bm25_index)
+        if not isinstance(pub, dict) or doc_kid not in (pub.get("approved_ids") or []):
+            return f"Publishing failed: {pub}"
+        if pub.get("publish_failures"):
+            return f"Saved but not live in the chatbot: {pub['publish_failures']}"
+        return None
+
+    @staticmethod
     async def apply_edit(
         knowledge_id: str,
         field: str,
@@ -1302,7 +1226,13 @@ status       : {status}
                     "kandungan", "komposisi", "ingredients", "key_ingredients", "key ingredients", "ingridients", "bahan"
                 )
 
-                if is_dedicated:
+                table_updated = None
+                if not is_name_rename and clean_item_name:
+                    table_updated = update_table_cell(curr_summary, clean_item_name, field_synonyms, formatted_val)
+                if table_updated is not None:
+                    curr_summary = table_updated
+                    existing_doc["summary"] = curr_summary
+                elif is_dedicated:
                     if is_name_rename:
                         existing_doc["title"] = formatted_val
                         if clean_item_name and clean_item_name.lower() in curr_summary.lower():
@@ -1310,9 +1240,6 @@ status       : {status}
                         existing_doc["summary"] = curr_summary
                     elif clean_field in ("harga", "ukuran", "sku", "kategori", "deskripsi") and bullet_attr_pattern.search(curr_summary):
                         curr_summary = bullet_attr_pattern.sub(rf'\g<1>{formatted_val}', curr_summary, count=1)
-                        existing_doc["summary"] = curr_summary
-                    elif clean_item_name and clean_item_name.lower() in curr_summary.lower():
-                        curr_summary = re.sub(rf'\b{re.escape(clean_item_name)}\b', formatted_val, curr_summary, flags=re.IGNORECASE)
                         existing_doc["summary"] = curr_summary
                     elif bullet_attr_pattern.search(curr_summary):
                         curr_summary = bullet_attr_pattern.sub(rf'\g<1>{formatted_val}', curr_summary, count=1)
@@ -1336,8 +1263,6 @@ status       : {status}
                             target_sec = re.sub(rf'\b{re.escape(clean_item_name)}\b', formatted_val, target_sec, flags=re.IGNORECASE)
                         elif clean_field in ("harga", "ukuran", "sku", "kategori", "deskripsi") and bullet_attr_pattern.search(target_sec):
                             target_sec = bullet_attr_pattern.sub(rf'\g<1>{formatted_val}', target_sec, count=1)
-                        elif clean_item_name and clean_item_name.lower() in target_sec.lower():
-                            target_sec = re.sub(rf'\b{re.escape(clean_item_name)}\b', formatted_val, target_sec, flags=re.IGNORECASE)
                         elif bullet_attr_pattern.search(target_sec):
                             target_sec = bullet_attr_pattern.sub(rf'\g<1>{formatted_val}', target_sec, count=1)
                         elif clean_field not in ("summary", "text", "konten"):
@@ -1348,10 +1273,10 @@ status       : {status}
                     else:
                         table_row_pattern = re.compile(rf'(^\s*\|\s*[^\n|]*{re.escape(clean_item_name)}[^\n|]*\|)([^\n]+)$', re.MULTILINE | re.IGNORECASE)
                         if table_row_pattern.search(curr_summary):
-                            if is_name_rename:
-                                curr_summary = re.sub(rf'\b{re.escape(clean_item_name)}\b', formatted_val, curr_summary, flags=re.IGNORECASE)
-                            else:
-                                curr_summary = table_row_pattern.sub(rf'\g<1> {formatted_val} |', curr_summary, count=1)
+                            if not is_name_rename:
+                                # The row has no column for this attribute: overwriting the row would destroy it
+                                raise _AttributeNotLocated()
+                            curr_summary = re.sub(rf'\b{re.escape(clean_item_name)}\b', formatted_val, curr_summary, flags=re.IGNORECASE)
                             existing_doc["summary"] = curr_summary
                         elif bullet_key_pattern := re.search(rf'(^[|\-\*]\s*\*\*[^\*\n:]*{re.escape(clean_item_name)}[^\*\n:]*\*\*\s*:\s*)[^\n]+', curr_summary, re.MULTILINE | re.IGNORECASE):
                             curr_summary = re.sub(
@@ -1363,6 +1288,8 @@ status       : {status}
                             )
                             existing_doc["summary"] = curr_summary
                         elif clean_item_name and clean_item_name.lower() in curr_summary.lower():
+                            if not is_name_rename:
+                                raise _AttributeNotLocated()
                             curr_summary = re.sub(rf'\b{re.escape(clean_item_name)}\b', formatted_val, curr_summary, flags=re.IGNORECASE)
                             existing_doc["summary"] = curr_summary
 
@@ -1456,157 +1383,27 @@ status       : {status}
                 # AUTO-APPROVE: General Prompt confirm → overwrite approved file, re-ingest immediately
                 existing_doc["status"] = "Approved"
                 existing_doc.pop("is_revision", None)
+                if existing_doc.get("summary"):
+                    from app.rag.services.rag_generator import repair_markdown_tables
+                    existing_doc["summary"] = repair_markdown_tables(existing_doc["summary"])
 
-                # 1. Overwrite data/output/{doc_kid}.json
-                os.makedirs("data/output", exist_ok=True)
-                with open(approved_file, "w", encoding="utf-8") as f:
-                    json.dump(existing_doc, f, indent=4, ensure_ascii=False)
-
-                # 2. Re-chunk from updated summary for vector + BM25 indexing
-                doc_chunks = existing_doc.get("chunks", [])
-                updated_summary = existing_doc.get("summary", "")
-                if updated_summary and updated_summary.strip():
-                    try:
-                        from app.rag.utils.summary_chunker import chunk_summary_markdown
-                        doc_img_url = existing_doc.get("image_url") or (
-                            existing_doc.get("image_urls", [None])[0]
-                            if existing_doc.get("image_urls") else None
-                        )
-                        raw_cats = existing_doc.get("categories") or existing_doc.get("suggested_categories") or []
-                        parsed_cats = []
-                        if isinstance(raw_cats, list):
-                            for c in raw_cats:
-                                if isinstance(c, dict) and "name" in c:
-                                    parsed_cats.append(c["name"])
-                                elif isinstance(c, str):
-                                    parsed_cats.append(c)
-                        vis_settings = existing_doc.get("visibility_settings") or {
-                            "clinics": ["all"], "doctor_types": ["all"], "doctors": ["all"]
-                        }
-                        doc_chunks = chunk_summary_markdown(
-                            summary=updated_summary,
-                            source_file=existing_doc.get("file_name", doc_kid),
-                            knowledge_id=doc_kid,
-                            batch_id=existing_doc.get("batch_id"),
-                            file_hash=existing_doc.get("file_hash", ""),
-                            title=existing_doc.get("title", doc_kid),
-                            doc_type=existing_doc.get("document_type", "GENERAL"),
-                            categories=parsed_cats,
-                            valid_from=str(existing_doc.get("valid_from", "")).strip() or None,
-                            valid_until=str(existing_doc.get("valid_until", "")).strip() or None,
-                            visibility_settings=vis_settings,
-                            default_image_url=doc_img_url,
-                        )
-                        existing_doc["chunks"] = doc_chunks
-                        # Re-save with updated chunks
-                        with open(approved_file, "w", encoding="utf-8") as f:
-                            json.dump(existing_doc, f, indent=4, ensure_ascii=False)
-                        logger.info(f"[DedicatedService] Re-chunked summary into {len(doc_chunks)} chunks for '{doc_kid}'")
-                    except Exception as rechunk_err:
-                        logger.warning(f"[DedicatedService] Re-chunking failed, using existing chunks: {rechunk_err}")
-
-                # 3. Re-ingest into Vector Store (delete old → insert new)
-                v_store = vector_store
-                if not v_store and pipeline:
-                    v_store = pipeline.vector_store
-                if not v_store:
-                    try:
-                        from app.rag.services.vector_store import PGVectorAdapter
-                        v_store = PGVectorAdapter()
-                    except Exception:
-                        pass
-                if v_store:
-                    try:
-                        v_store.delete_document(doc_kid)
-                        file_name = existing_doc.get("file_name", "")
-                        if file_name and file_name != doc_kid:
-                            v_store.delete_document(file_name)
-                    except Exception as del_err:
-                        logger.debug(f"[DedicatedService] Vector pre-delete note: {del_err}")
-                    if doc_chunks:
-                        try:
-                            v_store.insert_chunks(doc_chunks)
-                            logger.info(f"[DedicatedService] Re-indexed {len(doc_chunks)} chunks in vector store for '{doc_kid}'")
-                        except Exception as ins_err:
-                            logger.error(f"[DedicatedService] Vector insert failed: {ins_err}")
-                            # Rollback JSON file & vector store to backup state
-                            with open(approved_file, "w", encoding="utf-8") as f:
-                                json.dump(backup_doc, f, indent=4, ensure_ascii=False)
-                            backup_chunks = backup_doc.get("chunks", [])
-                            try:
-                                v_store.delete_document(doc_kid)
-                                if backup_chunks:
-                                    v_store.insert_chunks(backup_chunks)
-                            except Exception:
-                                pass
-                            return {"success": False, "error": f"Vector indexing failed: {ins_err}"}
-
-                # 4. Re-ingest into BM25 Index
-                bm25_inst = bm25_index
-                if not bm25_inst:
-                    try:
-                        from app.rag.services.rag_retriever import BM25Index
-                        bm25_inst = BM25Index()
-                        if os.path.exists(settings.bm25_index_path):
-                            bm25_inst.load(settings.bm25_index_path)
-                    except Exception:
-                        pass
-                if bm25_inst:
-                    try:
-                        bm25_inst.remove_file_chunks(doc_kid)
-                        file_name = existing_doc.get("file_name", "")
-                        if file_name and file_name != doc_kid:
-                            bm25_inst.remove_file_chunks(file_name)
-                    except Exception as bm25_del_err:
-                        logger.debug(f"[DedicatedService] BM25 pre-delete note: {bm25_del_err}")
-                    if doc_chunks:
-                        try:
-                            bm25_inst.add_chunks(doc_chunks)
-                            os.makedirs(os.path.dirname(settings.bm25_index_path), exist_ok=True)
-                            bm25_inst.save(settings.bm25_index_path)
-                            logger.info(f"[DedicatedService] Re-indexed {len(doc_chunks)} chunks in BM25 for '{doc_kid}'")
-                        except Exception as bm25_ins_err:
-                            logger.error(f"[DedicatedService] BM25 insert failed: {bm25_ins_err}")
-                            # Rollback JSON file, vector store, and BM25 to backup state
-                            with open(approved_file, "w", encoding="utf-8") as f:
-                                json.dump(backup_doc, f, indent=4, ensure_ascii=False)
-                            backup_chunks = backup_doc.get("chunks", [])
-                            if v_store:
-                                try:
-                                    v_store.delete_document(doc_kid)
-                                    if backup_chunks:
-                                        v_store.insert_chunks(backup_chunks)
-                                except Exception:
-                                    pass
-                            if bm25_inst:
-                                try:
-                                    bm25_inst.remove_file_chunks(doc_kid)
-                                    if backup_chunks:
-                                        bm25_inst.add_chunks(backup_chunks)
-                                except Exception:
-                                    pass
-                            return {"success": False, "error": f"BM25 indexing failed: {bm25_ins_err}"}
-
-                # 5. Sync PostgreSQL Knowledge record
+                # Publish through the one path every edit takes: the draft is re-chunked from the edited summary,
+                # promoted, synced to the database and made live in the index the chatbot reads.
+                existing_doc.pop("chunks", None)
+                pub_err = await GeneralKnowledgeService.publish_document(doc_kid, existing_doc, pipeline, bm25_index)
+                if pub_err:
+                    with open(approved_file, "w", encoding="utf-8") as f:
+                        json.dump(backup_doc, f, indent=4, ensure_ascii=False)
+                    return {"success": False, "error": pub_err}
+                try:
+                    with open(approved_file, "r", encoding="utf-8") as f:
+                        existing_doc = json.load(f)
+                except Exception:
+                    pass
                 try:
                     await GeneralKnowledgeService.sync_knowledge_db(doc_kid, existing_doc=existing_doc, db=db)
                 except Exception as db_err:
                     logger.debug(f"[DedicatedService] DB sync note: {db_err}")
-
-                # 6. Upload approved JSON to MinIO approved bucket
-                try:
-                    from app.services.storage import promote_staging_to_approved
-                    promote_staging_to_approved(doc_kid, existing_doc)
-                except Exception as s3_err:
-                    logger.debug(f"[DedicatedService] MinIO approved sync note: {s3_err}")
-
-                # 7. Clean up any stale pending file
-                pending_cleanup = os.path.join("data/pending", f"{doc_kid}.json")
-                if os.path.exists(pending_cleanup):
-                    try:
-                        os.remove(pending_cleanup)
-                    except Exception:
-                        pass
 
                 logger.info(f"[DedicatedService] Auto-approved edit for '{doc_kid}'. Data immediately retrievable by RAG.")
                 GeneralKnowledgeService.log_mutation_summary(
@@ -1666,6 +1463,10 @@ status       : {status}
                 }
 
 
+        except _AttributeNotLocated:
+            return {"success": False, "error": (
+                f"Atribut '{field}' untuk '{target_item or knowledge_id}' tidak ditemukan di dokumen (tidak ada baris "
+                f"atau kolom '{field}'). Dokumen tidak diubah; gunakan Edit Knowledge untuk menambahkannya.")}
         except Exception as e:
             logger.error(f"[DedicatedService] Failed to apply edit for '{knowledge_id}': {e}")
             return {"success": False, "error": str(e)}
@@ -1820,25 +1621,10 @@ status       : {status}
 
                     existing_doc["chunks"] = filtered_chunks
 
-                    with open(approved_file, "w", encoding="utf-8") as f:
-                        json.dump(existing_doc, f, indent=4, ensure_ascii=False)
-
-                    if vector_store:
-                        vector_store.delete_document(doc_kid)
-                        if filtered_chunks:
-                            vector_store.insert_chunks(filtered_chunks)
-
-                    if bm25_index:
-                        bm25_index.remove_file_chunks(doc_kid)
-                        if filtered_chunks:
-                            bm25_index.add_chunks(filtered_chunks)
-                        bm25_index.save(settings.bm25_index_path)
-
-                    try:
-                        from app.services.storage import upload_approved_json
-                        upload_approved_json(doc_kid, existing_doc)
-                    except Exception as s3_err:
-                        logger.debug(f"[ImageDelete] MinIO update note: {s3_err}")
+                    # Live in the chatbot through the same publish path as every other change
+                    pub_err = await GeneralKnowledgeService.publish_document(doc_kid, existing_doc, bm25_index=bm25_index)
+                    if pub_err:
+                        return {"success": False, "error": pub_err}
 
                     await GeneralKnowledgeService.sync_knowledge_db(doc_kid, existing_doc=existing_doc, db=db)
 
@@ -1909,7 +1695,7 @@ status       : {status}
                             filtered_chunks = []
 
                 # Case B: Delete specific product by name
-                elif delete_type == "name" or any(w in target_item_lower for w in ("serum", "cream", "gel", "lotion", "toner", "wash", "cleanser", "facial", "sunscreen", "spot", "moisturizer", "acneact", "truwhite")):
+                elif delete_type == "name" or any(w in target_item_lower for w in ("serum", "cream", "gel", "lotion", "toner", "wash", "cleanser", "facial", "sunscreen", "spot", "moisturizer", "shampoo", "sampo", "mask", "masker")):
                     prod_boundary_pattern = r'(?=(?:^|\n)#{1,3}\s+Detail\s+Produk|(?:^|\n)##\s+(?!Detail\s+Produk)[^\n]+|(?:^|\n)Informasi\s+Produk\s+[^\n]+)'
                     sections = [s for s in re.split(prod_boundary_pattern, summary) if s.strip()]
                     if len(sections) <= 1:
@@ -2107,25 +1893,10 @@ status       : {status}
                         "title": f"Seluruh item ({', '.join(delete_targets)}) dan dokumen '{doc_kid}' berhasil dihapus dari basis pengetahuan."
                     }
 
-                with open(approved_file, "w", encoding="utf-8") as f:
-                    json.dump(existing_doc, f, indent=4, ensure_ascii=False)
-
-                if vector_store:
-                    vector_store.delete_document(doc_kid)
-                    if filtered_chunks:
-                        vector_store.insert_chunks(filtered_chunks)
-
-                if bm25_index:
-                    bm25_index.remove_file_chunks(doc_kid)
-                    if filtered_chunks:
-                        bm25_index.add_chunks(filtered_chunks)
-                    bm25_index.save(settings.bm25_index_path)
-
-                try:
-                    from app.services.storage import upload_approved_json
-                    upload_approved_json(doc_kid, existing_doc)
-                except Exception as s3_err:
-                    logger.debug(f"[DedicatedService] MinIO update note: {s3_err}")
+                # Live in the chatbot through the same publish path as every other change
+                pub_err = await GeneralKnowledgeService.publish_document(doc_kid, existing_doc, bm25_index=bm25_index)
+                if pub_err:
+                    return {"success": False, "error": pub_err}
 
                 # Prune chat messages in DB so deleted products don't linger in conversation history
                 await GeneralKnowledgeService.prune_chat_messages_for_deleted_targets(

@@ -57,6 +57,13 @@ class CanonicalChunk:
     frequency: Optional[str] = None
     indication: Optional[str] = None
 
+    domain: Optional[str] = None
+    clinical_domain: Optional[str] = None
+    is_discontinued: bool = False
+    target_indications: List[str] = field(default_factory=list)
+    routine_steps: List[Dict[str, Any]] = field(default_factory=list)
+    product_entities: List[Dict[str, Any]] = field(default_factory=list)
+
     content: str = ""
     retrieval_text: str = ""
 
@@ -89,6 +96,12 @@ class CanonicalChunk:
             "dose": self.dose,
             "frequency": self.frequency,
             "indication": self.indication,
+            "domain": self.domain or self.clinical_domain,
+            "clinical_domain": self.clinical_domain or self.domain,
+            "is_discontinued": self.is_discontinued,
+            "target_indications": self.target_indications,
+            "routine_steps": self.routine_steps,
+            "product_entities": self.product_entities,
             "valid_from": self.valid_from,
             "valid_until": self.valid_until,
             "is_temporally_valid": self.is_temporally_valid,
@@ -131,6 +144,13 @@ def build_canonical_retrieval_text(chunk: CanonicalChunk) -> str:
     k_type = chunk.knowledge_type.value if isinstance(chunk.knowledge_type, KnowledgeType) else str(chunk.knowledge_type)
     parts.append(f"Type: {k_type.upper()}")
 
+    eff_domain = chunk.domain or chunk.clinical_domain
+    if eff_domain:
+        parts.append(f"Domain: {eff_domain.strip()}")
+
+    if chunk.is_discontinued:
+        parts.append("Status: DISCONTINUED")
+
     if chunk.treatment_name:
         parts.append(f"Treatment: {chunk.treatment_name.strip()}")
 
@@ -154,6 +174,21 @@ def build_canonical_retrieval_text(chunk: CanonicalChunk) -> str:
 
     if chunk.indication:
         parts.append(f"Indication: {chunk.indication.strip()}")
+
+    if chunk.target_indications:
+        parts.append(f"Target Indications: {', '.join(chunk.target_indications)}")
+
+    if chunk.routine_steps:
+        step_strs = []
+        for s in chunk.routine_steps:
+            if isinstance(s, dict):
+                p_name = s.get("product_name") or s.get("category") or ""
+                tod = f" ({s['time_of_day']})" if s.get("time_of_day") else ""
+                step_strs.append(f"Step {s.get('step')}{tod}: {p_name}".strip())
+            elif isinstance(s, str):
+                step_strs.append(s)
+        if step_strs:
+            parts.append(f"Routine Steps: {'; '.join(step_strs)}")
 
     if chunk.section and chunk.section.lower() not in ("general", "root"):
         parts.append(f"Section: {chunk.section.strip()}")
@@ -271,6 +306,26 @@ class ClinicalStage(str, Enum):
     AFTER = "after"
 
 
+class ImageOrigin(str, Enum):
+    EMBEDDED_ASSET = "embedded_asset"  # Extracted directly from PDF XObject stream
+    PAGE_RENDER = "page_render"        # Cropped from rendered page canvas
+
+
+class PDFContext(str, Enum):
+    DIGITAL = "digital"
+    FLATTENED_DESIGN = "flattened_design"
+    SCANNED = "scanned"
+    SPREADSHEET = "spreadsheet"
+    DOCUMENT = "document"
+
+
+class ImageSemanticRole(str, Enum):
+    PRODUCT_REFERENCE = "product_reference"
+    TREATMENT_EVIDENCE = "treatment_evidence"
+    SCIENTIFIC_EVIDENCE = "scientific_evidence"
+    DOCUMENT_DECORATION = "document_decoration"
+
+
 # Canonical Form Factor Taxonomy (Single Source of Truth across Parser, Retrieval, and Generator)
 FORM_FACTOR_TAXONOMY: Dict[str, str] = {
     "serum": "serum",
@@ -379,6 +434,11 @@ class ImageProvenance:
     confidence: float = 0.0
     classification_reason: Optional[str] = None
 
+    image_origin: ImageOrigin = ImageOrigin.EMBEDDED_ASSET
+    extraction_source: str = "embedded_image"
+    pdf_context: PDFContext = PDFContext.DIGITAL
+    semantic_role: ImageSemanticRole = ImageSemanticRole.PRODUCT_REFERENCE
+
     def should_display(self) -> bool:
         """Only INCLUDE is permitted to display. REVIEW and EXCLUDE are strictly suppressed."""
         return self.display_policy == ImageDisplayPolicy.INCLUDE
@@ -399,6 +459,10 @@ class ImageProvenance:
             "image_type": self.image_type.value if isinstance(self.image_type, ImageType) else str(self.image_type),
             "image_relevance": self.image_relevance.value if isinstance(self.image_relevance, ImageRelevance) else str(self.image_relevance),
             "display_policy": self.display_policy.value if isinstance(self.display_policy, ImageDisplayPolicy) else str(self.display_policy),
+            "image_origin": self.image_origin.value if isinstance(self.image_origin, ImageOrigin) else str(self.image_origin),
+            "extraction_source": self.extraction_source,
+            "pdf_context": self.pdf_context.value if isinstance(self.pdf_context, PDFContext) else str(self.pdf_context),
+            "semantic_role": self.semantic_role.value if isinstance(self.semantic_role, ImageSemanticRole) else str(self.semantic_role),
             "clinical_stage": self.clinical_stage.value if isinstance(self.clinical_stage, ClinicalStage) else (str(self.clinical_stage) if self.clinical_stage else None),
             "form_factor": self.form_factor,
             "linked_product": self.linked_product,
@@ -425,6 +489,15 @@ class ImageProvenance:
         raw_pol = d.get("display_policy", ImageDisplayPolicy.EXCLUDE.value)
         disp_pol = ImageDisplayPolicy(raw_pol) if raw_pol in ImageDisplayPolicy._value2member_map_ else ImageDisplayPolicy.EXCLUDE
 
+        raw_origin = d.get("image_origin", ImageOrigin.EMBEDDED_ASSET.value)
+        img_origin = ImageOrigin(raw_origin) if raw_origin in ImageOrigin._value2member_map_ else ImageOrigin.EMBEDDED_ASSET
+
+        raw_context = d.get("pdf_context", PDFContext.DIGITAL.value)
+        pdf_ctx = PDFContext(raw_context) if raw_context in PDFContext._value2member_map_ else PDFContext.DIGITAL
+
+        raw_role = d.get("semantic_role", ImageSemanticRole.PRODUCT_REFERENCE.value)
+        sem_role = ImageSemanticRole(raw_role) if raw_role in ImageSemanticRole._value2member_map_ else ImageSemanticRole.PRODUCT_REFERENCE
+
         raw_stage = d.get("clinical_stage")
         stage = ClinicalStage(raw_stage) if raw_stage in ClinicalStage._value2member_map_ else None
 
@@ -443,6 +516,10 @@ class ImageProvenance:
             image_type=img_type,
             image_relevance=img_rel,
             display_policy=disp_pol,
+            image_origin=img_origin,
+            extraction_source=d.get("extraction_source", "embedded_image"),
+            pdf_context=pdf_ctx,
+            semantic_role=sem_role,
             clinical_stage=stage,
             form_factor=d.get("form_factor"),
             linked_product=d.get("linked_product"),
@@ -759,7 +836,8 @@ def classify_image_provenance(
     if k_type == KnowledgeType.PRODUCT:
         active_text = caption_clean or alt_clean
         ff_active = extract_canonical_form_factor(active_text)
-        is_product_brand = any(b in (caption_lower or alt_lower) for b in ["erha", "erhair", "acneact", "truwhite", "scalperfect", "produk", "product"])
+        product_indicators = ["produk", "product", "item", "kemasan", "botol", "tube", "jar", "pack", "sachet", "box", "netto"]
+        is_product_brand = any(b in (caption_lower or alt_lower) for b in product_indicators)
         if ff_active or is_product_brand:
             return ImageProvenance(
                 image_id=image_id, document_id=doc_id, source_document=src_doc, page_or_sheet=page_or_sheet,
@@ -891,7 +969,8 @@ def classify_image_provenance(
     else:
         active_text = caption_clean or alt_clean
         ff_other = extract_canonical_form_factor(active_text)
-        is_product_brand = any(b in (caption_lower or alt_lower) for b in ["erha", "erhair", "acneact", "truwhite", "scalperfect", "produk", "product"])
+        product_indicators = ["produk", "product", "item", "kemasan", "botol", "tube", "jar", "pack", "sachet", "box", "netto"]
+        is_product_brand = any(b in (caption_lower or alt_lower) for b in product_indicators)
         if ff_other or is_product_brand:
             return ImageProvenance(
                 image_id=image_id, document_id=doc_id, source_document=src_doc, page_or_sheet=page_or_sheet,
@@ -900,6 +979,18 @@ def classify_image_provenance(
                 image_relevance=ImageRelevance.RELEVANT, display_policy=ImageDisplayPolicy.INCLUDE,
                 form_factor=ff_other, linked_product=active_text, confidence=0.80,
                 classification_reason="general_product_detected"
+            )
+        # An image under a product heading ("Detail Produk", "Product Information") of a document that names its
+        # product is that product's picture, whatever text happens to be printed on it (its alt text)
+        named_product = (m.get("product_name") or "").strip()
+        if named_product and re.search(r'\b(?:produk|product|kemasan|packaging)\b', sec_lower):
+            return ImageProvenance(
+                image_id=image_id, document_id=doc_id, source_document=src_doc, page_or_sheet=page_or_sheet,
+                row=row, column=column, image_index=image_index, target_url=target_url, alt_text=alt_clean,
+                caption=caption_clean, knowledge_type=k_type, image_type=ImageType.PRODUCT,
+                image_relevance=ImageRelevance.RELEVANT, display_policy=ImageDisplayPolicy.INCLUDE,
+                form_factor=extract_canonical_form_factor(named_product), linked_product=named_product,
+                section=section, confidence=0.75, classification_reason="section_context_named_product"
             )
         if any(k in (caption_lower or alt_lower) for k in ["before & after", "before after", "sebelum & sesudah"]):
             return ImageProvenance(
@@ -935,5 +1026,255 @@ def classify_image_provenance(
         confidence=0.0,
         classification_reason="insufficient_evidence"
     )
+
+
+# =============================================================================
+# CANONICAL CLINICAL EVIDENCE & KNOWLEDGE GRAPH CONTRACTS (PHASE 1 FROZEN SPEC)
+# =============================================================================
+
+@dataclass
+class CanonicalEvidence:
+    """
+    Canonical Clinical Evidence Unit (Factual Source of Truth - SSOT).
+    Mapped 1:1 to kb_evidence relational schema.
+    """
+    id: Optional[str] = None
+    version_id: Optional[str] = None
+    evidence_type: str = "TEXT" # TABLE, TABLE_ROW, KEY_VALUE, PROCEDURE_STEP, RULE, SECTION, TEXT, VISUAL
+    knowledge_type: Optional[str] = None # PRODUCT, TREATMENT, SOP, CRITERIA, LITERATURE, PROMO, OTHER
+    authority_override: Optional[int] = None # 1..5
+    section_path: List[str] = field(default_factory=list)
+    title: Optional[str] = None
+    body: str = ""
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    provenance: Dict[str, Any] = field(default_factory=dict)
+    evidence_content_hash: str = ""
+    derivation: str = "NATIVE" # NATIVE, OCR, VISION, ADMIN_EDIT
+    processor: str = "canonical_extractor"
+    processor_version: str = "2.1.0"
+    confidence: Optional[float] = 1.0
+    visual_analysis_status: Optional[str] = None # NATIVE_COMPLETE, OCR_COMPLETE, VISION_COMPLETE, PARTIAL, LOW_CONFIDENCE, REVIEW_REQUIRED, VISION_FAILED
+    ordinal: int = 0
+    entity_ids: List[str] = field(default_factory=list)
+    asset_ids: List[str] = field(default_factory=list)
+
+    def compute_content_hash(self) -> str:
+        """Computes deterministic SHA-256 hash of section_path + body + sorted attributes."""
+        import json
+        sec_str = "/".join(self.section_path or [])
+        attr_str = json.dumps(self.attributes or {}, sort_keys=True)
+        raw = f"{sec_str}::{self.body}::{attr_str}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def ensure_hash(self) -> str:
+        if not self.evidence_content_hash:
+            self.evidence_content_hash = self.compute_content_hash()
+        return self.evidence_content_hash
+
+
+@dataclass
+class CanonicalEntity:
+    """
+    Namespaced Clinical Entity Master.
+    Stores stable canonical identities, brands, and intrinsic form factors.
+    Versioned facts belong strictly to CanonicalEvidence.attributes.
+    """
+    id: Optional[str] = None
+    entity_type: str = "PRODUCT" # PRODUCT, TREATMENT, CONDITION, INGREDIENT
+    entity_namespace: str = "ERHA" # ERHA, DERMIES, GENERIC, EXTERNAL
+    canonical_name: str = ""
+    normalized_key: str = ""
+    form_factor: Optional[str] = None
+    aliases: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.normalized_key and self.canonical_name:
+            self.normalized_key = normalize_entity_key(self.canonical_name)
+
+
+def normalize_entity_key(name: str) -> str:
+    """Normalizes clinical entity name to lowercase alphanumeric string without punctuation."""
+    if not name:
+        return ""
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', name.lower())
+    tokens = [t for t in cleaned.split() if t]
+    return " ".join(tokens)
+
+
+def extract_entity_aliases(name: str) -> List[str]:
+    """
+    Universal algorithmic alias generator for clinical and product entities:
+    - Extracts acronyms, parenthetical phrases, trimmed variations, and initialisms.
+    - Zero hardcoded product/brand dictionaries.
+    """
+    if not name:
+        return []
+    aliases = set()
+    clean_name = name.strip()
+    norm = normalize_entity_key(clean_name)
+    if norm:
+        aliases.add(norm)
+    aliases.add(clean_name.lower())
+
+    # 1. Parenthetical phrases: "Double Basic DPCT (Medical Grade Facial)" -> "Medical Grade Facial", "Double Basic DPCT"
+    paren_match = re.search(r'\(([^)]+)\)', clean_name)
+    if paren_match:
+        inside = paren_match.group(1).strip()
+        outside = re.sub(r'\s*\([^)]*\)', '', clean_name).strip()
+        if len(inside) >= 2:
+            aliases.add(inside.lower())
+            aliases.add(inside)
+        if len(outside) >= 3:
+            aliases.add(outside.lower())
+            aliases.add(outside)
+
+    # 2. Uppercase acronyms / terms inside name: "DPCT", "RF", "CO2", "IPL"
+    acronyms = re.findall(r'\b[A-Z0-9]{2,8}\b', clean_name)
+    for acr in acronyms:
+        if acr not in ("II", "III", "IV", "VI", "VII", "VIII", "AND", "THE", "FOR", "WITH"):
+            aliases.add(acr)
+            aliases.add(acr.lower())
+
+    # 3. Universal initialism discovery from multi-word medical titles:
+    # e.g., "Deep Pore Cleansing Therapy" -> "DPCT", "Monopolar Radiofrequency" -> "MR"
+    words = re.sub(r'[^a-zA-Z\s]', ' ', clean_name).split()
+    meaningful = [w for w in words if w.lower() not in ("dan", "atau", "by", "for", "and", "the", "of", "in", "single", "paket", "x")]
+    if len(meaningful) >= 2:
+        initials = "".join(w[0].upper() for w in meaningful)
+        if 2 <= len(initials) <= 6:
+            aliases.add(initials)
+            aliases.add(initials.lower())
+
+    # Also check sub-phrase initialisms, e.g. "Single Essential Deep Pore Cleansing Therapy" -> "DPCT"
+    for i in range(len(meaningful) - 3):
+        sub_words = meaningful[i:i+4]
+        sub_initials = "".join(w[0].upper() for w in sub_words)
+        if 2 <= len(sub_initials) <= 6:
+            aliases.add(sub_initials)
+            aliases.add(sub_initials.lower())
+
+    return [a for a in aliases if len(a) >= 2]
+
+
+@dataclass
+class CanonicalAsset:
+    """
+    Scored media asset with full-page and crop support.
+    Classified and validated pre-publish.
+    """
+    id: Optional[str] = None
+    version_id: Optional[str] = None
+    storage_key: str = ""
+    content_hash: str = ""
+    asset_kind: str = "STANDALONE_IMAGE" # FULL_PAGE, REGION_CROP, STANDALONE_IMAGE
+    parent_asset_id: Optional[str] = None
+    bbox: Optional[List[int]] = None # [x0, y0, x1, y1]
+    asset_class: str = "UNKNOWN" # PRODUCT_PHOTO, CLINICAL_PHOTO, DIAGRAM, CHART, LOGO, DECORATIVE, UNKNOWN
+    classification_score: float = 0.0
+    classification_breakdown: Dict[str, Any] = field(default_factory=dict)
+    label: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    provenance: Dict[str, Any] = field(default_factory=dict)
+    status: str = "VALID" # VALID, MISSING, EXCLUDED
+
+
+def score_multimodal_asset(
+    repetition: int = 1,
+    aspect_ratio: float = 1.0,
+    width: int = 400,
+    height: int = 400,
+    ocr_density: float = 0.0,
+    entity_proximity: float = 0.5,
+    is_product_context: bool = False,
+    file_name: str = "",
+    alt_or_caption: str = ""
+) -> Tuple[str, float, Dict[str, Any]]:
+    """
+    Multimodal Asset Classification Scorer (Frozen Plan Section 3.2).
+    Score = w1(repetition) + w2(aspect_ratio) + w3(dimensions) + w4(ocr_density) + w5(entity_proximity)
+    Outputs: (asset_class, score, breakdown)
+    """
+    w1 = 0.25
+    if repetition >= 4 and not is_product_context:
+        s1 = 0.95 # highly repetitive non-product -> likely logo/decorative
+    elif repetition >= 2 and is_product_context:
+        s1 = 0.70 # reusable product packaging
+    else:
+        s1 = 0.20 # unique image
+
+    w2 = 0.15
+    if aspect_ratio > 3.0 or aspect_ratio < 0.25:
+        s2 = 0.90 # extreme ratio -> banner/divider
+    elif 0.7 <= aspect_ratio <= 1.4:
+        s2 = 0.20 # balanced photo ratio (1:1, 4:3) -> product/treatment
+    else:
+        s2 = 0.50
+
+    w3 = 0.20
+    is_tiny = (width <= 100 and height <= 100)
+    is_large = (width >= 300 and height >= 300)
+    if is_tiny:
+        s3 = 0.95 # tiny icon
+    elif is_large:
+        s3 = 0.15 # large photo/figure
+    else:
+        s3 = 0.50
+
+    w4 = 0.20
+    s4 = min(1.0, max(0.0, ocr_density))
+
+    w5 = 0.20
+    s5 = max(0.0, min(1.0, entity_proximity))
+
+    # Composite Artifact Score (higher means more likely logo/decorative)
+    artifact_score = round(w1 * s1 + w2 * s2 + w3 * s3 + w4 * (1.0 - s4) + w5 * (1.0 - s5), 4)
+
+    breakdown = {
+        "repetition": repetition,
+        "aspect_ratio": aspect_ratio,
+        "dimensions": f"{width}x{height}",
+        "ocr_density": round(ocr_density, 3),
+        "entity_proximity": round(entity_proximity, 3),
+        "artifact_score": artifact_score
+    }
+
+    # Multi-signal routing rules
+    text_check = f"{file_name} {alt_or_caption}".lower()
+    if is_tiny or (artifact_score >= 0.70 and not is_product_context) or (repetition >= 10 and not is_product_context):
+        if "logo" in text_check or (repetition >= 10 and is_tiny):
+            return "LOGO", artifact_score, breakdown
+        return "DECORATIVE", artifact_score, breakdown
+    elif ocr_density >= 0.40 or any(k in text_check for k in ["chart", "grafik", "kurva", "diagram", "uji"]):
+        if any(k in text_check for k in ["chart", "grafik", "kurva"]):
+            return "CHART", round(1.0 - artifact_score, 4), breakdown
+        return "DIAGRAM", round(1.0 - artifact_score, 4), breakdown
+    elif any(k in text_check for k in ["before", "after", "sebelum", "sesudah"]):
+        return "CLINICAL_PHOTO", round(1.0 - artifact_score, 4), breakdown
+    elif is_product_context or s5 >= 0.60 or (repetition <= 2 and is_large) or any(k in text_check for k in ["produk", "bottle", "packaging", "serum", "cream", "toner"]):
+        return "PRODUCT_PHOTO", round(1.0 - artifact_score, 4), breakdown
+    else:
+        return "UNKNOWN", 0.5, breakdown
+
+
+@dataclass
+class ParseReport:
+    source_file: str
+    sheet: Optional[str] = None
+    total_physical_rows: int = 0
+    disposition_summary: Dict[str, int] = field(default_factory=lambda: {"evidence_count": 0, "context_rows": 0, "excluded_rows": 0})
+    exclusions: List[Dict[str, Any]] = field(default_factory=list)
+    visual_summary: Dict[str, int] = field(default_factory=lambda: {"total": 0, "completed": 0, "review_required": 0, "failed": 0})
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_file": self.source_file,
+            "sheet": self.sheet,
+            "total_physical_rows": self.total_physical_rows,
+            "disposition_summary": self.disposition_summary,
+            "exclusions": self.exclusions,
+            "visual_summary": self.visual_summary
+        }
+
 
 

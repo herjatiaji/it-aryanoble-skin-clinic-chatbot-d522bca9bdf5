@@ -5,7 +5,7 @@ from functools import lru_cache
 from loguru import logger
 
 from sqlalchemy import create_engine, Column, String, Text, Integer, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.orm import declarative_base, sessionmaker
 # pyrefly: ignore [missing-import]
 from pgvector.sqlalchemy import Vector
@@ -23,7 +23,7 @@ class DocumentChunk(Base):
     text = Column(Text, nullable=False)
     source_file = Column(String, nullable=False, index=True)
     metadata_ = Column("metadata", JSONB, nullable=False)
-    embedding = Column(Vector(768), nullable=False)
+    embedding = Column(Vector(1536), nullable=False)
 
 
 
@@ -107,15 +107,25 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
 
         logger.info("PGVectorAdapter initialized successfully.")
 
-    def insert_chunks(self, chunks: List[Dict]):
+    def insert_chunks(self, chunks: List[Dict], batch_size: int = 32):
         if not chunks:
             logger.warning("No chunks provided to insert.")
             return
+        from app.rag.config import settings as _rag_settings
+        if not getattr(_rag_settings, "legacy_retrieval_fallback", False):
+            # The chatbot reads the canonical index; embedding into this store would cost tokens for nothing
+            logger.debug(f"Legacy vector store not in use: skipped {len(chunks)} chunks.")
+            return
 
-        logger.info(f"Embedding {len(chunks)} chunks with active embedding model...")
-        
-        texts_to_embed = []
-        for chunk in chunks:
+        import time
+
+        total_chunks = len(chunks)
+        num_batches = (total_chunks + batch_size - 1) // batch_size
+        logger.info(f"Processing {total_chunks} chunks in {num_batches} batches (batch_size={batch_size}) for 2 vCPU / 2.9 GB RAM stability...")
+
+        # Pre-build retrieval text for all chunks
+        prepared_chunks = []
+        for i, chunk in enumerate(chunks):
             metadata = chunk.get("metadata", {})
             retrieval_text = metadata.get("retrieval_text")
             if not retrieval_text:
@@ -142,37 +152,62 @@ class PGVectorAdapter(BaseVectorStoreAdapter):
                     parts.append(f"Section: {section}")
                 parts.append(f"Content: {chunk.get('text', '')}")
                 retrieval_text = " | ".join(parts)
-            texts_to_embed.append(retrieval_text)
-            
-        embeddings = self.embeddings.embed_documents(texts_to_embed)
-        
-        logger.info(f"Inserting points to PGVector table: {self.collection_name}")
-        with self.Session() as session:
-            for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
+            prepared_chunks.append((chunk, retrieval_text))
+
+        inserted_count = 0
+        for b_idx in range(num_batches):
+            b_start = b_idx * batch_size
+            b_end = min(b_start + batch_size, total_chunks)
+            batch = prepared_chunks[b_start:b_end]
+            texts_to_embed = [item[1] for item in batch]
+
+            logger.info(f"Embedding batch {b_idx + 1}/{num_batches} ({len(batch)} chunks)...")
+            batch_embeddings = self.embeddings.embed_documents(texts_to_embed)
+
+            logger.info(f"Inserting batch {b_idx + 1}/{num_batches} into PGVector table: {self.collection_name}")
+            records = []
+            for idx_in_batch, ((chunk, _), vector) in enumerate(zip(batch, batch_embeddings)):
+                global_idx = b_start + idx_in_batch
                 metadata = chunk.get("metadata", {})
                 source_file = metadata.get("source_file", "unknown")
                 chunk_id = metadata.get("chunk_id")
                 if chunk_id:
                     unique_id = str(chunk_id)
                 else:
-                    chunk_index = metadata.get("chunk_index", i)
-                    unique_id = f"{source_file}_{chunk_index}_{i}"
-                
-                existing = session.query(DocumentChunk).filter_by(id=unique_id).first()
-                if existing:
-                    session.delete(existing)
-                    
-                doc = DocumentChunk(
-                    id=unique_id,
-                    text=chunk["text"],
-                    source_file=source_file,
-                    metadata_=metadata,
-                    embedding=vector
-                )
-                session.add(doc)
-            
-            session.commit()
-            logger.info(f"Successfully inserted {len(chunks)} chunks into PGVector.")
+                    chunk_index = metadata.get("chunk_index", global_idx)
+                    unique_id = f"{source_file}_{chunk_index}_{global_idx}"
+
+                records.append({
+                    "id": unique_id,
+                    "text": chunk["text"],
+                    "source_file": source_file,
+                    "metadata": metadata,
+                    "embedding": vector
+                })
+
+            if records:
+                with self.Session() as session:
+                    table = DocumentChunk.__table__
+                    stmt = pg_insert(table).values(records)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=[table.c.id],
+                        set_={
+                            "text": stmt.excluded.text,
+                            "source_file": stmt.excluded.source_file,
+                            "metadata": stmt.excluded["metadata"],
+                            "embedding": stmt.excluded.embedding,
+                        }
+                    )
+                    session.execute(stmt)
+                    session.commit()
+                inserted_count += len(records)
+                logger.info(f"Committed batch {b_idx + 1}/{num_batches} ({inserted_count}/{total_chunks} chunks) via batch upsert to PGVector.")
+
+            # Micro-pause between batches to allow event loop and concurrent chat queries to breathe
+            if b_end < total_chunks:
+                time.sleep(0.05)
+
+        logger.info(f"Successfully inserted all {inserted_count} chunks into PGVector.")
 
     @lru_cache(maxsize=2048)
     def _get_cached_embedding(self, query: str) -> List[float]:

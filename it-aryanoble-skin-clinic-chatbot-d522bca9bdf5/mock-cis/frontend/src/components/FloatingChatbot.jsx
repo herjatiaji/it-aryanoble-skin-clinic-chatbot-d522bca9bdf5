@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import React, { Fragment, cloneElement, isValidElement, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./FloatingChatbot.css";
@@ -38,9 +38,12 @@ function resolveImageUrl(src, apiBaseUrl) {
 	if (!src) return "";
 	let trimmed = src.trim();
 
-	// Normalize hallucinated `https://api/` or `http://api/` prefixes
-	if (/^https?:\/\/api\//i.test(trimmed)) {
-		trimmed = trimmed.replace(/^https?:\/\/api\//i, "/api/");
+	// Normalize hallucinated `https://api.storage/`, `https://api/`, or `/api/storage/` prefixes
+	trimmed = trimmed.replace(/^https?:\/\/api(?:\.storage)?(?:\/storage)?\//i, "/api/storage/");
+	trimmed = trimmed.replace(/^\/api\/api\/storage\//i, "/api/storage/");
+
+	if (trimmed.startsWith("/storage/")) {
+		trimmed = `/api${trimmed}`;
 	}
 
 	if (
@@ -49,7 +52,11 @@ function resolveImageUrl(src, apiBaseUrl) {
 		trimmed.startsWith("data:") ||
 		trimmed.startsWith("blob:")
 	) {
-		return encodeURI(decodeURI(trimmed));
+		// Only keep as absolute if it's NOT an internal or hallucinated domain
+		if (!/^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|minio|backend|api\.storage|api)(?::\d+)?\//i.test(trimmed)) {
+			return encodeURI(decodeURI(trimmed));
+		}
+		trimmed = trimmed.replace(/^(?:https?:\/\/)?(?:[^\/]+)\/(?:api\/storage\/|storage\/)?/i, "/api/storage/");
 	}
 
 	const base = (apiBaseUrl || "http://localhost:8000").replace(/\/api\/?$/, "").replace(/\/+$/, "");
@@ -57,16 +64,233 @@ function resolveImageUrl(src, apiBaseUrl) {
 	return encodeURI(decodeURI(fullUrl));
 }
 
+function renderWithBreaks(children) {
+	if (children === null || children === undefined) return null;
+	if (typeof children === "string") {
+		if (!children.includes("\u241E") && !/<br\s*\/?>/i.test(children) && !/&lt;br\s*\/?&gt;/i.test(children)) {
+			return children;
+		}
+		const parts = children.split(/(?:\u241E|<br\s*\/?>|&lt;br\s*\/?&gt;)/gi);
+		return parts.map((part, idx) => (
+			<Fragment key={idx}>
+				{idx > 0 && <br />}
+				{part}
+			</Fragment>
+		));
+	}
+	if (Array.isArray(children)) {
+		return children.map((child, idx) => (
+			<Fragment key={idx}>{renderWithBreaks(child)}</Fragment>
+		));
+	}
+	if (isValidElement(children) && children.props && children.props.children) {
+		const newChildren = renderWithBreaks(children.props.children);
+		return cloneElement(children, undefined, newChildren);
+	}
+	return children;
+}
+
 function repairMarkdownTables(text) {
-	if (!text || !text.includes("|")) return text;
-	let repaired = text;
-	// 1. Break concatenated rows separated by consecutive pipes: | Val A | | Val B | -> | Val A |\n| Val B |
-	repaired = repaired.replace(/\|\s*\|/g, "|\n|");
-	// 2. Ensure double newline before table start if preceded directly by non-blank text
-	repaired = repaired.replace(/([^\n\s|][^\n|]*)\n(\|(?:\s*[^|\n]+\s*\|)+)/g, "$1\n\n$2");
-	// 3. Ensure double newline after table end if followed directly by non-blank text
-	repaired = repaired.replace(/(\|[^\n]+\|)\n([^|\n\s])/g, "$1\n\n$2");
-	return repaired;
+	if (!text || !text.includes("|")) return text || "";
+
+	// Normalize raw <br> tags and escaped &lt;br&gt; to \u241E sentinel so JSX renderers resolve them as <br />
+	let s = text.replace(/<br\s*\/?>/gi, "\u241E").replace(/&lt;br\s*\/?&gt;/gi, "\u241E");
+
+	// 0. Separate lines with prefixes (bullets/text) before table rows
+	// e.g. `- New Services | No. | Nama Tindakan | Nama Alat | | ---` -> `- New Services\n\n| No. | ...`
+	s = s.replace(
+		/^([ \t]*(?:[-*•●◦]\s+)?[^|\n]+?)[ \t]*(\|[ \t]*[^|\n]+(?:[ \t]*\|[ \t]*[^|\n]+)+[ \t]*\|?.*)$/gm,
+		(match, prefix, tablePart) => {
+			const p = prefix.trim();
+			const t = tablePart.trim();
+			if (t.includes("---") || /\|[ \t]*\d+[ \t]*\|/.test(t) || (t.startsWith("|") && t.split("|").length >= 3)) {
+				return `${p}\n\n${t}`;
+			}
+			return match;
+		},
+	);
+
+	// 1. Separate glued delimiters and rows
+	s = s.replace(/\|[ \t]*\|(?=[ \t]*:?-{3,})/g, "|\n|");
+	s = s.replace(/((?:\s*:?-{3,}:?\s*\|)+)[ \t]*\|(?=[ \t]*[^|\n])/g, "$1\n|");
+	// Separate glued || between data rows (e.g. `| Shampoo | ![img] || Hair Mask | ![img] |`)
+	s = s.replace(/\|{2,}(?=[ \t]*[^|\n:])/g, "|\n|");
+	s = s.replace(/\|[ \t]*\|(?=[ \t]*\d+[ \t]*\|)/g, "|\n|");
+
+	const rawLines = s.split("\n");
+	const processedLines = [];
+
+	for (let i = 0; i < rawLines.length; i++) {
+		let trimmed = rawLines[i].trim();
+
+		// Check if line contains multiple glued numbered rows (e.g. `| 5 |||| 6 |||| 7 |||`)
+		if (trimmed.startsWith("|") && /\|[ \t]*\d+[ \t]*\|.*\|[ \t]*\d+[ \t]*\|/.test(trimmed)) {
+			const parts = trimmed.split(/(?<=\|)[ \t]*(?=\|[ \t]*\d+[ \t]*\|)/);
+			for (const p of parts) {
+				const pClean = p.trim();
+				if (pClean) processedLines.push(pClean);
+			}
+			continue;
+		}
+
+		// Normalize runs of 3+ glued pipes into a single pipe
+		const isDelim = /^\|?(?:\s*:?-{3,}:?\s*\|?)+$/.test(trimmed);
+		if (!isDelim && trimmed.startsWith("|")) {
+			trimmed = trimmed.replace(/\|{3,}/g, "|");
+		}
+
+		processedLines.push(trimmed);
+	}
+
+	// 2. Merge split or partial delimiter rows
+	const mergedLines = [];
+	let idx = 0;
+	while (idx < processedLines.length) {
+		const line = processedLines[idx].trim();
+		const isDelimLine = /^\|?(?:\s*:?-{3,}:?\s*\|?)+$/.test(line);
+		if (isDelimLine) {
+			let j = idx + 1;
+			while (j < processedLines.length && processedLines[j].trim() === "") {
+				j++;
+			}
+			if (j < processedLines.length && /^\|?(?:\s*:?-{3,}:?\s*\|?)+$/.test(processedLines[j].trim())) {
+				const cellsCurr = line.split("|").map((c) => c.trim()).filter(Boolean);
+				const cellsNext = processedLines[j].trim().split("|").map((c) => c.trim()).filter(Boolean);
+				const allDelim = cellsCurr.concat(cellsNext);
+				mergedLines.push("| " + allDelim.join(" | ") + " |");
+				idx = j + 1;
+				continue;
+			}
+		}
+		mergedLines.push(processedLines[idx]);
+		idx += 1;
+	}
+
+	// 3. Block-level Table Parser & Normalizer
+	const finalLines = [];
+	let i = 0;
+
+	const isRow = (lineStr) => {
+		const l = lineStr.trim();
+		return l.startsWith("|") && (l.endsWith("|") || l.includes("---"));
+	};
+
+	const extractCells = (lineStr) => {
+		let l = lineStr.trim();
+		if (!l.endsWith("|")) l = l + " |";
+		while (l.includes("||")) {
+			l = l.replace(/\|\|/g, "|  |");
+		}
+		return l.split("|").slice(1, -1).map((c) => c.trim());
+	};
+
+	const isDelimRow = (cells) => {
+		return cells.length > 0 && cells.every((c) => !c || /^:?-{3,}:?$/.test(c));
+	};
+
+	while (i < mergedLines.length) {
+		const origL = mergedLines[i];
+		const cleanL = origL.trim();
+
+		if (!isRow(cleanL)) {
+			finalLines.push(origL);
+			i++;
+			continue;
+		}
+
+		// Found a table row! Collect all consecutive table rows
+		const tableRawRows = [];
+		while (i < mergedLines.length && isRow(mergedLines[i])) {
+			tableRawRows.push(mergedLines[i].trim());
+			i++;
+		}
+
+		if (tableRawRows.length === 0) continue;
+
+		const parsedRows = tableRawRows.map(extractCells);
+
+		let headerCells = null;
+		let bodyRows = [];
+
+		if (parsedRows.length === 1) {
+			const firstCells = parsedRows[0];
+			if (isDelimRow(firstCells)) continue;
+			const cols = Math.max(firstCells.length, 1);
+			headerCells = Array.from({ length: cols }, (_, cIdx) => `Kolom ${cIdx + 1}`);
+			bodyRows = [firstCells];
+		} else {
+			const firstRow = parsedRows[0];
+			const secondRow = parsedRows[1];
+
+			if (isDelimRow(firstRow)) {
+				const cols = Math.max(firstRow.length, 1);
+				headerCells = Array.from({ length: cols }, (_, cIdx) => `Kolom ${cIdx + 1}`);
+				bodyRows = parsedRows.slice(1);
+			} else if (isDelimRow(secondRow)) {
+				headerCells = firstRow;
+				bodyRows = parsedRows.slice(2);
+			} else {
+				headerCells = firstRow;
+				bodyRows = parsedRows.slice(1);
+			}
+		}
+
+		if (!headerCells || headerCells.length === 0) {
+			for (const r of tableRawRows) finalLines.push(r);
+			continue;
+		}
+
+		// Unpack glued body rows if cell count is a multiple of header count
+		const unpackedBodyRows = [];
+		for (const b of bodyRows) {
+			if (!isDelimRow(b) && b.length > headerCells.length && b.length % headerCells.length === 0) {
+				for (let k = 0; k < b.length; k += headerCells.length) {
+					unpackedBodyRows.push(b.slice(k, k + headerCells.length));
+				}
+			} else {
+				unpackedBodyRows.push(b);
+			}
+		}
+		bodyRows = unpackedBodyRows;
+
+		// Determine target column count
+		let targetColCount = headerCells.length;
+		for (const b of bodyRows) {
+			if (!isDelimRow(b) && b.length > targetColCount) {
+				targetColCount = b.length;
+			}
+		}
+
+		// Pad headers if needed
+		while (headerCells.length < targetColCount) {
+			headerCells.push(`Kolom ${headerCells.length + 1}`);
+		}
+
+		// Ensure blank line before table
+		if (finalLines.length > 0 && finalLines[finalLines.length - 1].trim() !== "") {
+			finalLines.push("");
+		}
+
+		// Output header
+		finalLines.push("| " + headerCells.map((c) => c || "-").join(" | ") + " |");
+		// Output delimiter
+		finalLines.push("| " + Array(targetColCount).fill("---").join(" | ") + " |");
+
+		// Output body rows
+		for (const bRow of bodyRows) {
+			if (isDelimRow(bRow)) continue;
+			const padded = [...bRow];
+			while (padded.length < targetColCount) {
+				padded.push("");
+			}
+			finalLines.push("| " + padded.slice(0, targetColCount).join(" | ") + " |");
+		}
+
+		// Ensure blank line after table
+		finalLines.push("");
+	}
+
+	return finalLines.join("\n");
 }
 
 function stripInternalMetadata(text) {
@@ -93,8 +317,10 @@ function stripInternalMetadata(text) {
 		return match;
 	});
 
-	// Normalize unicode bullet symbols (•, ●, ◦) to standard markdown list syntax
-	cleaned = cleaned.replace(/^[ \t]*[•●◦][ \t]*/gm, "- ");
+	// Auto-wrap bare storage image URLs (/api/storage/images/... or full URL) into markdown image syntax
+	cleaned = cleaned.replace(/(?<!\]\(|="|='|\()((?:https?:\/\/[^\s\)\"\'\`]+)?\/api\/storage\/images\/[^\s\)\"\'\`]+\.(?:png|jpg|jpeg|webp|gif))/gi, (match) => {
+		return `\n\n![Foto Produk](${match.trim()})\n\n`;
+	});
 
 	// Auto-heal GFM markdown tables
 	cleaned = repairMarkdownTables(cleaned);
@@ -225,6 +451,7 @@ export default function FloatingChatbot({
 	const [allowFileAttachments, setAllowFileAttachments] = useState(false);
 	const [selectedFiles, setSelectedFiles] = useState([]);
 	const [isLoading, setIsLoading] = useState(false);
+	const [isVerifying, setIsVerifying] = useState(false);
 	const [previewImage, setPreviewImage] = useState(null);
 
 	// Feedback states
@@ -270,7 +497,6 @@ export default function FloatingChatbot({
 			}
 
 			const data = await res.json();
-			setSessionId(data.id);
 			setSessionStatus(data.status || "ACTIVE");
 			setAllowFileAttachments(Boolean(data.allow_file_attachments));
 
@@ -296,11 +522,14 @@ export default function FloatingChatbot({
 						{
 							id: "init",
 							role: "assistant",
-							content: "Your artificial intelligence assistant is ready.",
+							content: "Halo, Dok! Saya asisten AI Arya Noble. Ada yang bisa saya bantu terkait produk, rekomendasi perawatan, atau panduan klinis hari ini?",
 						},
 					]);
 				}
 			}
+			// Enable sending only once the history is in place; a message typed earlier would be
+			// overwritten by the history list and disappear from the conversation.
+			setSessionId(data.id);
 		} catch (err) {
 			console.error("Failed to create/resume session:", err);
 			setMessages([
@@ -419,11 +648,17 @@ export default function FloatingChatbot({
 
 			const reader = res.body.getReader();
 			const decoder = new TextDecoder("utf-8");
-			let assistantMessageId = "ai-" + Date.now().toString();
+			const assistantMessageId = "ai-" + Date.now().toString();
 
-			// Create a placeholder for the assistant message
-			setMessages((prev) => [...prev, { id: assistantMessageId, role: "assistant", content: "" }]);
-			setIsLoading(false); // Remove loading indicator once stream starts
+			// Streamed tokens are an unverified preview: keep the loading indicator until the
+			// verified 'final' answer arrives, and only fall back to the preview if it never does.
+			let previewText = "";
+			let finalReceived = false;
+			const showAssistantMessage = (content) => {
+				setMessages((prev) => [...prev, { id: assistantMessageId, role: "assistant", content }]);
+				setIsLoading(false);
+				setIsVerifying(false);
+			};
 
 			let buffer = "";
 
@@ -449,25 +684,18 @@ export default function FloatingChatbot({
 							const parsedData = JSON.parse(jsonStr);
 
 							if (parsedData.type === "token") {
-								setMessages((prev) =>
-									prev.map((msg) =>
-										msg.id === assistantMessageId
-											? { ...msg, content: msg.content + parsedData.content }
-											: msg,
-									),
-								);
+								previewText += parsedData.content;
+								setIsVerifying(true);
+							} else if (parsedData.type === "final") {
+								// Verified answer (grounded facts, product images) is the only content shown
+								finalReceived = true;
+								showAssistantMessage(parsedData.content);
 							} else if (parsedData.type === "done") {
 								// The stream has ended
 								break;
 							} else if (parsedData.error) {
 								console.error("AI Assistant Error:", parsedData.error);
-								setMessages((prev) =>
-									prev.map((msg) =>
-										msg.id === assistantMessageId
-											? { ...msg, content: msg.content + "\n\n**Error:** " + parsedData.error }
-											: msg,
-									),
-								);
+								previewText += "\n\n**Error:** " + parsedData.error;
 							}
 							// 'context' type could be handled here if we want to show sources
 						} catch (err) {
@@ -476,7 +704,13 @@ export default function FloatingChatbot({
 					}
 				}
 			}
+
+			// Backend error paths stream a message without a 'final' event
+			if (!finalReceived) {
+				showAssistantMessage(previewText || "Maaf, terjadi kesalahan pada pemrosesan AI.");
+			}
 		} catch (err) {
+			setIsVerifying(false);
 			setIsLoading(false);
 			if (err.name === "AbortError") {
 				console.log("Chat stream aborted by user");
@@ -590,25 +824,42 @@ export default function FloatingChatbot({
 
 				{sessionStatus === "CLOSED" ? (
 					<div className="fc-end-session-screen">
-						<h2 className="fc-end-title">End of Session</h2>
+						<h2 className="fc-end-title">
+							{manualClose ? "Sesi Konsultasi Selesai" : "Batas Waktu Sesi Berakhir"}
+						</h2>
 						<div className="fc-end-icon">
-							<svg
-								xmlns="http://www.w3.org/2000/svg"
-								viewBox="0 0 24 24"
-								fill="none"
-								stroke="currentColor"
-								strokeWidth="2"
-								strokeLinecap="round"
-								strokeLinejoin="round"
-							>
-								<circle cx="12" cy="12" r="10"></circle>
-								<polyline points="12 6 12 12 16 14"></polyline>
-							</svg>
+							{manualClose ? (
+								<svg
+									xmlns="http://www.w3.org/2000/svg"
+									viewBox="0 0 24 24"
+									fill="none"
+									stroke="currentColor"
+									strokeWidth="2"
+									strokeLinecap="round"
+									strokeLinejoin="round"
+								>
+									<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+									<polyline points="22 4 12 14.01 9 11.01"></polyline>
+								</svg>
+							) : (
+								<svg
+									xmlns="http://www.w3.org/2000/svg"
+									viewBox="0 0 24 24"
+									fill="none"
+									stroke="currentColor"
+									strokeWidth="2"
+									strokeLinecap="round"
+									strokeLinejoin="round"
+								>
+									<circle cx="12" cy="12" r="10"></circle>
+									<polyline points="12 6 12 12 16 14"></polyline>
+								</svg>
+							)}
 						</div>
 						<p className="fc-end-desc">
 							{manualClose
-								? "This session has ended, please give a feedback so we can improve, and you will get a summary."
-								: "You have reached the 5-minute limit for this session, please give this session a feedback so we can improve, and you will get a summary."}
+								? "Dokter telah mengakhiri sesi konsultasi ini. Mohon berikan penilaian dan masukan agar kami dapat terus meningkatkan akurasi asisten klinis."
+								: "Sesi telah mencapai batas waktu 5 menit. Mohon berikan penilaian dan masukan Anda untuk peningkatan layanan asisten klinis kami."}
 						</p>
 
 						{feedbackSubmitted ? (
@@ -766,8 +1017,8 @@ export default function FloatingChatbot({
 																thead: ({ children }) => <thead className="fc-thead">{children}</thead>,
 																tbody: ({ children }) => <tbody className="fc-tbody">{children}</tbody>,
 																tr: ({ children }) => <tr className="fc-tr">{children}</tr>,
-																th: ({ children }) => <th className="fc-th">{children}</th>,
-																td: ({ children }) => <td className="fc-td">{children}</td>,
+																th: ({ children }) => <th className="fc-th">{renderWithBreaks(children)}</th>,
+																td: ({ children }) => <td className="fc-td">{renderWithBreaks(children)}</td>,
 															}}
 														>
 															{stripInternalMetadata(msg.content)}
@@ -793,6 +1044,7 @@ export default function FloatingChatbot({
 											<div className="fc-dot"></div>
 											<div className="fc-dot"></div>
 											<div className="fc-dot"></div>
+											{isVerifying && <span className="fc-loading-label">Memverifikasi jawaban…</span>}
 										</div>
 									</div>
 								</div>

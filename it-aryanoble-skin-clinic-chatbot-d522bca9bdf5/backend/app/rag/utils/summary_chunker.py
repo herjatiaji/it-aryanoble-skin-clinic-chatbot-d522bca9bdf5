@@ -6,6 +6,8 @@ Import: from app.rag.utils.summary_chunker import chunk_summary_markdown
 import re
 from loguru import logger
 
+from app.rag.pipeline_versions import CHUNKER_VERSION
+
 
 def _clean_item_name(val: str) -> str:
     if not val:
@@ -140,6 +142,7 @@ def _clean_invalid_image_markdown(text: str, title: str = "") -> str:
         t_match = re.search(r'\|\s*(?:Jenis Treatment|Nama Treatment|Treatment)\s*\|\s*([^\|\n]+)\s*\|', text, re.IGNORECASE)
     
     item_label = ""
+    is_product_label = False
     if t_match:
         c_name = _clean_item_name(t_match.group(1))
         if c_name and not _is_generic_name(c_name):
@@ -155,8 +158,10 @@ def _clean_invalid_image_markdown(text: str, title: str = "") -> str:
             c_name = _clean_item_name(p_match.group(1))
             if c_name and not _is_generic_name(c_name):
                 item_label = c_name
+                is_product_label = True
 
-    if item_label and not any(k in item_label.lower() for k in ["treatment", "perawatan", "laser", "peeling", "facial", "therapy", "injeksi", "gel", "wash", "cream", "serum", "moisturizer"]):
+    # A product name stays a product name; only a treatment name gets the "Treatment" suffix
+    if item_label and not is_product_label and not any(k in item_label.lower() for k in ["treatment", "perawatan", "laser", "peeling", "facial", "therapy", "injeksi", "gel", "wash", "cream", "serum", "moisturizer"]):
         item_label = f"{item_label} Treatment"
 
     def _replace_img(match):
@@ -183,12 +188,28 @@ def _clean_invalid_image_markdown(text: str, title: str = "") -> str:
                         tbl_context = line
                         break
 
+            # The heading the image sits under is its section; the document title only when there is none
+            heading_re = re.compile(r'(?m)^#{1,6}\s+(.+?)\s*#*\s*$')
+            prev_heads = list(heading_re.finditer(text, 0, match.start()))
+            img_section = prev_heads[-1].group(1).strip(" *") if prev_heads else title
+            # The product this image shows: an explicit "Nama Produk: X" line in the image's own section
+            sec_start = prev_heads[-1].end() if prev_heads else 0
+            next_head = heading_re.search(text, match.end())
+            sec_body = text[sec_start: next_head.start() if next_head else len(text)]
+            n_match = re.search(r'\bNama\s+Produk\**\s*[:=]\s*\**\s*([^\n\r\|*]+)', sec_body, re.IGNORECASE)
+            product_label = ""
+            if n_match:
+                n_name = _clean_item_name(n_match.group(1))
+                if n_name and not _is_generic_name(n_name):
+                    product_label = n_name
+
             prov = classify_image_provenance(
                 target_url=url,
                 alt_text=alt_text,
                 table_context=tbl_context,
                 chunk_text=text,
-                section=title
+                section=img_section,
+                meta={"product_name": product_label} if product_label else None
             )
 
             # Suppress document artifacts or images that should not be displayed
@@ -234,6 +255,11 @@ def _clean_invalid_image_markdown(text: str, title: str = "") -> str:
 
 
 
+# Catalog item markers produced by the summary format ('### Detail Produk' + '- **Nama Produk**: X')
+ITEM_BLOCK_HEADING_RE = re.compile(r'^#{3,4}\s+(?:Detail\s+(?:Produk|Tindakan|Treatment)|Product\s+Details?|Treatment\s+Details?)\s*$', re.IGNORECASE)
+ITEM_NAME_FIELD_RE = re.compile(r'\*\*(?:Nama\s+Produk|Nama\s+Tindakan|Nama\s+Treatment|Product\s+Name|Treatment\s+Name)\*\*\s*:\s*([^\n]+)', re.IGNORECASE)
+
+
 def _split_large_markdown_table(table_text: str, section_title: str = "", max_chars: int = 1500) -> list:
     """
     Splits a large Markdown table (> max_chars) safely by rows.
@@ -244,13 +270,20 @@ def _split_large_markdown_table(table_text: str, section_title: str = "", max_ch
     table_lines = [l for l in lines if l.startswith("|")]
 
     # If it's not a standard markdown table or too small, return as single chunk
-    if len(table_lines) < 3:
+    if len(table_lines) < 2:
         return [table_text]
 
-    # Extract header line and delimiter line
     header_line = table_lines[0]
-    delimiter_line = table_lines[1]
-    data_rows = table_lines[2:]
+    if not header_line.endswith("|"):
+        header_line = header_line + " |"
+
+    if len(table_lines) > 1 and re.match(r'^\|(?:\s*:?-{3,}:?\s*\|)+$', table_lines[1]):
+        delimiter_line = table_lines[1]
+        data_rows = table_lines[2:]
+    else:
+        col_count = max(len(header_line.split('|')) - 2, 2)
+        delimiter_line = "| " + " | ".join(["---"] * col_count) + " |"
+        data_rows = table_lines[1:]
 
     # Header block string to prepend
     table_header_prefix = f"{header_line}\n{delimiter_line}"
@@ -284,6 +317,78 @@ def _split_large_markdown_table(table_text: str, section_title: str = "", max_ch
     return sub_chunks
 
 
+def common_words(names: list, min_share: float = 0.5, min_names: int = 3) -> set:
+    """Words that occur in at least `min_share` of the given names (e.g. a shared brand): not distinctive."""
+    if len(names) < min_names:
+        return set()
+    counts = {}
+    for name in names:
+        for w in set(re.findall(r"[a-z0-9]+", (name or "").lower())):
+            counts[w] = counts.get(w, 0) + 1
+    return {w for w, n in counts.items() if n / len(names) >= min_share}
+
+
+# Words naming a product's form: in an item name they mark a product, whatever treatment word is also there
+PRODUCT_FORM_WORDS = ["cleanser", "wash", "serum", "toner", "cream", "creme", "krim", "gel", "lotion", "sunscreen",
+                      "moisturizer", "mask", "masker", "essence", "ampoule", "shampoo", "sabun", "soap", "spray", "mist",
+                      "balm", "oil", "pad", "booster", "foam", "scrub"]
+
+
+# Rows per table chunk: small enough that one row's facts (a size, a price, a duration) are found by search
+TABLE_ROWS_PER_CHUNK = 10
+# A first page with fewer words than this under its opening H1 is a cover: that H1 titles the document
+COVER_PAGE_MAX_WORDS = 60
+
+
+def parse_markdown_blocks(markdown: str) -> list:
+    """
+    Markdown as a list of blocks: {"kind": "heading" | "text" | "table", "level", "text", "page"}.
+    A thematic break ('---') starts a new page; blank lines separate text blocks.
+    """
+    blocks = []
+    page = 0
+    para = []
+
+    def _flush_para():
+        if para:
+            txt = "\n".join(para).strip()
+            if txt:
+                blocks.append({"kind": "text", "level": 0, "text": txt, "page": page})
+            para.clear()
+
+    lines = (markdown or "").split("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+        if re.fullmatch(r"(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,}", stripped):
+            _flush_para()
+            page += 1
+            i += 1
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", stripped)
+        if heading:
+            _flush_para()
+            blocks.append({"kind": "heading", "level": len(heading.group(1)), "text": heading.group(2).strip(), "page": page})
+            i += 1
+            continue
+        if stripped.startswith("|"):
+            _flush_para()
+            table = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table.append(lines[i].strip())
+                i += 1
+            blocks.append({"kind": "table", "level": 0, "text": "\n".join(table), "page": page})
+            continue
+        if not stripped:
+            _flush_para()
+        else:
+            para.append(raw.rstrip())
+        i += 1
+    _flush_para()
+    return blocks
+
+
 def chunk_summary_markdown(
     summary: str,
     source_file: str = "",
@@ -315,6 +420,12 @@ def chunk_summary_markdown(
     # Apply Document Normalization / Structure Reconstruction to fix line-break fragmentation
     from app.rag.utils.normalizer import normalize_document_text
     summary = normalize_document_text(summary)
+    if not summary or not summary.strip():
+        return []
+
+    # Ensure markdown tables are fully sanitized before chunking
+    from app.rag.services.rag_generator import repair_markdown_tables
+    summary = repair_markdown_tables(summary)
     if not summary or not summary.strip():
         return []
 
@@ -354,6 +465,9 @@ def chunk_summary_markdown(
 
     if not default_image_url:
         default_image_url = treatment_img or (all_doc_imgs[0] if all_doc_imgs else None)
+
+    # Words on most of this document's image labels (its brand, its product line) do not tell items apart
+    common_label_words = common_words([alt for alt, _ in all_doc_imgs_with_alt])
 
     # Discover document-level related products / treatments for knowledge interconnection
     doc_related_products = []
@@ -401,8 +515,6 @@ def chunk_summary_markdown(
         "clinics": ["all"], "doctor_types": ["all"], "doctors": ["all"]
     }
 
-    # Split summary into sections by ## headings
-    raw_sections = re.split(r'(?=\n##\s+)', summary)
     ref_sec_pattern = re.compile(
         r'^##\s*(?:REFERENCES?|DAFTAR\s+(?:PUSTAKA|REFERENSI|RUJUKAN)|BIBLIOGRAPHY|LITERATURE\s+CITED|CITED\s+LITERATURE|PUSTAKA\s+ACUAN)\b',
         re.IGNORECASE
@@ -411,24 +523,56 @@ def chunk_summary_markdown(
         r'^##\s*(?:\d+[\.\)]\s*)?(?:.*persetujuan.*tanda\s*tangan|.*lembar\s+(?:persetujuan|pengesahan)|.*halaman\s+pengesahan|.*tanda\s+tangan|.*approval\s+sheet)',
         re.IGNORECASE
     )
-    sections = [
-        s.strip() for s in raw_sections 
-        if s.strip() and len(s.strip()) >= 30 
-        and not ref_sec_pattern.match(s.strip())
-        and not sig_sec_pattern.match(s.strip())
-    ]
-    if not sections:
-        sections = [summary.strip()]
 
-    logger.debug(f"Structure-aware chunking: split summary into {len(sections)} sections by ## headings.")
+    # The summary as blocks (headings, text, tables, page breaks): chunks are built from content blocks,
+    # each carrying the headings above it, so a heading never becomes a chunk of its own.
+    blocks = parse_markdown_blocks(summary)
+    sections = [b for b in blocks if b["kind"] == "heading"] or [summary]
+    logger.debug(f"Structure-aware chunking: {len(blocks)} blocks, {len(sections)} headings.")
+
+    # The summary's opening H1 names the document's subject ('VOLNEWMER Training Book'). When it differs
+    # from the stored title, later pages would otherwise never mention the subject, so every chunk
+    # carries it as the root of its section path.
+    # The opening H1 names the whole document when it is the only H1 (repeats of the same text count once),
+    # or when it is a cover title: the document's first block, on a first page with little else on it. When
+    # every page opens with its own H1 (a catalog), the first one is just the first page's subject.
+    h1_texts = {b["text"].strip().lower() for b in blocks if b["kind"] == "heading" and b["level"] == 1}
+    first_block = blocks[0] if blocks else None
+    first_page_words = sum(
+        len(re.findall(r"\w+", b["text"])) for b in blocks
+        if first_block and b["page"] == first_block["page"] and b["kind"] != "heading"
+    )
+    opens_with_h1 = bool(first_block) and first_block["kind"] == "heading" and first_block["level"] == 1
+    is_cover = opens_with_h1 and first_page_words < COVER_PAGE_MAX_WORDS
+    doc_heading = first_block["text"] if opens_with_h1 and (len(h1_texts) == 1 or is_cover) else None
+    if doc_heading and doc_heading.lower() in (title or "").lower():
+        doc_heading = None
+
+    def _entity_kind(name: str) -> str:
+        """Treatment or product: the document's type decides; in a mixed document, a product-form word in the
+        name ('Facial Cleanser', 'Peeling Gel') makes it a product before any treatment word does."""
+        if doc_type == "TREATMENT":
+            return "treatment"
+        if doc_type == "PRODUCT":
+            return "product"
+        name_l = (name or "").lower()
+        if re.search(r"\b(?:" + "|".join(PRODUCT_FORM_WORDS) + r")\b", name_l):
+            return "product"
+        if any(k in name_l for k in ["treatment", "perawatan", "laser", "peel", "facial", "therapy", "injeksi"]):
+            return "treatment"
+        return "product"
 
     # Lightweight meta builder with clean, non-redundant schema
-    def _build_meta(chunk_text, entity_name, chunk_index):
+    def _build_meta(chunk_text, entity_name, chunk_index, section_label=None):
         heading_path = f"{title} > {entity_name}" if title and entity_name and title.lower() != entity_name.lower() else (entity_name or title)
+        section = section_label or entity_name
+        if doc_heading and doc_heading.lower() not in (section or "").lower():
+            section = f"{doc_heading} / {section}" if section else doc_heading
+            heading_path = " > ".join(dict.fromkeys(p for p in (title, doc_heading, entity_name) if p))
         meta = {
             "source_file": source_file,
             "file_name": source_file or knowledge_id,
-            "section": entity_name,
+            "section": section,
             "heading_path": heading_path,
             "page": 1,
             "chunk_index": chunk_index,
@@ -442,6 +586,7 @@ def chunk_summary_markdown(
             "clinics": visibility_settings.get("clinics", ["all"]),
             "doctor_types": visibility_settings.get("doctor_types", ["all"]),
             "doctors": visibility_settings.get("doctors", ["all"]),
+            "chunker_version": CHUNKER_VERSION,
         }
 
         chunk_txt_lower = (chunk_text or "").lower()
@@ -477,7 +622,7 @@ def chunk_summary_markdown(
         if not detected_treatment and not detected_product:
             clean_ent = _clean_item_name(entity_name)
             if clean_ent and not _is_generic_name(clean_ent):
-                if doc_type == "TREATMENT" or any(k in clean_ent.lower() for k in ["treatment", "perawatan", "laser", "peel", "facial", "therapy", "injeksi"]):
+                if _entity_kind(clean_ent) == "treatment":
                     detected_treatment = clean_ent
                 else:
                     detected_product = clean_ent
@@ -486,7 +631,7 @@ def chunk_summary_markdown(
         if not detected_treatment and not detected_product and current_main_entity:
             clean_main = _clean_item_name(current_main_entity)
             if clean_main and not _is_generic_name(clean_main):
-                if doc_type == "TREATMENT" or any(k in clean_main.lower() for k in ["treatment", "perawatan", "laser", "peel", "facial", "therapy", "injeksi"]):
+                if _entity_kind(clean_main) == "treatment":
                     detected_treatment = clean_main
                 else:
                     detected_product = clean_main
@@ -543,7 +688,8 @@ def chunk_summary_markdown(
                 target_entity = detected_product or detected_treatment
                 if target_entity and all_doc_imgs_with_alt:
                     clean_target = re.sub(r'[^a-zA-Z0-9\s]', '', target_entity.lower()).strip()
-                    target_words = [w for w in clean_target.split() if len(w) > 2 and w not in ["erha", "acneact", "truwhite", "the", "and", "with"]]
+                    target_words = [w for w in clean_target.split() if len(w) > 2 and w not in common_label_words
+                                    and w not in ["the", "and", "with", "for", "produk", "product", "series", "range"]]
                     for alt, u in all_doc_imgs_with_alt:
                         alt_l = alt.lower()
                         u_l = u.lower()
@@ -637,99 +783,135 @@ def chunk_summary_markdown(
         "tabel treatment", "spesifikasi & parameter", "informasi treatment", "detail treatment", "gambar & foto"
     }
 
-    chunks = []
-    chunk_idx = 0
-    current_main_entity = title
-
-    for section_text in sections:
-        h2_match = re.match(r'^##\s+(?:\d+[\.\)]\s*)?(.+)', section_text)
-        header_title = h2_match.group(1).strip() if h2_match else title
-
-        clean_header = header_title.lower().strip(":-_#\t ")
-        is_sub = (
-            clean_header in GENERIC_SUBHEADERS or 
-            len(clean_header) <= 3 or 
+    def _is_subheader(heading: str) -> bool:
+        clean_header = heading.lower().strip(":-_#\t ")
+        return (
+            clean_header in GENERIC_SUBHEADERS or
+            len(clean_header) <= 3 or
             any(k in clean_header for k in [
-                "spesifikasi alat", "kondisi sebelum", "sebelum & sesudah", 
-                "before & after", "sebelum dan sesudah", "gambar treatment", 
+                "spesifikasi alat", "kondisi sebelum", "sebelum & sesudah",
+                "before & after", "sebelum dan sesudah", "gambar treatment",
                 "foto treatment", "parameter alat", "parameter treatment",
                 "alat / mesin", "alat & mesin"
             ])
         )
-        if is_sub:
-            entity_name = current_main_entity or title
+
+    chunks = []
+    chunk_idx = 0
+    current_main_entity = title
+    seen_texts = set()
+    stack = []          # headings above the current block: [(level, text)]
+    body = []           # content blocks of the chunk being built
+    body_len = 0
+    current_item = None
+    skipping = None     # level of a references/signature heading whose section is left out
+    last_page = None
+
+    def _names():
+        return [t for _, t in stack if t.strip().lower() != (title or "").strip().lower()]
+
+    def _entity_and_label():
+        nonlocal current_main_entity
+        names = _names()
+        if not names:
+            return current_main_entity or title, None
+        top = names[0]
+        if _is_subheader(top):
+            entity = current_main_entity or title
         else:
-            entity_name = header_title
-            current_main_entity = header_title
+            entity = top
+            current_main_entity = top
+        label = " / ".join(names) if len(names) > 1 else None
+        return entity, label
 
-        if len(section_text) <= max_section_chars:
-            chunk_idx += 1
-            chunks.append({
-                "text": section_text,
-                "metadata": _build_meta(section_text, entity_name, chunk_idx)
-            })
-        else:
-            # Split long sections safely (handling large tables & paragraphs)
-            paragraphs = [p.strip() for p in section_text.split("\n\n") if p.strip()]
-            running_parts = []
-            running_len = 0
+    def _emit(parts):
+        nonlocal chunk_idx
+        content = "\n\n".join(p for p in parts if p).strip()
+        if len(re.sub(r"[#*|\-\s]", "", content)) < 3:
+            return
+        head = "\n".join(f"{'#' * lvl} {txt}" for lvl, txt in stack)
+        text = f"{head}\n\n{content}" if head else content
+        key = re.sub(r"\s+", " ", text.lower())
+        if key in seen_texts:
+            return
+        seen_texts.add(key)
+        entity, label = _entity_and_label()
+        if current_item:
+            label = f"{label or entity} / {current_item}"
+        chunk_idx += 1
+        chunks.append({"text": text, "metadata": _build_meta(text, entity, chunk_idx, label)})
 
-            for para in paragraphs:
-                # If paragraph itself is a giant Markdown Table (> max_section_chars)
-                if para.startswith("|") and len(para) > max_section_chars:
-                    # Flush any accumulated running_parts first
-                    if running_parts and running_len >= 100:
-                        chunk_idx += 1
-                        sub_text = "\n\n".join(running_parts)
-                        if entity_name and not sub_text.startswith("##"):
-                            sub_text = f"## {entity_name}\n\n{sub_text}"
-                        chunks.append({
-                            "text": sub_text,
-                            "metadata": _build_meta(sub_text, entity_name, chunk_idx)
-                        })
-                        running_parts = []
-                        running_len = 0
+    def _flush():
+        nonlocal body, body_len
+        if body:
+            _emit(body)
+        body, body_len = [], 0
 
-                    # Split giant table safely row-by-row while preserving headers
-                    sub_tables = _split_large_markdown_table(
-                        table_text=para,
-                        section_title=entity_name,
-                        max_chars=max_section_chars
-                    )
-                    for sub_tbl in sub_tables:
-                        chunk_idx += 1
-                        chunks.append({
-                            "text": sub_tbl,
-                            "metadata": _build_meta(sub_tbl, entity_name, chunk_idx)
-                        })
-                    continue
+    for block in blocks:
+        if block["page"] != last_page:
+            # A page starts its own subject (each catalog page names its product)
+            _flush()
+            stack, current_item, skipping, last_page = [], None, None, block["page"]
 
-                # Normal paragraph handling
-                combined_len = running_len + len(para)
-                if combined_len > max_section_chars and running_parts and running_len >= 100:
-                    chunk_idx += 1
-                    sub_text = "\n\n".join(running_parts)
-                    if entity_name and not sub_text.startswith("##"):
-                        sub_text = f"## {entity_name}\n\n{sub_text}"
-                    chunks.append({
-                        "text": sub_text,
-                        "metadata": _build_meta(sub_text, entity_name, chunk_idx)
-                    })
-                    running_parts = []
-                    running_len = 0
+        if block["kind"] == "heading":
+            _flush()
+            lvl, txt = block["level"], block["text"]
+            if skipping is not None and lvl > skipping:
+                continue
+            skipping = None
+            if ref_sec_pattern.match(f"## {txt}") or sig_sec_pattern.match(f"## {txt}"):
+                skipping = lvl
+                continue
+            stack = [(l, t) for l, t in stack if l < lvl] + [(lvl, txt)]
+            if ITEM_BLOCK_HEADING_RE.match(f"{'#' * lvl} {txt}"):
+                current_item = None
+            continue
 
-                running_parts.append(para)
-                running_len += len(para)
+        if skipping is not None:
+            continue
 
-            if running_parts:
-                chunk_idx += 1
-                sub_text = "\n\n".join(running_parts)
-                if entity_name and not sub_text.startswith("##"):
-                    sub_text = f"## {entity_name}\n\n{sub_text}"
-                chunks.append({
-                    "text": sub_text,
-                    "metadata": _build_meta(sub_text, entity_name, chunk_idx)
-                })
+        text = block["text"]
+        if block["kind"] == "table":
+            rows = [l for l in text.split("\n") if l.strip()]
+            has_delim = len(rows) > 1 and re.match(r'^\|(?:\s*:?-{3,}:?\s*\|)+\s*$', rows[1])
+            header = rows[:2] if has_delim else rows[:1]
+            data = rows[len(header):]
+            if body_len + len(text) <= max_section_chars and len(data) <= TABLE_ROWS_PER_CHUNK:
+                body.append(text)
+                body_len += len(text)
+                continue
+            # A long table is split by rows, every part keeping the column header; a short lead-in
+            # paragraph stays with the first part.
+            lead = body if body_len < 300 else []
+            if not lead:
+                _flush()
+            group, group_len = [], 0
+            header_len = sum(len(h) for h in header)
+            for row in data:
+                if group and (len(group) >= TABLE_ROWS_PER_CHUNK or header_len + group_len + len(row) > max_section_chars):
+                    _emit(lead + ["\n".join(header + group)])
+                    lead, group, group_len = [], [], 0
+                group.append(row)
+                group_len += len(row)
+            if group:
+                _emit(lead + ["\n".join(header + group)])
+            body, body_len = [], 0
+            continue
+
+        # Catalog item boundary: a new item name closes the previous item's chunk
+        name_match = ITEM_NAME_FIELD_RE.search(text)
+        if name_match:
+            new_item = name_match.group(1).strip().strip("*").strip()
+            if body and new_item != current_item:
+                _flush()
+            current_item = new_item
+
+        if body and body_len + len(text) > max_section_chars and body_len >= 100:
+            _flush()
+        body.append(text)
+        body_len += len(text)
+
+    _flush()
 
     # Integrity Check / Safety Guard: ensure chunking preserved text content (>50% ratio)
     total_chunk_len = sum(len(c.get("text", "")) for c in chunks)

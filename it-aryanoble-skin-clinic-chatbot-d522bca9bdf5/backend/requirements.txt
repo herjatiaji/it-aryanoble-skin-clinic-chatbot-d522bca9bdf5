@@ -24,12 +24,19 @@ langchain-openai            # LangChain integrations for OpenAI-compatible LLMs 
 langchain-community         # Community tool integrations, retrievers, and adapters
 langchain-huggingface       # LangChain wrappers for HuggingFace embedding models
 langchain-experimental      # Advanced experimental RAG splitters and agents
-docling                     # Deep document parsing engine for complex PDFs & tables
+rapidocr                    # Lightweight OCR engine for flattened design & scanned PDFs (supersedes Docling)
 sentence-transformers       # Local vector embedding generation (e.g., BAAI/bge-m3)
 unstructured                # Unstructured document parsing fallback
 langdetect                  # Natural language detection for document content
 rank-bm25                   # In-memory BM25 sparse keyword index engine
 psycopg[binary]             # Synchronous PostgreSQL driver for PGVector adapter
+# --- Document & Spreadsheet Parsing Dependencies ---
 boto3                       # AWS S3 / MinIO Object Storage SDK
 PyMuPDF                     # Fast PDF text and embedded image extraction
+python-docx                 # Fast DOCX text, table, and image extraction
+python-pptx                 # Fast PowerPoint (.pptx) text, slide, and image extraction
+pandas>=2.0.0               # High-performance dataframe engine for spreadsheet and tabular parsing
+openpyxl>=3.1.2             # Excel (.xlsx/.xlsm) openpyxl engine with cell anchors and merge support
+tabulate>=0.9.0             # Fast markdown table rendering for pandas dataframes
+Pillow>=10.0.0              # Image manipulation, format conversion, and visual preprocessing
 

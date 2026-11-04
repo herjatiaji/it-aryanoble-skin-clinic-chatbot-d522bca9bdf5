@@ -15,7 +15,11 @@ export function useCisSyncListener() {
 		let isMounted = true;
 		let reconnectTimeout: NodeJS.Timeout | null = null;
 		let eventSource: EventSource | null = null;
-		const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+		let rawApiUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
+		if (rawApiUrl.includes("localhost") || rawApiUrl.includes("127.0.0.1")) {
+			rawApiUrl = "/api";
+		}
+		const apiUrl = rawApiUrl;
 
 		function connect() {
 			if (!isMounted) return;

@@ -1,17 +1,30 @@
 import axios from "axios";
 
-// Determine the base URL. If NEXT_PUBLIC_API_URL is set, use it. Otherwise, default to local FastAPI dev server.
-const baseURL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+// Always use "/api" as the base URL for the client.
+// Browser requests will hit the same-origin Next.js proxy (/api/* -> http://backend:8000/api/*).
+let defaultBaseURL = "/api";
+const publicApi = process.env.NEXT_PUBLIC_API_URL;
+if (publicApi && !publicApi.includes("localhost") && !publicApi.includes("127.0.0.1") && !publicApi.includes("backend")) {
+	defaultBaseURL = publicApi;
+}
 
 export const api = axios.create({
-	baseURL,
+	baseURL: defaultBaseURL,
 	// Ensure cookies are sent with every request
 	withCredentials: true,
 });
 
-// Request interceptor to add any needed headers
+// Request interceptor to add any needed headers and handle SSR container routing
 api.interceptors.request.use(
 	(config) => {
+		// If running on the server during SSR, route to internal backend container
+		if (typeof window === "undefined" && config.url && !config.url.startsWith("http")) {
+			const internalBackend = process.env.INTERNAL_BACKEND_URL || "http://backend:8000";
+			const cleanBase = internalBackend.replace(/\/api\/?$/, "");
+			const cleanPath = config.url.startsWith("/") ? config.url : `/${config.url}`;
+			config.baseURL = undefined;
+			config.url = `${cleanBase}/api${cleanPath}`;
+		}
 		return config;
 	},
 	(error) => {

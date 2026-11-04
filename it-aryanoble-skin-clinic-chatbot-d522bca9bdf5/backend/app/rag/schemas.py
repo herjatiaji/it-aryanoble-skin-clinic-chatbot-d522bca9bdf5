@@ -91,15 +91,32 @@ class PendingDocumentResponse(BaseModel):
 class RefineRequest(BaseModel):
     prompt: str = Field(..., description="Instructions to refine the document summary or text content")
     history: Optional[List[ChatMessage]] = Field(default=[], description="Multi-turn conversation history for refine editing")
+    current_summary: Optional[str] = Field(default=None, description="Optional current document summary/content incorporating any manual edits")
 
     model_config = {
         "json_schema_extra": {
             "example": {
                 "prompt": "Tolong terjemahkan bagian dosis ke Bahasa Indonesia dan buatkan kesimpulan",
-                "history": []
+                "history": [],
+                "current_summary": "Konten dokumen..."
             }
         }
     }
+
+
+class ReparseVisionRequest(BaseModel):
+    page_numbers: Optional[List[int]] = Field(None, description="Optional list of page numbers (1-indexed) to re-parse with Vision. If omitted, re-parses all pages.")
+    max_pages: Optional[int] = Field(1000, description="Maximum pages to process")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "page_numbers": [1, 2, 3],
+                "max_pages": 1000
+            }
+        }
+    }
+
 
 class EditApprovedDocumentRequest(BaseModel):
     summary: Optional[str] = Field(None, description="Updated document summary markdown (for manual save)")
@@ -217,5 +234,135 @@ from app.rag.canonical import (
     generate_stable_image_id,
     ImageProvenance,
     ImageProvenanceRegistry,
-    classify_image_provenance
+    classify_image_provenance,
+    CanonicalEvidence,
+    CanonicalEntity,
+    CanonicalAsset,
+    ParseReport
 )
+
+
+# =============================================================================
+# PHASE 1.5 QUALITY GATE & STAGING CMS SCHEMAS
+# =============================================================================
+
+class EvidenceItemResponse(BaseModel):
+    id: str
+    evidence_type: str
+    knowledge_type: Optional[str] = None
+    section_path: List[str] = Field(default_factory=list)
+    title: Optional[str] = None
+    body: str
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+    visual_analysis_status: Optional[str] = None
+    confidence: Optional[float] = 1.0
+    derivation: str = "NATIVE"
+    ordinal: int = 0
+
+
+class AssetItemResponse(BaseModel):
+    id: str
+    storage_key: str
+    asset_class: str
+    classification_score: float = 0.0
+    classification_breakdown: Dict[str, Any] = Field(default_factory=dict)
+    label: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    status: str = "VALID"
+
+
+class QualityGateReadiness(BaseModel):
+    is_ready: bool = False
+    can_publish: bool = False
+    current_status: str = "PROCESSING"
+    job_status: str = "PENDING"
+    unresolved_items: int = 0
+    reasons: List[str] = Field(default_factory=list)
+
+
+class QualityGateResponse(BaseModel):
+    knowledge_id: str
+    version_id: Optional[str] = None
+    version_no: int = 0
+    status: str = "NOT_FOUND"
+    job_status: str = "PENDING"
+    readiness: QualityGateReadiness
+    parse_report: Dict[str, Any] = Field(default_factory=dict)
+    visual_summary: Dict[str, Any] = Field(default_factory=dict)
+    total_evidence_count: int = 0
+    total_asset_count: int = 0
+    evidences: List[EvidenceItemResponse] = Field(default_factory=list)
+    assets: List[AssetItemResponse] = Field(default_factory=list)
+
+
+class UpdateEvidenceRequest(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
+    visual_analysis_status: Optional[str] = None
+
+
+class RegenerateSummaryResponse(BaseModel):
+    knowledge_id: str
+    version_id: str
+    summary_md: str
+    message: str = "Summary successfully regenerated from Canonical Evidence SSOT."
+
+
+# =============================================================================
+# PHASE 2 VERSIONING, ATOMIC PUBLISH & MEDIA SERVING SCHEMAS
+# =============================================================================
+
+class PublishVersionRequest(BaseModel):
+    version_id: Optional[str] = None
+    approved_by: Optional[str] = None
+
+
+class PublishVersionResponse(BaseModel):
+    status: str
+    knowledge_id: str
+    version_id: str
+    is_active: bool = True
+    message: str = "Document published atomically with verified readiness."
+
+
+class MediaResolveResponse(BaseModel):
+    asset_id: str
+    version_id: str
+    knowledge_id: str
+    storage_key: str
+    url: str
+    presigned_url: Optional[str] = None
+    asset_class: str
+    classification_score: float = 0.0
+    label: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    status: str
+    is_active: bool = True
+
+
+class InvariantCheckResponse(BaseModel):
+    is_valid: bool
+    orphan_active_chunks: int = 0
+    inactive_chunks_of_active_versions: int = 0
+    multi_active_documents: List[str] = Field(default_factory=list)
+    message: str
+
+
+class ReparseVisionRequest(BaseModel):
+    max_pages: Optional[int] = 1000
+    force_vision: bool = True
+    page_range: Optional[List[int]] = None
+    page_numbers: Optional[List[int]] = None
+    concurrent_workers: Optional[int] = 4
+
+
+class ReparseVisionResponse(BaseModel):
+    status: str
+    knowledge_id: str
+    total_pages_reparsed: int
+    chunks_created: int
+    message: str
+

@@ -1,0 +1,10 @@
+{
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/it-aryanoble-skin-clinic-chatbot-d522bca9bdf5/backend",
+        "${workspaceFolder}/backend"
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/it-aryanoble-skin-clinic-chatbot-d522bca9bdf5/backend",
+        "${workspaceFolder}/backend"
+    ]
+}

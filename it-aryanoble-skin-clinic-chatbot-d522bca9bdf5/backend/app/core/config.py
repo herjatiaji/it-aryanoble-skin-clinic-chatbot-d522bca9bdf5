@@ -33,14 +33,18 @@ class Settings(BaseSettings):
     S3_REGION: str = "ap-southeast-3" # AWS Jakarta Region
     S3_USE_PATH_STYLE: Optional[bool] = None # None = auto-detect (True for MinIO, False for AWS)
     S3_PUBLIC_URL: Optional[str] = None # Optional public CDN / API prefix
+    BACKEND_PUBLIC_URL: Optional[str] = None # Explicit backend public API host e.g. https://dokterpedia-api-dev.aryanoble.web.id
 
     COOKIE_DOMAIN: Optional[str] = None # e.g. ".aryanoble.web.id" or ".aryanoble.co.id"
     COOKIE_SECURE: Optional[bool] = None
     COOKIE_SAMESITE: str = "lax"
     CORS_ORIGINS: list[str] | str = [
         "http://localhost:3000",
+        "http://127.0.0.1:3000",
         "http://localhost:8000",
+        "http://127.0.0.1:8000",
         "http://localhost:8001",
+        "http://127.0.0.1:8001",
         "https://dokterpedia-dev.aryanoble.web.id",
         "https://dokterpedia-staging.aryanoble.web.id",
         "https://dokterpedia.aryanoble.co.id",
@@ -48,6 +52,9 @@ class Settings(BaseSettings):
 
     # Token Quotas
     INGESTION_MONTHLY_TOKEN_LIMIT: int = 1000000
+
+    # Ingestion Extraction Engine Toggle: True = Scenario C (OCR + Vision), False = Scenario A (Native text only)
+    ENABLE_OCR_VISION: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 

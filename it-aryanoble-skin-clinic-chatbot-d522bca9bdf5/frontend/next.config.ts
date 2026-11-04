@@ -2,6 +2,7 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   /* config options here */
+  skipTrailingSlashRedirect: true,
   reactCompiler: true,
   images: {
     remotePatterns: [
@@ -23,8 +24,12 @@ const nextConfig: NextConfig = {
 
     return [
       {
-        source: "/api/storage/:path*",
-        destination: `${backendUrl}/api/storage/:path*`,
+        source: "/api/:path*/",
+        destination: `${backendUrl}/api/:path*/`,
+      },
+      {
+        source: "/api/:path*",
+        destination: `${backendUrl}/api/:path*`,
       },
     ];
   },

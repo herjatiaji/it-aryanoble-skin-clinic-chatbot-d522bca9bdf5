@@ -8,3 +8,13 @@ from .chat import ChatSession, ChatMessage
 from .config import AppConfig
 from .ingestion_usage import IngestionTokenUsage
 from .pending_operation import PendingOperation
+from .canonical_knowledge import (
+    KnowledgeVersion,
+    KBEvidence,
+    KBEntity,
+    KBEvidenceEntity,
+    KBAsset,
+    KBEvidenceAsset,
+    KBChunk,
+    KBRelation
+)

@@ -205,6 +205,12 @@ class MetadataEnricher:
                 chunk_index=idx
             )
 
+            domain = chunk_meta.get("domain") or chunk_meta.get("clinical_domain")
+            is_discontinued = bool(chunk_meta.get("is_discontinued", False))
+            target_indications = chunk_meta.get("target_indications") or []
+            routine_steps = chunk_meta.get("routine_steps") or []
+            product_entities = chunk_meta.get("product_entities") or []
+
             # Canonical Chunk object
             canon_chunk = CanonicalChunk(
                 document_id=filename,
@@ -227,6 +233,12 @@ class MetadataEnricher:
                 dose=dose,
                 frequency=frequency,
                 indication=indication,
+                domain=domain,
+                clinical_domain=domain,
+                is_discontinued=is_discontinued,
+                target_indications=target_indications,
+                routine_steps=routine_steps,
+                product_entities=product_entities,
                 content=text,
                 valid_from=chunk_meta.get("valid_from"),
                 valid_until=chunk_meta.get("valid_until"),

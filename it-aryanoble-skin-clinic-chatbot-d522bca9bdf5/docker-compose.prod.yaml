@@ -1,8 +1,15 @@
+# Sized for the production server: 2 vCPU / 2.9 GB RAM. Limits total ~2.4 GB, leaving ~500 MB for the OS.
+# Measured peaks (2026-10-26): backend ~980 MB while vision-parsing a 131-page PDF (plateaus, does not grow
+# per page); Postgres ~280 MB; MinIO ~425 MB during image-heavy ingest; frontend (production build) ~140 MB;
+# mock-cis ~70 MB.
+# Documents are ingested one at a time (MAX_INGESTION_CONCURRENCY=1); raise limits only with more RAM.
 services:
   db:
     image: pgvector/pgvector:pg16
     container_name: skin_clinic_db_prod
     restart: always
+    cpus: 1.0
+    mem_limit: 384m
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -21,6 +28,8 @@ services:
     image: minio/minio:RELEASE.2024-01-16T16-07-38Z
     container_name: skin_clinic_minio_prod
     restart: always
+    cpus: 0.5
+    mem_limit: 448m
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -42,8 +51,8 @@ services:
       target: production
     container_name: skin_clinic_backend_prod
     restart: always
-    cpus: 2.0
-    mem_limit: 6144m
+    cpus: 1.5
+    mem_limit: 1280m
     ports:
       - "8000:8000"
     env_file:
@@ -51,6 +60,7 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/arya_noble
       - ENABLE_RERANKER=false
+      - MAX_INGESTION_CONCURRENCY=1
     depends_on:
       db:
         condition: service_healthy
@@ -73,6 +83,8 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://dokterpedia-api-dev.aryanoble.web.id/api}
     container_name: skin_clinic_frontend_prod
     restart: always
+    cpus: 0.5
+    mem_limit: 256m
     ports:
       - "3000:3000"
     environment:
@@ -86,6 +98,8 @@ services:
       context: ./mock-cis
     container_name: skin_clinic_mock_cis_prod
     restart: always
+    cpus: 0.25
+    mem_limit: 96m
     ports:
       - "8001:8001"
     environment:

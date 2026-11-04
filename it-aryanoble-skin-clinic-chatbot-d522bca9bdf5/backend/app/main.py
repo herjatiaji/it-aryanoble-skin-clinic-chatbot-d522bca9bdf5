@@ -29,6 +29,13 @@ async def lifespan(app: FastAPI):
             vector_store = None
 
         ingestion_pipeline = IngestionPipeline(vector_store=vector_store)
+        app.state.vector_store = vector_store
+        app.state.ingestion_pipeline = ingestion_pipeline
+        app.state.bm25_index = None
+        app.state.reranker = None
+        app.state.hybrid_retriever = None
+        app.state.llm_adapter = None
+        app.state.generation_pipeline = None
 
         bm25_index = BM25Index()
         try:
@@ -40,11 +47,15 @@ async def lifespan(app: FastAPI):
         reranker = None
 
         try:
+            from app.rag.services.canonical_retriever import CanonicalV2Retriever
+            canonical_engine = CanonicalV2Retriever()
             hybrid_retriever = HybridRetriever(
                 vector_store=vector_store,
                 bm25_index=bm25_index,
-                reranker=reranker
+                reranker=reranker,
+                canonical_engine=canonical_engine
             )
+            app.state.canonical_engine = canonical_engine
         except Exception as e:
             logger.error(f"Failed to initialize hybrid retriever: {e}")
             hybrid_retriever = None
@@ -109,8 +120,62 @@ async def lifespan(app: FastAPI):
 
     sync_worker_task = asyncio.create_task(_minio_background_sync_worker())
 
+    # Documents processed by an older chunker are brought up to date in the background, one at a time,
+    # once the app has settled (no admin script needed after a chunker change).
+    async def _reprocess_outdated_documents():
+        try:
+            await asyncio.sleep(90)
+            from app.rag.config import settings as _rag_settings
+            if getattr(_rag_settings, "auto_reprocess_outdated", True):
+                from app.rag.services.reprocess import rechunk_outdated
+                await rechunk_outdated()
+        except asyncio.CancelledError:
+            pass
+        except Exception as r_err:
+            logger.warning(f"Reprocessing outdated documents failed: {r_err}")
+
+    async def _fail_interrupted_ingestions():
+        # Ingestion runs (and queues) inside this process, so a document still PROCESSING when the process
+        # starts lost its task to the restart (deploy, out-of-memory kill) and would show as in progress
+        # forever. It is marked failed the way a failed ingestion is, so the admin sees it and uploads again.
+        # With several workers another worker may still be ingesting it, so this only runs with one.
+        if os.getenv("WORKERS", "1") != "1":
+            return
+        try:
+            from sqlalchemy import update
+            from app.core.database import AsyncSessionLocal
+            from app.models.knowledge import Knowledge, KnowledgeStatus
+            reason = "[Gagal Diproses] Proses ingest terhenti karena server dimulai ulang. Silakan unggah ulang dokumen."
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(
+                    update(Knowledge)
+                    .where(Knowledge.status == KnowledgeStatus.PROCESSING, Knowledge.deleted_at.is_(None))
+                    .values(status=KnowledgeStatus.REJECTED, ai_summary=reason)
+                    .returning(Knowledge.file_name)
+                )
+                names = [r[0] for r in res.fetchall()]
+                await session.commit()
+            if names:
+                logger.warning(f"Ingestion interrupted by the restart, marked failed: {names}")
+        except Exception as f_err:
+            logger.warning(f"Could not mark interrupted ingestions as failed: {f_err}")
+
+    await _fail_interrupted_ingestions()
+    reprocess_task = asyncio.create_task(_reprocess_outdated_documents())
+
+    # Check public storage URL configuration for staging / production
+    env_name = getattr(settings, "ENVIRONMENT", "") or os.getenv("ENV", "")
+    backend_pub = getattr(settings, "BACKEND_PUBLIC_URL", "") or os.getenv("BACKEND_PUBLIC_URL", "")
+    s3_pub = getattr(settings, "S3_PUBLIC_URL", "") or os.getenv("S3_PUBLIC_URL", "")
+    if str(env_name).lower() not in ("development", "dev", "test", "testing") and not (backend_pub or s3_pub):
+        logger.warning(
+            "⚠️ [STORAGE CONFIG] Neither BACKEND_PUBLIC_URL nor S3_PUBLIC_URL is configured. "
+            "Image URLs in external CIS responses may be unresolvable if CIS calls the backend via internal container/VPC hostnames."
+        )
+
     yield
 
+    reprocess_task.cancel()
     sync_worker_task.cancel()
     try:
         await sync_worker_task
@@ -130,11 +195,42 @@ app = FastAPI(
 # Pure ASGI Middleware to buffer and replay raw request body when X-Signature is present.
 # This prevents Starlette's MultipartParser from starving signature verification dependencies.
 @app.middleware("http")
+async def capture_request_host_middleware(request: Request, call_next):
+    from app.services.storage import set_current_request_base_url, is_internal_or_unreachable_host
+    forwarded_proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
+    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if forwarded_host and not is_internal_or_unreachable_host(forwarded_host):
+        base_url = f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+        set_current_request_base_url(base_url)
+    return await call_next(request)
+
+@app.middleware("http")
 async def cache_raw_body_for_signature(request: Request, call_next):
     if request.headers.get("X-Signature") or request.headers.get("x-signature"):
         body_bytes = await request.body()
         request.scope["_raw_body"] = body_bytes
     return await call_next(request)
+
+@app.middleware("http")
+async def fix_redirect_location_middleware(request: Request, call_next):
+    if request.url.path in {
+        "/api/users",
+        "/api/roles",
+        "/api/projects",
+        "/api/knowledge",
+        "/api/chats",
+        "/api/categories",
+        "/api/branches",
+        "/api/search",
+        "/api/config",
+    }:
+        request.scope["path"] = request.url.path + "/"
+
+    response = await call_next(request)
+    location = response.headers.get("location")
+    if location and "backend:8000" in location:
+        response.headers["location"] = location.replace("http://backend:8000", "")
+    return response
 
 app.add_middleware(
     CORSMiddleware,

@@ -59,6 +59,18 @@ _INJECTION_PATTERNS: list[Tuple[re.Pattern, float, str]] = [
         0.5,
         "unrestricted_mode"
     ),
+    (
+        re.compile(r"\b(?:system|admin|root|developer)\s+override\b|\boverride\s+mode\b", re.IGNORECASE),
+        0.5,
+        "system_override"
+    ),
+    (
+        # A disclosure verb aimed at the assistant's own hidden material, whatever words sit in between
+        re.compile(r"\b(?:reveal|leak|expose|dump|bocorkan|ungkapkan)\b(?:\s+\w+){0,3}?\s+(?:system|internal|hidden|secret|rahasia|tersembunyi)\s+"
+                   r"(?:prompts?|instructions?|guidelines?|rules?|configurations?|instruksi|aturan|konfigurasi)\b", re.IGNORECASE),
+        0.3,
+        "reveal_hidden_material"
+    ),
     # Contextual / Medium patterns (0.25 - 0.35)
     (
         re.compile(r"you\s+are\s+now\s+(a|an|the)\s+", re.IGNORECASE),
@@ -153,8 +165,6 @@ _WHITELIST_PHRASES: list[str] = [
     "janji temu", "rekam medis", "biaya tindakan", "biaya perawatan",
     "efek samping", "side effect", "bahan aktif", "active ingredient",
     "aturan pakai", "cara pakai", "how to use", "interaksi obat",
-    # Arya Noble & Partner Brands
-    "lumera", "luméra", "dermies", "skincode",
     # Skin barrier & physiological terms
     "skin barrier", "skin-barrier", "barrier defense", "barrier repair",
     # Clinical consultation & treatment recommendation phrases
@@ -200,7 +210,7 @@ _WHITELIST_KEYWORDS: set[str] = {
     "emulsi", "emulsion", "kapsul", "capsule", "tablet", "pil", "suplemen",
     "produk", "product", "sku", "kemasan", "botol", "sachet", "tube", "jar",
 
-    # Treatments & clinical procedures
+    # Treatments, medical devices & clinical procedures
     "treatment", "tindakan", "perawatan", "terapi", "therapy", "prosedur",
     "laser", "vbeam", "pico", "picoway", "picosure", "ipl", "peel", "peeling",
     "micropeel", "microneedling", "dermapen", "prp", "botox", "botulinum",
@@ -208,9 +218,15 @@ _WHITELIST_KEYWORDS: set[str] = {
     "subsisi", "subcision", "dermabrasi", "microdermabrasion", "hydrafacial",
     "injeksi", "injection", "suntik", "infus", "phototherapy", "fototerapi",
     "rf", "radiofrequency", "hifu", "cauterisasi",
+    "ultraformer", "mpt", "liftera", "thermage", "sylfirm", "morpheus", "morpheus8",
+    "cartridge", "transducer", "handpiece", "kedalaman", "depth", "energi", "energy",
+    "joule", "shot", "layer", "lapisan", "smas", "subkutan", "subcutaneous", "fat", "lemak",
+    "tightening", "lifting", "firming", "rejuvenation", "kontur", "contouring",
+    "alat", "perangkat", "device", "mesin", "parameter", "spesifikasi", "protokol", "sop",
+    "katalog", "formularium", "kombo", "cheatsheet", "panduan", "petunjuk", "terapis", "therapist",
 
     # Clinic, doctors, administration & services
-    "erha", "arya", "noble", "lumera", "dermies", "skincode", "klinik", "clinic", "dokter", "dok", "doctor", "dr",
+    "klinik", "clinic", "dokter", "dok", "doctor", "dr",
     "spkk", "spdve", "dermatologist", "resepsionis", "perawat", "nurse", "apoteker",
     "pharmacist", "apotek", "apotheke", "konsultasi", "telekonsultasi", "appointment",
     "janji", "booking", "reservasi", "daftar", "pendaftaran", "registrasi",
@@ -413,6 +429,35 @@ class InputGuard:
                 matched.append(kw)
         return (len(matched) > 0), matched
 
+    # A word in at most this share of the published chunks is specific to some documents (a name or term),
+    # not general language
+    KB_TERM_MAX_DOC_RATIO = 0.02
+
+    @classmethod
+    def knowledge_base_terms(cls, query: str) -> list[str]:
+        """Query words the published knowledge base contains and that are specific to some of its documents."""
+        try:
+            from app.rag.services.canonical_retriever import CanonicalV2Retriever
+            retriever = CanonicalV2Retriever()
+            retriever._corpus_vocabulary()
+            doc_ratio = CanonicalV2Retriever._vocabulary_cache["doc_ratio"]
+        except Exception as kb_err:
+            logger.debug(f"Knowledge base topicality probe unavailable: {kb_err}")
+            return []
+        query_norm = unicodedata.normalize("NFKD", query).encode("ASCII", "ignore").decode("utf-8").lower()
+        tokens = dict.fromkeys(t for t in re.findall(r"[a-z0-9]+", query_norm) if len(t) >= 4)
+        terms = [t for t in tokens if 0 < doc_ratio.get(t, 0) <= cls.KB_TERM_MAX_DOC_RATIO]
+        # A frequent word is still the knowledge base's own term when its documents write it as a name
+        # (a brand or product line across many pages), unlike common language
+        frequent = [t for t in tokens if doc_ratio.get(t, 0) > cls.KB_TERM_MAX_DOC_RATIO]
+        if frequent and not terms:
+            try:
+                with retriever.engine.connect() as conn:
+                    terms = [t for t in frequent if CanonicalV2Retriever._is_proper_name_term(conn, t)]
+            except Exception:
+                pass
+        return terms
+
     @classmethod
     def check_topicality(cls, query: str) -> Tuple[bool, Optional[str]]:
         """
@@ -426,11 +471,11 @@ class InputGuard:
         if not settings.guardrails_block_offtopic:
             return True, None
 
-        # Intent detection for greeting & closing shortcut
+        # Intent detection for greeting, closing, & continuation shortcut
         try:
             from app.rag.services.intent import QueryIntentDetector, QueryIntent
             intent, _ = QueryIntentDetector.detect(query)
-            if intent in (QueryIntent.GREETING, QueryIntent.CLOSING):
+            if intent in (QueryIntent.GREETING, QueryIntent.CLOSING, QueryIntent.CONTINUATION):
                 return True, None
         except Exception:
             pass
@@ -462,8 +507,16 @@ class InputGuard:
             logger.info(f"Topicality Gate REJECTED (Specific off-topic blacklist match: {matched_blacklist}) query='{query[:80]}'")
             return False, _OFFTOPIC_SPECIFIC_MSG
 
-        # 4. Query neither whitelisted nor blacklisted -> Generic Rejection
-        logger.info(f"Topicality Gate REJECTED (Generic off-topic, no clinical match) query='{query[:80]}'")
+        # 3.5 Knowledge Base Probe: a query naming something the published knowledge base contains (a product,
+        # device or term specific to its documents) is in scope, so any newly ingested topic is allowed without
+        # a keyword list.
+        kb_terms = cls.knowledge_base_terms(query)
+        if kb_terms:
+            logger.info(f"Topicality Gate PASSED via knowledge base terms {kb_terms[:5]} query='{query[:80]}'")
+            return True, None
+
+        # 4. Query neither whitelisted, nor present in active KB, nor blacklisted -> Generic Rejection
+        logger.info(f"Topicality Gate REJECTED (Generic off-topic, no clinical or KB match) query='{query[:80]}'")
         return False, _OFFTOPIC_GENERIC_MSG
 
     @classmethod
@@ -580,14 +633,31 @@ class GuardrailsPipeline:
     """Orchestrator that wraps input validation and output processing."""
 
     @staticmethod
-    def validate_input(query: str) -> Tuple[bool, Optional[str]]:
+    def validate_input(query: str, history: Optional[list] = None) -> Tuple[bool, Optional[str]]:
         """
         Validates user input. Returns (is_valid, rejection_message).
         If guardrails are disabled globally, always returns True.
+
+        Prompt injection is always judged on the query itself. A query is judged on its own first;
+        only an elliptical follow-up ('berapa lama durasinya?') that names no topic at all -- and is
+        not explicitly off-topic -- inherits the topic of the user's earlier questions in the session.
         """
         if not settings.guardrails_enabled:
             return True, None
-        return InputGuard.validate(query)
+        is_safe, msg = InputGuard.check_prompt_injection(query)
+        if not is_safe:
+            return False, msg
+        on_topic, msg = InputGuard.check_topicality(query)
+        if on_topic:
+            return True, None
+        prior_user_turns = [
+            str(m.get("content") or "") for m in (history or [])
+            if isinstance(m, dict) and str(m.get("role", "")).lower() == "user"
+        ][-2:]
+        explicitly_off_topic, _ = InputGuard.matches_blacklist(query)
+        if prior_user_turns and not explicitly_off_topic:
+            return InputGuard.check_topicality("\n".join(prior_user_turns + [query]))
+        return False, msg
 
     @staticmethod
     def process_output(answer: str) -> str:

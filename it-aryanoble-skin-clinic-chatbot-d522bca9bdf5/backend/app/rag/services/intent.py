@@ -45,6 +45,8 @@ def format_doctor_name(doctor_name: Optional[str] = None) -> str:
     if not doctor_name or not str(doctor_name).strip():
         return "Dok"
     clean = str(doctor_name).strip()
+    if clean.lower() in ("admin", "staff", "general assistant", "user", "administrator"):
+        return clean
     if clean.lower().startswith("dr.") or clean.lower().startswith("dr ") or clean.lower().startswith("dokter"):
         return clean
     return f"dr. {clean}"
@@ -72,6 +74,12 @@ def get_contextual_greeting_response(query: str = "", doctor_name: Optional[str]
         salutation = "Wa'alaikumsalam"
     elif "hai" in q_lower.split() or "hi" in q_lower.split():
         salutation = "Hai"
+
+    is_staff = doc_title.lower() in ("admin", "staff", "general assistant", "user", "administrator")
+    if is_staff:
+        if any(k in q_lower for k in ["siapa", "kamu siapa", "anda siapa", "bot apa", "siapakah kamu"]):
+            return f"{salutation}, {doc_title}! Saya Arya Noble AI Assistant, asisten Knowledge Base resmi yang siap membantu Anda mencari dan memverifikasi informasi klinis, produk, SOP, serta data internal."
+        return f"{salutation}, {doc_title}! Saya Arya Noble AI Assistant. Ada yang bisa saya bantu terkait informasi klinis, produk, atau data knowledge base hari ini?"
 
     if any(k in q_lower for k in ["siapa", "kamu siapa", "anda siapa", "bot apa", "siapakah kamu"]):
         return f"{salutation}, {doc_title}! Saya ERHA Medical Assistant, asisten klinis yang siap membantu Dokter mencari informasi SOP tindakan medis, indikasi, dan panduan produk ERHA."
@@ -103,6 +111,8 @@ class QueryIntent(str, Enum):
     COMPARISON = "COMPARISON"
     AVAILABILITY = "AVAILABILITY"
     PRICE = "PRICE"
+    CONTINUATION = "CONTINUATION"
+    CATALOG_ENUMERATION = "CATALOG_ENUMERATION"
     EDIT = "EDIT"
     DELETE = "DELETE"
     UNKNOWN = "UNKNOWN"
@@ -133,6 +143,27 @@ _INTENT_PATTERNS = [
             r"^\s*(terima\s*kasih|terimakasih|makasih|thanks|thank\s*you|trims)\s+(banyak|atas\s+bantuannya|atas\s+infonya|infonya|rekomendasinya|sarannya|ya|dok|dokter)(\s+dok|\s+dokter|\s+ya|\s+ya\s+dok|\s+ya\s+dokter)?\s*[\.\,\!\?]*\s*$",
             r"^\s*(oke|ok|okay|sip|siap|baik|baiklah|mantap|noted|clear|paham|mengerti|cukup|sudah\s+cukup|cukup\s+jelas|sudah\s+jelas|sama[- ]sama)(\s+deh|\s+ya|\s+nih|\s+sip|\s+dok|\s+dokter|\s+terima\s*kasih|\s+makasih)?\s*[\.\,\!\?]*\s*$",
             r"^\s*(oke|ok|okay)\s+(dok|dokter|sip|siap|baik|noted)\s*[\.\,\!\?]*\s*$"
+        ]
+    ),
+    # 0.2 CONTINUATION / ALTERNATIVE INQUIRY (Isu #11)
+    (
+        QueryIntent.CONTINUATION,
+        [
+            r"^\s*(hanya|cuma)\s+(itu|ini)(\s+saja|\s+aja)?(\s+dok|\s+dokter|\s+kak|\s+min)?\s*[\?\!\.]*\s*$",
+            r"^\s*(apakah\s+)?(ada|masih\s+ada)\s+(lagi|yang\s+lain|alternatif\s+lain)(\s+dok|\s+dokter|\s+kak|\s+min)?\s*[\?\!\.]*\s*$",
+            r"^\s*(selain\s+(itu|ini)|ada\s+opsi\s+lain|ada\s+pilihan\s+lain)(\s+dok|\s+dokter|\s+kak|\s+min)?\s*[\?\!\.]*\s*$",
+            r"^\s*(ada\s+rekomendasi\s+lain|ada\s+tambahan\s+lain)(\s+dok|\s+dokter|\s+kak|\s+min)?\s*[\?\!\.]*\s*$",
+            r"^\s*(cuma\s+itu|hanya\s+itu)(\s+dok|\s+dokter|\s+kak|\s+min)?\s*[\?\!\.]*\s*$"
+        ]
+    ),
+    # 0.3 CATALOG_ENUMERATION / DAFTAR LENGKAP PRODUK (Section 4.3)
+    (
+        QueryIntent.CATALOG_ENUMERATION,
+        [
+            r"^\s*(?:ada\s+apa\s+aja|ada\s+apa\s+saja|ada\s+produk\s+apa|ada\s+treatment\s+apa|produk\s+apa\s+saja|produk\s+apa\s+aja)\b",
+            r"\b(?:daftar|list|katalog|pilihan|rekomendasi)\s+(?:produk|treatment|tindakan|item)\b",
+            r"\b(?:sebutkan\s+semua\s+produk|ada\s+produk\s+apa|produk\s+apa\s+saja|pilihan\s+(?:serum|toner|krim|cleanser|sabun))\b",
+            r"\b(?:opsi\s+produk|varian\s+produk|lini\s+produk)\b"
         ]
     ),
     # 1. EDIT KNOWLEDGE
@@ -180,6 +211,7 @@ _INTENT_PATTERNS = [
             r"\bcara pakai(?:nya)?\b", r"\bcara peng+unaan(?:nya)?\b", r"\baturan pakai\b",
             r"\bdosis\b", r"\bhow to use\b", r"\bdipakai kapan\b", r"\burutan pakai\b",
             r"\bcara menggunakannya\b", r"\bcara mengoleskan\b",
+            r"\b(step\s+penggunaan|step\s+pemakaian|urutan\s+pemakaian|urutan\s+penggunaan|rangkaian\s+pemakaian|rangkaian\s+produk|skincare\s+routine|tahapan\s+pemakaian|tahapan\s+penggunaan)\b",
             r"\b(tahapan|tahapan treatment|tahapan tindakan|prosedur|prosedur tindakan|prosedur treatment|langkah[- ]langkah|protokol|step[- ]by[- ]step|alur tindakan|alur treatment)\b"
         ]
     ),
@@ -283,6 +315,8 @@ class QueryIntentDetector:
             return 1
         elif intent in (QueryIntent.PRICE, QueryIntent.AVAILABILITY):
             return min(requested_top_k, 4) if requested_top_k > 4 else requested_top_k
+        elif intent == QueryIntent.CATALOG_ENUMERATION:
+            return max(requested_top_k, 25)
         return max(requested_top_k, 9)
 
     @staticmethod
@@ -344,8 +378,8 @@ class QueryIntentDetector:
             }
         elif intent == QueryIntent.HOW_TO_USE:
             return {
-                "max_sentences": 10,
-                "length_instruction": "Return the usage instructions or clinical procedure as a clear numbered step-by-step list (1. Step one 2. Step two...). Use bold for key terms. If there are morning vs evening routines, separate them with sub-headings (### Pagi Hari / ### Malam Hari). Do not add extra product recommendations.",
+                "max_sentences": 18,
+                "length_instruction": "Return the usage instructions, clinical procedure, or routine steps as a clear numbered step-by-step list (1. Step one 2. Step two...). Use bold for key terms. If there are morning vs evening routines, separate them with sub-headings (### Pagi Hari / ### Malam Hari). Include the relevant product names or categories for each step. Do not invent products outside retrieved context.",
                 "missing_fallback": "Untuk saat ini informasi tersebut belum tersedia."
             }
         elif intent == QueryIntent.PRICE:
@@ -377,6 +411,18 @@ class QueryIntentDetector:
                 "max_sentences": 2,
                 "length_instruction": "Return ONLY product availability or branch availability mentioned in context.",
                 "missing_fallback": "Untuk saat ini informasi tersebut belum tersedia."
+            }
+        elif intent == QueryIntent.CONTINUATION:
+            return {
+                "max_sentences": 4,
+                "length_instruction": "Jawab secara profesional apakah ada alternatif opsi lain yang tercantum di referensi untuk kondisi tersebut. Jika hanya 1 opsi resmi yang ada di dokumen, jelaskan secara sopan bahwa dokumen resmi saat ini hanya mencantumkan opsi tersebut.",
+                "missing_fallback": "Berdasarkan dokumen panduan resmi yang tersedia saat ini, pilihan yang tercantum adalah yang telah disebutkan sebelumnya."
+            }
+        elif intent == QueryIntent.CATALOG_ENUMERATION:
+            return {
+                "max_sentences": 12,
+                "length_instruction": "Sajikan seluruh daftar produk/treatment yang relevan secara lengkap, terstruktur, dan akurat berdasarkan data katalog resmi. Kelompokkan berdasarkan sediaan atau indikasi klinis.",
+                "missing_fallback": "Untuk saat ini produk dengan kriteria tersebut belum terdaftar di katalog resmi."
             }
         else:
             return {

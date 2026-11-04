@@ -11,6 +11,7 @@ import re
 import time
 import json
 import uuid
+import hashlib
 from datetime import datetime
 from typing import Optional
 from loguru import logger
@@ -395,20 +396,83 @@ def is_valid_storage_asset(s3_key_or_url: str) -> bool:
     return False
 
 
+import contextvars
+
+_current_request_base_url: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_current_request_base_url", default=None
+)
+
+def set_current_request_base_url(url: Optional[str]) -> None:
+    _current_request_base_url.set(url)
+
+def get_current_request_base_url() -> Optional[str]:
+    return _current_request_base_url.get()
+
+
+def is_internal_or_unreachable_host(host_or_url: str) -> bool:
+    """
+    Checks if a host or URL is internal to Docker, Kubernetes, or private VPC,
+    meaning an external browser/client (such as doctor's browser in CIS) cannot resolve it.
+    """
+    if not host_or_url:
+        return True
+
+    clean = str(host_or_url).strip()
+    if "://" in clean:
+        clean = clean.split("://", 1)[1]
+    clean = clean.split("/", 1)[0]
+    clean_host = clean.split(":", 1)[0].lower()
+
+    if clean_host in ("localhost", "127.0.0.1"):
+        return False
+
+    # Hallucinated / internal hosts (e.g. api.storage, api, backend, minio, db)
+    if clean_host in ("api.storage", "api", "backend", "minio", "db", "skin_clinic_backend", "skin_clinic_minio"):
+        return True
+
+    # Single-label hostnames without any dot (e.g. 'backend', 'skin_clinic_backend', 'minio')
+    if "." not in clean_host:
+        return True
+
+    # Docker/K8s/cloud internal suffixes
+    internal_suffixes = (".internal", ".cluster.local", ".svc", ".local", ".corp", ".lan")
+    if any(clean_host.endswith(sfx) for sfx in internal_suffixes):
+        return True
+
+    # If in staging or production, private RFC 1918 IPs cannot be reached by doctor browsers
+    env = os.getenv("ENVIRONMENT") or os.getenv("ENV") or "development"
+    if env.lower() not in ("development", "dev", "test", "testing"):
+        import ipaddress
+        try:
+            ip = ipaddress.ip_address(clean_host)
+            if ip.is_private or ip.is_loopback:
+                return True
+        except ValueError:
+            pass
+
+    return False
+
+
 def _format_browser_url(raw_url: str = None, s3_key: str = "") -> str:
     """
     Ensures image URL is accessible across all network environments (Dashboard & Mock CIS cross-origin):
     1. If raw_url is a valid external third-party HTTP(S) URL, preserve it.
     2. If S3_PUBLIC_URL is explicitly configured, use that.
     3. If BACKEND_PUBLIC_URL is explicitly configured, use that.
-    4. Otherwise, return relative backend API endpoint URL '/api/storage/{clean_key}' so frontend proxies correctly.
+    4. If request base URL is captured in contextvars and reachable, use that to resolve absolute URL.
+    5. Otherwise, return relative backend API endpoint URL '/api/storage/{clean_key}'.
     """
     input_str = (s3_key or raw_url or "").strip()
     if not input_str:
         return ""
 
     if input_str.startswith("http://") or input_str.startswith("https://"):
-        if not any(internal_host in input_str for internal_host in ["minio:9000", "localhost:9000", "127.0.0.1:9000", "localhost:8000", "127.0.0.1:8000"]):
+        # Strip hallucinated LLM domains: https://api.storage/ or https://api/
+        if re.match(r'^https?://api(?:\.storage)?(?:/storage)?/', input_str, re.IGNORECASE):
+            input_str = re.sub(r'^https?://api(?:\.storage)?(?:/storage)?/', '', input_str)
+        elif is_internal_or_unreachable_host(input_str):
+            input_str = re.sub(r'^https?://[^/]+/(?:images/|knowledge-documents/|api/storage/)?', '', input_str)
+        elif not any(internal_host in input_str for internal_host in ["minio:9000", "localhost:9000", "127.0.0.1:9000", "localhost:8000", "127.0.0.1:8000"]):
             if "/api/storage/" in input_str:
                 input_str = input_str.split("/api/storage/")[-1]
             elif "/storage/" in input_str:
@@ -435,11 +499,21 @@ def _format_browser_url(raw_url: str = None, s3_key: str = "") -> str:
             return f"{base}/{clean_key}"
 
     # Explicit backend host if configured in environment
-    backend_base = os.getenv("BACKEND_PUBLIC_URL")
+    backend_base = getattr(settings, "BACKEND_PUBLIC_URL", None) or os.getenv("BACKEND_PUBLIC_URL")
     if backend_base and str(backend_base).strip():
         base_clean = str(backend_base).strip().rstrip("/")
         if clean_key:
             return f"{base_clean}/api/storage/{clean_key}"
+
+    # Request host from current request context (e.g. https://dokterpedia-api-dev.aryanoble.web.id)
+    req_base = get_current_request_base_url()
+    if req_base and str(req_base).strip():
+        if not is_internal_or_unreachable_host(req_base):
+            req_clean = str(req_base).strip().rstrip("/")
+            if clean_key:
+                return f"{req_clean}/api/storage/{clean_key}"
+        else:
+            logger.debug(f"[STORAGE] Ignored internal/unreachable request base URL: {req_base}")
 
     # Default relative API endpoint URL (prevents hardcoded localhost:8000 in remote/production)
     if clean_key:
@@ -462,12 +536,27 @@ def expand_image_urls_in_markdown(text: str, verify_exists: bool = True) -> str:
         if not raw_url or raw_url.lower() in ("none", "null", "undefined", "#", "url_gambar", "url"):
             return ""
 
-        if verify_exists and not is_valid_storage_asset(raw_url):
+        # Normalize hallucinated https://api.storage/ or https://api/
+        normalized_url = re.sub(r'^https?://api(?:\.storage)?(?:/storage)?/', '/api/storage/', raw_url, flags=re.IGNORECASE)
+
+        if verify_exists and not is_valid_storage_asset(normalized_url):
             logger.info(f"Purging 404 / missing image tag from response markdown: ![{alt}]({raw_url})")
             return ""
 
-        expanded_url = _format_browser_url(raw_url=raw_url, s3_key=raw_url)
+        expanded_url = _format_browser_url(raw_url=normalized_url, s3_key=normalized_url)
         return f"![{alt}]({expanded_url})"
+
+    # Auto-wrap bare storage image paths that are not already enclosed in markdown image tags
+    bare_img_pat = re.compile(
+        r'(!\[([^\]]*)\]\(([^)]+)\))|((?:https?://[^\s\)\"\'\`]+)?/api/storage/images/[^\s\)\"\'\`]+\.(?:png|jpg|jpeg|webp|gif))',
+        re.IGNORECASE
+    )
+    def _wrap_bare(m):
+        if m.group(1):
+            return m.group(1)
+        bare = m.group(4)
+        return f"![Foto Produk]({bare})"
+    text = bare_img_pat.sub(_wrap_bare, text)
 
     cleaned = re.sub(r'!\[([^\]]*)\]\(([^)]*)\)', _replace_md_img, text)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
@@ -762,8 +851,8 @@ def get_s3_object_stream(s3_key: str, chunk_size: int = 65536) -> tuple:
                         _record_storage_error("get_s3_object_stream", bucket, cand, e)
                         logger.warning(f"Failed to fetch S3 object '{cand}' from bucket '{bucket}': {e}")
 
-            # UUID Hex prefix fallback search if filename was slightly altered by LLM/Markdown formatter
-            hex_match = re.search(r'([0-9a-f]{32})_', clean_key)
+            # 1. UUID / MD5 Hex prefix fallback search if filename was slightly altered
+            hex_match = re.search(r'([0-9a-f]{16,32})_', clean_key)
             if hex_match:
                 hex_prefix = hex_match.group(1)
                 for prefix_cand in [f"images/{hex_prefix}", hex_prefix]:
@@ -788,6 +877,31 @@ def get_s3_object_stream(s3_key: str, chunk_size: int = 65536) -> tuple:
                             return _stream_iterator_found(), ctype, content_length
                     except Exception as prefix_err:
                         logger.debug(f"S3 prefix lookup for '{hex_prefix}' in '{bucket}' error: {prefix_err}")
+
+            # 2. Base filename fallback search (if document was re-ingested with a different hash prefix)
+            base_fname = re.sub(r'^[0-9a-f]{16,32}_', '', os.path.basename(clean_key)).strip()
+            if base_fname and len(base_fname) >= 6 and not base_fname.startswith('.'):
+                try:
+                    list_res = client.list_objects_v2(Bucket=bucket, Prefix="images/", MaxKeys=300)
+                    for item in list_res.get("Contents", []):
+                        item_k = item.get("Key", "")
+                        if item_k.endswith(f"_{base_fname}") or item_k.endswith(f"/{base_fname}") or (base_fname in item_k and item_k.startswith("images/")):
+                            logger.info(f"S3 base filename match: resolved '{clean_key}' -> '{item_k}' in bucket '{bucket}'")
+                            resp = client.get_object(Bucket=bucket, Key=item_k)
+                            body = resp.get("Body")
+                            ctype = resp.get("ContentType", "image/png")
+                            content_length = resp.get("ContentLength")
+
+                            def _stream_iterator_base():
+                                try:
+                                    for chunk in body.iter_chunks(chunk_size=chunk_size):
+                                        yield chunk
+                                finally:
+                                    body.close()
+
+                            return _stream_iterator_base(), ctype, content_length
+                except Exception as base_err:
+                    logger.debug(f"S3 base filename lookup for '{base_fname}' in '{bucket}' error: {base_err}")
 
     return None, None, None
 
@@ -938,22 +1052,25 @@ def upload_images_parallel(images: list) -> list:
     if not client:
         results = []
         for img in images:
-            s3_key = f"images/{uuid.uuid4().hex}_{img['filename']}"
-            if img.get("content") and img.get("filename"):
-                _save_file_to_local_disk(img["content"], img["filename"], s3_key=s3_key)
+            raw_bytes = img.get("content", b"") or b""
+            content_hash = hashlib.md5(raw_bytes).hexdigest()[:16] if raw_bytes else uuid.uuid4().hex[:16]
+            s3_key = f"images/{content_hash}_{img['filename']}"
+            if raw_bytes and img.get("filename"):
+                _save_file_to_local_disk(raw_bytes, img["filename"], s3_key=s3_key)
             results.append({
                 "s3_key": s3_key,
                 "image_url": _format_browser_url(None, s3_key),
-                "size": len(img.get("content", b"")),
+                "size": len(raw_bytes),
                 "status": "fallback"
             })
         return results
 
     def _upload_single(img_data: dict) -> dict:
         fname = img_data["filename"]
-        content = img_data["content"]
+        content = img_data.get("content", b"") or b""
         ctype = img_data.get("content_type", "image/png")
-        s3_key = f"images/{uuid.uuid4().hex}_{fname}"
+        content_hash = hashlib.md5(content).hexdigest()[:16] if content else uuid.uuid4().hex[:16]
+        s3_key = f"images/{content_hash}_{fname}"
         browser_url = _format_browser_url(None, s3_key)
         try:
             extra_args = {}
@@ -983,7 +1100,7 @@ def upload_images_parallel(images: list) -> list:
             }
 
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(len(images), 8)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(images), 3)) as executor:
         results = list(executor.map(_upload_single, images))
 
     success_count = sum(1 for r in results if r["status"] == "success")
@@ -1573,6 +1690,36 @@ def get_document_presigned_url(s3_key: str, expires: int = 3600) -> str:
     return _generate_presigned_url(_docs_bucket(), s3_key, expires)
 
 
+def download_original_document(document_id: str, dest_dir: str, filename: str = "") -> Optional[str]:
+    """
+    Restores a document's original upload from the knowledge-documents bucket to dest_dir.
+    Local upload files are temporary; the bucket copy (originals/{y}/{m}/{document-id}/original.{ext})
+    is the durable one. Returns the local path, or None when no original is stored.
+    """
+    client = _get_client()
+    if not client or not document_id:
+        return None
+    try:
+        keys = []
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=_docs_bucket(), Prefix="originals/"):
+            keys.extend(o["Key"] for o in page.get("Contents", []) if f"/{document_id}/" in o["Key"])
+        if not keys:
+            return None
+        s3_key = sorted(keys)[-1]
+        os.makedirs(dest_dir, exist_ok=True)
+        ext = os.path.splitext(s3_key)[1]
+        local_name = f"{document_id}_{os.path.basename(filename) or 'original' + ext}"
+        local_path = os.path.join(dest_dir, local_name)
+        client.download_file(_docs_bucket(), s3_key, local_path)
+        logger.info(f"Restored original document '{s3_key}' to '{local_path}'")
+        return local_path
+    except Exception as e:
+        _record_storage_error("download_original_document", _docs_bucket(), document_id, e)
+        logger.warning(f"Could not restore original document for '{document_id}': {e}")
+        return None
+
+
 def delete_document_file(s3_key: str) -> None:
     """Deletes a document object from knowledge-documents bucket."""
     client = _get_client()
@@ -1676,9 +1823,10 @@ def delete_image_by_ref(raw_ref: str, knowledge_id: Optional[str] = None) -> boo
             except Exception as e:
                 logger.debug(f"MinIO delete image '{s3_candidate}' note: {e}")
 
-        # 2. If fname might be a suffix without the random UUID prefix (e.g. 'photo.jpg')
+        # 2. If fname is a bare suffix without the standard 16-to-32 hex hash prefix (e.g. 'photo.jpg')
         # Scan images bucket for keys ending with or containing the unique filename (if filename >= 6 chars)
-        if len(fname) >= 6:
+        is_prefixed = bool(re.match(r'^[0-9a-f]{16,32}_', fname))
+        if not is_prefixed and len(fname) >= 6:
             try:
                 paginator = client.get_paginator('list_objects_v2')
                 for page in paginator.paginate(Bucket=images_bucket, Prefix="images/"):
@@ -1881,7 +2029,8 @@ def delete_knowledge_images_and_assets(knowledge_id: str, doc_data: Optional[dic
     deleted_images = []
     seen_fnames = set()
 
-    # 1. Delete explicit image references
+    # 1. Collect all explicit image references and prepare batch delete
+    keys_to_delete = set()
     for ref in all_image_refs:
         clean = str(ref).strip()
         if "/api/storage/" in clean:
@@ -1894,8 +2043,19 @@ def delete_knowledge_images_and_assets(knowledge_id: str, doc_data: Optional[dic
         fname = os.path.basename(clean.lstrip("/"))
         if fname and len(fname) >= 4 and fname not in seen_fnames:
             seen_fnames.add(fname)
-            if delete_image_by_ref(fname, knowledge_id=kid_str):
-                deleted_images.append(fname)
+            keys_to_delete.add(f"images/{fname}")
+            keys_to_delete.add(fname)
+            keys_to_delete.add(clean)
+            deleted_images.append(fname)
+
+            # Fast local disk fallback cleanup
+            for folder in ["data/images", "data/storage/images", "data/temp", "data/uploads", "data/storage"]:
+                local_f = os.path.normpath(os.path.join(folder, fname))
+                if os.path.exists(local_f) and os.path.isfile(local_f):
+                    try:
+                        os.remove(local_f)
+                    except Exception:
+                        pass
 
     # 2. Comprehensive S3 Scanner on images bucket for any images tagged with kid_str or batch_id
     if client and (kid_str or batch_ids):
@@ -1905,46 +2065,43 @@ def delete_knowledge_images_and_assets(knowledge_id: str, doc_data: Optional[dic
             for page in paginator.paginate(Bucket=images_bucket):
                 for obj in page.get('Contents', []):
                     key = obj.get('Key', '')
-                    matched = False
                     for ident in match_identifiers:
                         if ident and len(ident) >= 6 and ident in key:
-                            matched = True
-                            break
-                    if matched and key not in seen_fnames:
-                        seen_fnames.add(key)
-                        try:
-                            client.delete_object(Bucket=images_bucket, Key=key)
+                            keys_to_delete.add(key)
                             deleted_images.append(key)
-                            logger.info(f"🗑️ Purged matched MinIO image '{key}' for doc '{kid_str}'")
-                        except Exception as del_err:
-                            logger.debug(f"Failed deleting matched MinIO image '{key}': {del_err}")
+                            break
         except Exception as scan_err:
             logger.debug(f"Error scanning images bucket for '{kid_str}': {scan_err}")
 
-    # Clean MinIO knowledge-documents bucket (originals & canonical)
+    # 3. High-Speed S3 Batch Deletion (up to 1,000 keys per HTTP request)
+    if client and keys_to_delete:
+        del_list = [{"Key": k} for k in keys_to_delete]
+        for i in range(0, len(del_list), 500):
+            chunk = del_list[i:i + 500]
+            try:
+                client.delete_objects(Bucket=images_bucket, Delete={"Objects": chunk})
+                logger.info(f"🗑️ Batch deleted {len(chunk)} objects from MinIO bucket '{images_bucket}' for doc '{kid_str}'")
+            except Exception as batch_err:
+                logger.debug(f"Batch delete notice in images bucket: {batch_err}")
+
+    # 4. Clean MinIO knowledge-documents bucket (originals & canonical) in batch
     if client and (kid_str or batch_ids):
         all_ids_to_clean = {kid_str} | batch_ids
+        doc_keys_to_delete = set()
         for target_id in all_ids_to_clean:
             if not target_id:
                 continue
-            try:
-                # 1. Delete canonical JSON
-                client.delete_object(Bucket=docs_bucket, Key=f"canonical/{target_id}/document.json")
-            except Exception:
-                pass
+            doc_keys_to_delete.add(f"canonical/{target_id}/document.json")
 
             try:
-                # 2. Delete original upload files in originals/.../{target_id}/...
+                # Scan original upload files in originals/.../{target_id}/...
                 paginator = client.get_paginator('list_objects_v2')
                 for page in paginator.paginate(Bucket=docs_bucket, Prefix="originals/"):
                     for obj in page.get('Contents', []):
                         key = obj.get('Key', '')
                         if f"/{target_id}/" in key or f"_{target_id}_" in key:
-                            try:
-                                client.delete_object(Bucket=docs_bucket, Key=key)
-                                logger.info(f"🗑️ Deleted original document '{key}' from MinIO '{docs_bucket}'")
-                            except Exception as err:
-                                logger.debug(f"Could not delete original document '{key}': {err}")
+                            doc_keys_to_delete.add(key)
+                            deleted_images.append(key)
             except Exception as e:
                 logger.debug(f"Error purging originals for '{target_id}': {e}")
 
@@ -1954,6 +2111,16 @@ def delete_knowledge_images_and_assets(knowledge_id: str, doc_data: Optional[dic
                 delete_approved_json(target_id)
             except Exception:
                 pass
+
+        if doc_keys_to_delete:
+            doc_del_list = [{"Key": k} for k in doc_keys_to_delete]
+            for i in range(0, len(doc_del_list), 500):
+                chunk = doc_del_list[i:i + 500]
+                try:
+                    client.delete_objects(Bucket=docs_bucket, Delete={"Objects": chunk})
+                    logger.info(f"🗑️ Batch deleted {len(chunk)} objects from MinIO bucket '{docs_bucket}' for doc '{kid_str}'")
+                except Exception as batch_err:
+                    logger.debug(f"Batch delete notice in docs bucket: {batch_err}")
 
     return {
         "knowledge_id": kid_str,
